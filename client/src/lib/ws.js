@@ -1,13 +1,13 @@
 import { useStore } from './store.js';
 
+const RETRY_MS = 5000; // while the connection is down, try again every 5 s
+
 let socket = null;
-let retry = 500;
 
 export function connectEvents() {
   const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`;
   socket = new WebSocket(url);
   socket.onopen = () => {
-    retry = 500;
     const st = useStore.getState();
     st.set({ connected: true });
     // Resync everything after a reconnect (e.g. the server restarted).
@@ -22,8 +22,7 @@ export function connectEvents() {
   };
   socket.onclose = () => {
     useStore.getState().set({ connected: false });
-    setTimeout(connectEvents, retry);
-    retry = Math.min(8000, retry * 1.6);
+    setTimeout(connectEvents, RETRY_MS);
   };
   socket.onerror = () => socket.close();
 }
