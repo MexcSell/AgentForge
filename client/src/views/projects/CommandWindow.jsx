@@ -483,7 +483,7 @@ export function CommandWindow({ project }) {
               else if (e.key === 'Escape' && newCmd) { e.preventDefault(); setHideHint(true); }
               else if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); }
             }}
-            className="w-full bg-transparent resize-none outline-none px-3 pt-2.5 text-[0.86rem] placeholder:text-subtle" />
+            className="w-full bg-transparent resize-none outline-none focus-visible:outline-none! px-3 pt-2.5 text-[0.86rem] placeholder:text-subtle" />
           {/* items-end: the add-image button and Send stay level at the bottom however many thumbnail rows wrap between them. */}
           <div className="flex items-end gap-2 px-2 pb-2">
             <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }} />
