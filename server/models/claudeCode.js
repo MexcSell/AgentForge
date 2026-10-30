@@ -1,0 +1,129 @@
+import { spawn } from 'node:child_process';
+import { config } from '../config.js';
+import { childEnv } from '../services/env.js';
+
+const WRITE_ALLOWED = [
+  'Read', 'Glob', 'Grep', 'Edit', 'Write', 'TodoWrite',
+  'Bash(npm *)', 'Bash(npx *)', 'Bash(node *)', 'Bash(ls *)', 'Bash(cat *)', 'Bash(mkdir *)', 'Bash(touch *)', 'Bash(cp *)', 'Bash(mv *)',
+  'Bash(echo *)', 'Bash(test *)', 'Bash(pwd)', 'Bash(head *)', 'Bash(tail *)', 'Bash(wc *)', 'Bash(grep *)', 'Bash(find *)', 'Bash(diff *)', 'Bash(sort *)',
+  'Bash(git status*)', 'Bash(git diff*)', 'Bash(git log*)', 'Bash(git show*)', 'Bash(python3 *)', 'Bash(pytest *)',
+].join(',');
+// Deliberately absent: rm, git commit/push, curl, sudo — destructive or outward actions stay gated.
+const READ_DENIED = 'Edit,Write,NotebookEdit';
+
+function brief(input) {
+  if (!input || typeof input !== 'object') return '';
+  const v = input.file_path || input.path || input.command || input.pattern || input.url || input.description || '';
+  return String(v).slice(0, 200);
+}
+
+/** Runs one Claude Code turn non-interactively and streams normalized events. */
+export function runClaudeCode({ model, prompt, system, cwd, access = 'read', addDirs = [], signal, onEvent, timeoutMs }) {
+  const cfg = model.config || {};
+  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--no-session-persistence'];
+  if (model.model) args.push('--model', model.model);
+  if (cfg.effort) args.push('--effort', cfg.effort);
+  if (cfg.maxBudgetUsd) args.push('--max-budget-usd', String(cfg.maxBudgetUsd));
+  if (system) args.push('--append-system-prompt', system);
+  if (access === 'write') {
+    args.push('--permission-mode', cfg.permissionMode || 'acceptEdits', '--allowedTools', cfg.allowedTools || WRITE_ALLOWED);
+  } else {
+    args.push('--permission-mode', 'default', '--disallowedTools', READ_DENIED);
+  }
+  for (const d of addDirs) args.push('--add-dir', d);
+
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const child = spawn(config.claudeBin, args, { cwd, env: childEnv(), detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const toolCalls = {};
+    const toolNames = {};
+    let text = '';
+    let final = null;
+    let rateLimit = null;
+    let stderr = '';
+    let buf = '';
+    let settled = false;
+
+    const kill = () => {
+      try { process.kill(-child.pid, 'SIGTERM'); } catch {}
+      setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 4000).unref();
+    };
+    const timer = timeoutMs ? setTimeout(() => { onEvent?.({ type: 'error', text: `Timed out after ${Math.round(timeoutMs / 60000)} min` }); kill(); }, timeoutMs) : null;
+    const onAbort = () => { onEvent?.({ type: 'status', text: 'Cancelled' }); kill(); };
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    const handle = (e) => {
+      if (e.type === 'system' && e.subtype === 'init') {
+        onEvent?.({ type: 'status', text: `Session started · ${e.model} · ${e.permissionMode}` });
+      } else if (e.type === 'rate_limit_event') {
+        rateLimit = e.rate_limit_info || null;
+      } else if (e.type === 'assistant') {
+        for (const b of e.message?.content || []) {
+          if (b.type === 'text' && b.text) { text += (text ? '\n' : '') + b.text; onEvent?.({ type: 'text', text: b.text }); }
+          else if (b.type === 'thinking' && b.thinking) onEvent?.({ type: 'thinking', text: b.thinking });
+          else if (b.type === 'tool_use') {
+            toolCalls[b.name] = (toolCalls[b.name] || 0) + 1;
+            toolNames[b.id] = b.name;
+            onEvent?.({ type: 'tool_use', name: b.name, input: brief(b.input) });
+          }
+        }
+      } else if (e.type === 'user') {
+        const content = e.message?.content;
+        if (Array.isArray(content)) {
+          for (const b of content) {
+            if (b.type !== 'tool_result') continue;
+            const raw = Array.isArray(b.content) ? b.content.map((c) => c.text || '').join('\n') : String(b.content ?? '');
+            onEvent?.({ type: 'tool_result', name: toolNames[b.tool_use_id], ok: !b.is_error, preview: raw.slice(0, 400) });
+          }
+        }
+      } else if (e.type === 'result') {
+        final = e;
+      }
+    };
+
+    child.stdout.on('data', (chunk) => {
+      buf += chunk.toString();
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line) continue;
+        try { handle(JSON.parse(line)); } catch { /* non-JSON noise */ }
+      }
+    });
+    child.stderr.on('data', (c) => { stderr += c.toString(); if (stderr.length > 20000) stderr = stderr.slice(-20000); });
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`Could not start Claude Code (${config.claudeBin}): ${err.message}`));
+    });
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      const u = final?.usage || {};
+      const out = {
+        text: final?.result ?? text,
+        usage: {
+          input: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0),
+          output: u.output_tokens || 0,
+          cache: u.cache_read_input_tokens || 0,
+        },
+        toolCalls,
+        costUsd: final?.total_cost_usd || 0,
+        durationMs: final?.duration_ms || Date.now() - started,
+        rateLimit,
+      };
+      if (signal?.aborted) return reject(Object.assign(new Error('Cancelled'), { partial: out }));
+      if (!final || final.is_error) {
+        const why = final?.subtype && final.subtype !== 'success' ? final.subtype : (stderr.trim().split('\n').pop() || `exit code ${code}`);
+        return reject(Object.assign(new Error(`Claude Code failed: ${why}`), { partial: out }));
+      }
+      resolve(out);
+    });
+
+    child.stdin.end(prompt);
+  });
+}

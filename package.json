@@ -1,0 +1,57 @@
+{
+  "name": "agentforge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AgentForge — self-evolving multi-agent software engineering control room",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node scripts/supervisor.js",
+    "server": "node server/index.js",
+    "dev": "node scripts/dev.js",
+    "build": "vite build",
+    "db:check": "node server/db/check.js",
+    "stop": "node -e \"process.kill(+require('fs').readFileSync('data/supervisor.pid','utf8'),'SIGTERM')\"",
+    "logs": "tail -f data/logs/agentforge.log"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^10.1.6",
+    "@fastify/static": "^10.1.8",
+    "@fastify/websocket": "^11.3.4",
+    "chokidar": "^6.0.0",
+    "fastify": "^5.12.7",
+    "node-pty": "^1.1.0",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@codemirror/language": "^6.13.1",
+    "@codemirror/language-data": "^6.5.2",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.15",
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "@lezer/highlight": "^1.2.5",
+    "@tailwindcss/vite": "^4.3.3",
+    "@uiw/react-codemirror": "^4.25.12",
+    "@vitejs/plugin-react": "^6.1.2",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "clsx": "^2.1.1",
+    "highlight.js": "^11.12.0",
+    "lucide-react": "^1.65.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-markdown": "^10.1.0",
+    "react-resizable-panels": "^4.15.2",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.3.5",
+    "zustand": "^5.0.16"
+  },
+  "allowScripts": {
+    "node-pty@1.1.0": true
+  }
+}

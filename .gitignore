@@ -1,0 +1,16 @@
+# AgentForge — only source code is uploaded to GitHub
+node_modules/
+client/dist/
+client/dist-*/
+data/
+.runtime/
+reference/
+*.pptx
+*.pdf
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+coverage/
+.vite/

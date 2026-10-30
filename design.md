@@ -1,3 +1,8 @@
+
+Please reference to the "reference/" folder.
+
+Create a project and run it. If the project is modified, it must restart itself.
+
 Self-evolving agent orchestration.
 Agents that evolve on their own by leading a software development team with specialized agents. About this.
 Please tell me the most advanced structure.
@@ -16,6 +21,15 @@ https://chatgpt.com/share/6ae43f02-1b98-83ea-8c15-325df51fd71e
 https://chatgpt.com/share/6ae442ae-0510-83ea-851c-ba3c9c4d5dbc
 https://chatgpt.com/share/6ae442c1-9364-83e9-a126-b1f24e177062
 https://chatgpt.com/share/6ae442e1-9674-83ea-99cf-141f436d49af
+
+For the face-to-face part, use React. Write the most advanced face-to-face section.
+Please refer to the face-to-face section.
+https://linear.app/?utm_source=chatgpt.com
+https://vercel.com/?utm_source=chatgpt.com
+https://stripe.com/en-jp?utm_source=chatgpt.com
+https://www.raycast.com/?utm_source=chatgpt.com
+https://supabase.com/?utm_source=chatgpt.com
+
 
 An overview of the work of developing software using a group of agents, that is, using website, is described.
 1. function of website
@@ -52,6 +66,7 @@ should have icons that fit their characteristics.
 
 - FileManager
 The multi-selection function is a must.
+You should be able to multi-select by pressing the control.
 should have icons that fit their characteristics.
 The standard path is your project path.
 Creating, copying/pasting, editing, viewing, deleting, moving and dragging arbitrary files and registers should all work. Also, all files and registers should have icons according to their type.
@@ -69,6 +84,18 @@ You must upload the information to github with the information below.
 git config user.name "mexcsell"
 git config user.email sellmexc9@gmail.com
 git push -u origin main
+
+git init
+git add README.md
+git commit -m "first commit"
+git branch -M main
+git remote add origin https://github.com/MexcSell/AgentForge.git
+git push -u origin main
+
+git branch -M main
+git push -u origin main
+
+When uploading a project to Github, separate the files and upload only the source code.
 
 2. Technical content
 The data base is set to PostgreSQL.
