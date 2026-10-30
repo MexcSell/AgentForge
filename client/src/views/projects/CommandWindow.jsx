@@ -255,6 +255,7 @@ export function CommandWindow({ project }) {
   const [settings, setSettings] = useState(false);
   const [confirmDel, setConfirmDel] = useState(false);
   const [hideHint, setHideHint] = useState(false);
+  const [preview, setPreview] = useState(null);
   const scroller = useRef(null);
   const stick = useRef(true);
   const fileInput = useRef(null);
@@ -458,19 +459,24 @@ export function CommandWindow({ project }) {
             <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }} />
             <IconButton icon={ImagePlus} label="Attach images" onClick={() => fileInput.current?.click()} />
             {files.length > 0 && (
-              <div className="flex-1 flex flex-wrap gap-2 pt-1.5">
+              <div className="flex-1 min-w-0 flex flex-wrap gap-2">
                 {files.map((f, i) => (
                   <div key={f.url} className="relative group">
-                    <img src={f.url} alt="" className="h-16 w-16 object-cover rounded-lg border border-line" />
-                    <button onClick={() => setFiles(files.filter((_, j) => j !== i))} className="absolute -top-1.5 -right-1.5 size-5 rounded-full bg-raised border border-line flex items-center justify-center opacity-0 group-hover:opacity-100"><X size={11} /></button>
+                    {/* Double-click (or Enter/Space when focused) opens the preview; a single click does nothing. */}
+                    <img src={f.url} alt={f.file.name} title="Double-click to preview" tabIndex={0} onDoubleClick={() => setPreview(f)}
+                      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setPreview(f); } }}
+                      className="size-10 object-cover rounded-md border border-line cursor-zoom-in select-none" />
+                    <button aria-label={`Remove ${f.file.name}`} onClick={() => { setFiles(files.filter((_, j) => j !== i)); if (preview === f) setPreview(null); }}
+                      className="absolute -top-1 -right-1 size-4 rounded-full bg-raised border border-line flex items-center justify-center opacity-0 group-hover:opacity-100 focus-visible:opacity-100"><X size={9} /></button>
                   </div>
                 ))}
               </div>
             )}
-            <div className="ml-auto flex items-center gap-2">
-              {running && <span className="text-[0.7rem] text-subtle">New orders are queued after the current mission</span>}
-              <Button variant="primary" size="sm" icon={Send} loading={sending} disabled={!text.trim() && !files.length} onClick={send}>Send</Button>
-            </div>
+            <Button variant="primary" size="sm" icon={Send} className="ml-auto" loading={sending} disabled={!text.trim() && !files.length} onClick={send}
+              title={running ? 'New orders are queued after the current mission' : undefined}>Send</Button>
+            <Modal open={!!preview} onClose={() => setPreview(null)} title={preview?.file.name || 'Image'} size="lg" bodyClass="p-2 flex items-center justify-center bg-sunken">
+              {preview && <img src={preview.url} alt={preview.file.name} className="max-w-full max-h-full object-contain" />}
+            </Modal>
           </div>
         </div>
       </div>
