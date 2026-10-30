@@ -23,13 +23,17 @@ export const Button = forwardRef(function Button({ variant = 'secondary', size =
   );
 });
 
-export const IconButton = forwardRef(function IconButton({ icon: Icon, label, active, size = 'md', className, badge, tone, ...rest }, ref) {
+const DOT = { ok: 'bg-ok', accent: 'bg-accent', warn: 'bg-warn', bad: 'bg-bad' };
+
+/** `dot` (ok | accent | warn | bad) adds a small status dot in the top-right corner; `badge` a red counter. */
+export const IconButton = forwardRef(function IconButton({ icon: Icon, label, active, size = 'md', className, badge, dot, tone, ...rest }, ref) {
   const sz = size === 'sm' ? 'size-6' : size === 'lg' ? 'size-9' : 'size-7';
   return (
     <button ref={ref} title={label} aria-label={label} className={cx('relative inline-flex items-center justify-center rounded-md transition-colors shrink-0 disabled:opacity-40 disabled:pointer-events-none', sz,
       active ? 'bg-accent-soft text-accent' : tone === 'danger' ? 'text-muted hover:text-bad hover:bg-bad-soft' : 'text-muted hover:text-fg hover:bg-hover', className)} {...rest}>
       <Icon size={size === 'sm' ? 14 : size === 'lg' ? 18 : 16} strokeWidth={1.9} />
-      {badge ? <span className="absolute -top-0.5 -right-0.5 min-w-4 h-4 px-1 rounded-full bg-bad text-white text-[10px] font-semibold leading-4 text-center tabular">{badge > 99 ? '99+' : badge}</span> : null}
+      {badge ? <span className="absolute -top-0.5 -right-0.5 min-w-4 h-4 px-1 rounded-full bg-bad text-white text-[10px] font-semibold leading-4 text-center tabular">{badge > 99 ? '99+' : badge}</span>
+        : dot ? <span aria-hidden="true" data-dot={dot} className={cx('absolute top-0.5 right-0.5 size-2 rounded-full ring-2 ring-[var(--af-panel)]', DOT[dot] || DOT.ok)} /> : null}
     </button>
   );
 });

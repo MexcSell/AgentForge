@@ -13,6 +13,7 @@ import { listProjects, getProject, createProjectRecord, publishProject } from '.
 import { listTopics, getTopic, createTopic, updateTopic, deleteTopic, isUuid } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
 import { gitInfo } from '../services/git.js';
+import { disposePreview } from '../services/runner.js';
 import { listModels, publishModels, PROVIDERS, runModel, recordRunUsage } from '../models/index.js';
 import { submitCommand, cancelMission, standup, syncNow, approveProposal, rejectProposal } from '../orchestrator/engine.js';
 import { evolutionOverview, analyzeMission } from '../orchestrator/evolution.js';
@@ -39,8 +40,14 @@ export default async function apiRoutes(app, opts = {}) {
     const p = await getProject(req.params.id);
     if (!p) return err(reply, 404, 'Not found');
     const b = req.body || {};
-    const fields = { name: b.name?.trim() || p.name, github_url: b.github_url === undefined ? p.github_url : b.github_url?.trim() || null, description: b.description ?? p.description, auto_sync: b.auto_sync ?? p.auto_sync, path: b.path?.trim() || p.path };
-    await query(`UPDATE projects SET name=$2, github_url=$3, description=$4, auto_sync=$5, path=$6, updated_at=now() WHERE id=$1`, [p.id, fields.name, fields.github_url, fields.description, fields.auto_sync, fields.path]);
+    // Run & preview settings: undefined keeps the current value, '' or null clears it (auto-detect).
+    const text = (v, cur) => (v === undefined ? cur : String(v ?? '').trim() || null);
+    const port = b.preview_port === undefined ? p.preview_port : b.preview_port === null || String(b.preview_port).trim() === '' ? null : Number(b.preview_port);
+    if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65535 || port === config.port)) return err(reply, 400, 'Preview port must be a free port number between 1 and 65535');
+    const fields = { name: b.name?.trim() || p.name, github_url: b.github_url === undefined ? p.github_url : b.github_url?.trim() || null, description: b.description ?? p.description, auto_sync: b.auto_sync ?? p.auto_sync, path: b.path?.trim() || p.path,
+      run_command: text(b.run_command, p.run_command), preview_port: port, preview_path: text(b.preview_path, p.preview_path) };
+    await query(`UPDATE projects SET name=$2, github_url=$3, description=$4, auto_sync=$5, path=$6, run_command=$7, preview_port=$8, preview_path=$9, updated_at=now() WHERE id=$1`,
+      [p.id, fields.name, fields.github_url, fields.description, fields.auto_sync, fields.path, fields.run_command, fields.preview_port, fields.preview_path]);
     return publishProject(p.id);
   });
 
@@ -52,6 +59,7 @@ export default async function apiRoutes(app, opts = {}) {
     for (const p of rows) {
       if (p.protected) { refused.push(p.name); continue; }
       await cancelMission(p.id).catch(() => {});
+      await disposePreview(p.id).catch(() => {});
       await query(`DELETE FROM projects WHERE id = $1`, [p.id]);
       if (p.manager_id) await query(`UPDATE agents SET archived = true WHERE id = $1`, [p.manager_id]);
       emit('project:delete', { id: p.id });

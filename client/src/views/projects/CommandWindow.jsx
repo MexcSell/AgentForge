@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Send, ImagePlus, X, Copy, Check, Users, Square, Trash2, Lock, FolderOpen, Settings2, ArrowRight, Lightbulb, ThumbsUp, ThumbsDown,
   ListTree, Sparkles, CircleCheck, CircleX, TriangleAlert, Workflow, UserPlus, CopyPlus, Loader2, Slash,
-  Hash, Plus, Pencil, Split, CornerDownRight, Archive, ArchiveRestore,
+  Hash, Plus, Pencil, Split, CornerDownRight, Archive, ArchiveRestore, MonitorPlay,
 } from 'lucide-react';
 import { api } from '../../lib/api.js';
 import { useStore, selectRun } from '../../lib/store.js';
@@ -14,6 +14,7 @@ import { Markdown } from '../../components/Markdown.jsx';
 import { Modal, Confirm } from '../../components/Modal.jsx';
 import { cx, Badge, Button, IconButton, Input, Field, Textarea, Toggle, Kbd, AgentAvatar, Progress, STATUS_TONE } from '../../components/ui.jsx';
 import { TopicBar, TagChip, TagEditor, RenameInput } from './TopicBar.jsx';
+import { PreviewWindow } from './PreviewWindow.jsx';
 
 const EMPTY = [];
 const SLASH = [
@@ -224,7 +225,17 @@ function Message({ m, count, tasks }) {
 function ProjectSettings({ project, open, onClose }) {
   const [f, setF] = useState(project);
   useEffect(() => { if (open) setF(project); }, [open]);
-  const save = async () => { await api.patch(`/api/projects/${project.id}`, f); toast.success('Project updated'); onClose(); };
+  const save = async () => {
+    // Preview fields: empty means auto-detect (null); the port is a number.
+    const port = String(f.preview_port ?? '').trim();
+    if (port && !(Number.isInteger(+port) && +port >= 1 && +port <= 65535)) return toast.warn('Preview port must be a whole number from 1 to 65535');
+    const path = f.preview_path?.trim() || null;
+    await api.patch(`/api/projects/${project.id}`, {
+      ...f, run_command: f.run_command?.trim() || null, preview_port: port ? +port : null, preview_path: path && !path.startsWith('/') ? `/${path}` : path,
+    });
+    toast.success('Project updated');
+    onClose();
+  };
   return (
     <Modal open={open} onClose={onClose} title="Project settings" icon={Settings2} size="md"
       footer={<><Button variant="ghost" onClick={onClose}>Cancel</Button><Button variant="primary" onClick={save}>Save</Button></>}>
@@ -234,6 +245,15 @@ function ProjectSettings({ project, open, onClose }) {
         <Field label="GitHub URL"><Input value={f.github_url || ''} placeholder="https://github.com/owner/repo.git" onChange={(e) => setF({ ...f, github_url: e.target.value })} /></Field>
         <Field label="Brief"><Textarea rows={3} value={f.description || ''} onChange={(e) => setF({ ...f, description: e.target.value })} /></Field>
         <Toggle checked={f.auto_sync} onChange={(v) => setF({ ...f, auto_sync: v })} label="Upload to GitHub after every completed mission" />
+        <div className="flex flex-col gap-4 pt-4 border-t border-line">
+          <Field label="Run command" hint="What Run starts in the Preview window.">
+            <Input className="mono" value={f.run_command || ''} placeholder="npm run dev — auto-detected if empty" onChange={(e) => setF({ ...f, run_command: e.target.value })} />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Preview port"><Input type="number" min={1} max={65535} value={f.preview_port ?? ''} placeholder="Auto-detected" onChange={(e) => setF({ ...f, preview_port: e.target.value })} /></Field>
+            <Field label="Preview path"><Input className="mono" value={f.preview_path || ''} placeholder="/ (e.g. /index.html)" onChange={(e) => setF({ ...f, preview_path: e.target.value })} /></Field>
+          </div>
+        </div>
       </div>
     </Modal>
   );
@@ -252,14 +272,19 @@ export function CommandWindow({ project }) {
   const [files, setFiles] = useState([]);
   const [sending, setSending] = useState(false);
   const [drag, setDrag] = useState(false);
-  const [settings, setSettings] = useState(false);
+  const [settings, setSettings] = useState(false); // true, or 'preview' when opened from the Preview window (returns there on close)
   const [confirmDel, setConfirmDel] = useState(false);
   const [hideHint, setHideHint] = useState(false);
   const [preview, setPreview] = useState(null);
+  const [previewWin, setPreviewWin] = useState(false);
   const scroller = useRef(null);
   const stick = useRef(true);
   const fileInput = useRef(null);
   const ta = useRef(null);
+  const previewBtn = useRef(null);
+  // The session outlives the window (and page reloads): fetch it so the header can show that it is running.
+  useEffect(() => { st.loadPreview(project.id).catch(() => {}); }, [project.id]);
+  const previewRunning = st.previews[project.id]?.status === 'running';
 
   // Collapse consecutive identical messages into one with a counter.
   const grouped = useMemo(() => {
@@ -330,7 +355,8 @@ export function CommandWindow({ project }) {
   return (
     <div className="h-full flex flex-col relative" onDragOver={(e) => { if ([...e.dataTransfer.types].includes('Files')) { e.preventDefault(); setDrag(true); } }}
       onDragLeave={(e) => { if (e.currentTarget === e.target) setDrag(false); }} onDrop={(e) => { e.preventDefault(); setDrag(false); addFiles(e.dataTransfer.files); }}>
-      <div className="flex items-center gap-2.5 px-4 h-12 border-b border-line shrink-0">
+      {/* @container: below @md (28rem, e.g. a 25% chat pane) the icon group tightens and Stop becomes icon-only, so only the title truncates. */}
+      <div className="@container flex items-center gap-2.5 px-4 h-12 border-b border-line shrink-0">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             {project.protected && <Lock size={13} className="text-accent shrink-0" />}
@@ -342,12 +368,16 @@ export function CommandWindow({ project }) {
             <span>·</span><span className="shrink-0">GM <button className="hover:underline text-muted" onClick={() => st.set({ agentModal: project.manager_id })}>{project.manager_name}</button></span>
           </div>
         </div>
-        {project.github_url && <a href={project.github_url.replace(/\.git$/, '')} target="_blank" rel="noreferrer" title={project.github_url} className="size-7 rounded-md flex items-center justify-center text-muted hover:text-fg hover:bg-hover"><GithubMark size={15} /></a>}
-        <IconButton icon={Users} label="Stand-up meeting" onClick={() => api.post(`/api/projects/${project.id}/standup`, { topic_id: topicId || undefined })} />
-        <IconButton icon={FolderOpen} label="Open in Files" onClick={() => st.set({ view: 'files', filePanes: [{ id: 'p1', path: project.path }], activePane: 'p1' })} />
-        <IconButton icon={Settings2} label="Project settings" onClick={() => setSettings(true)} />
-        {running && <Button size="sm" variant="danger" icon={Square} onClick={() => api.post(`/api/projects/${project.id}/cancel`)}>Stop</Button>}
-        <IconButton icon={Trash2} label={project.protected ? 'Protected project — cannot be deleted' : 'Delete project'} tone="danger" disabled={project.protected} onClick={() => setConfirmDel(true)} />
+        <div className="flex items-center gap-2.5 @max-md:gap-1 shrink-0">
+          {project.github_url && <a href={project.github_url.replace(/\.git$/, '')} target="_blank" rel="noreferrer" title={project.github_url} className="size-7 rounded-md flex items-center justify-center text-muted hover:text-fg hover:bg-hover"><GithubMark size={15} /></a>}
+          <IconButton ref={previewBtn} icon={MonitorPlay} label="Run & preview project" dot={previewRunning ? 'ok' : undefined} onClick={() => setPreviewWin(true)}
+            {...(previewRunning && { title: 'Run & preview project — the preview is running' })} />
+          <IconButton icon={Users} label="Stand-up meeting" onClick={() => api.post(`/api/projects/${project.id}/standup`, { topic_id: topicId || undefined })} />
+          <IconButton icon={FolderOpen} label="Open in Files" onClick={() => st.set({ view: 'files', filePanes: [{ id: 'p1', path: project.path }], activePane: 'p1' })} />
+          <IconButton icon={Settings2} label="Project settings" onClick={() => setSettings(true)} />
+          {running && <Button size="sm" variant="danger" icon={Square} title="Stop the mission" className="@max-md:px-1.5" onClick={() => api.post(`/api/projects/${project.id}/cancel`)}><span className="@max-md:sr-only">Stop</span></Button>}
+          <IconButton icon={Trash2} label={project.protected ? 'Protected project — cannot be deleted' : 'Delete project'} tone="danger" disabled={project.protected} onClick={() => setConfirmDel(true)} />
+        </div>
       </div>
 
       <TopicBar project={project} run={run} onCompose={focusComposer} />
@@ -481,7 +511,12 @@ export function CommandWindow({ project }) {
         </div>
       </div>
       <div aria-live="polite" className="sr-only">{st.announce}</div>
-      <ProjectSettings project={project} open={settings} onClose={() => setSettings(false)} />
+      <ProjectSettings project={project} open={!!settings} onClose={() => { if (settings === 'preview') setPreviewWin(true); setSettings(false); }} />
+      {/* Closing the window leaves the preview process running. */}
+      {previewWin && (
+        <PreviewWindow project={project} onClose={() => { setPreviewWin(false); previewBtn.current?.focus(); }}
+          onOpenSettings={() => { setPreviewWin(false); setSettings('preview'); }} />
+      )}
       <Confirm open={confirmDel} title={`Delete "${project.name}"?`} danger confirmLabel="Delete project" onClose={() => setConfirmDel(false)}
         body="Removes the project, its chat history and tasks from AgentForge. Files on disk are kept."
         onConfirm={() => api.post('/api/projects/delete', { ids: [project.id] })} />

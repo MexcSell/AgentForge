@@ -35,6 +35,8 @@ const without = (obj, key) => {
   return next;
 };
 const byCreated = (a, b) => new Date(a.created_at) - new Date(b.created_at);
+export const PREVIEW_LOG_MAX = 2000; // output lines kept per preview session
+const capLog = (lines) => (lines.length > PREVIEW_LOG_MAX ? lines.slice(-PREVIEW_LOG_MAX) : lines);
 
 /** The topic to show after `goneId` disappears: the next open tab in strip order, else the previous one. */
 function nextTopic(list, goneId) {
@@ -76,6 +78,7 @@ export const useStore = create((set, get) => ({
   tasks: {},
   missions: {},
   live: {},
+  previews: {}, // { [projectId]: { status, mode, command, port, url, startedAt, exitCode, error, log: string[] } }
   syncTick: 0,
   evolutionTick: 0,
   clientUpdate: null,
@@ -156,6 +159,20 @@ export const useStore = create((set, get) => ({
   async deleteTopic(t) {
     await api.del(`/api/topics/${t.id}`);
     get().applyEvent('topic:delete', { id: t.id, project_id: t.project_id });
+  },
+
+  /** Fetches the project's preview session snapshot (never starts it). */
+  async loadPreview(projectId) {
+    const p = await api.get(`/api/projects/${projectId}/preview`, { quiet: true });
+    get().applyEvent('preview:update', { ...p, project_id: projectId });
+    return get().previews[projectId];
+  },
+
+  /** action: start | stop | restart. Live state arrives as preview:update; the reply only counts if no event beat it here. */
+  async previewAction(projectId, action) {
+    const before = get().previews[projectId];
+    const p = await api.post(`/api/projects/${projectId}/preview/${action}`);
+    if (p?.status && get().previews[projectId] === before) get().applyEvent('preview:update', { ...p, project_id: projectId });
   },
 
   applyEvent(type, p) {
@@ -269,6 +286,20 @@ export const useStore = create((set, get) => ({
       case 'notification:delete': set({ notifications: st.notifications.filter((n) => n.id !== p.id) }); break;
       case 'models:update': set({ models: p }); break;
       case 'settings:update': set({ settings: { ...st.settings, [p.key]: p.value } }); break;
+      case 'preview:update': {
+        // Session snapshot. A snapshot without `log` keeps the lines streamed so far.
+        const pid = p.project_id ?? p.projectId;
+        if (!pid) break;
+        const prev = st.previews[pid];
+        set({ previews: { ...st.previews, [pid]: { ...prev, ...p, log: Array.isArray(p.log) ? capLog(p.log) : prev?.log || [] } } });
+        break;
+      }
+      case 'preview:log': {
+        const prev = st.previews[p.project_id];
+        const lines = Array.isArray(p.lines) ? p.lines : [String(p.lines ?? '')];
+        set({ previews: { ...st.previews, [p.project_id]: { ...prev, log: capLog([...(prev?.log || []), ...lines]) } } });
+        break;
+      }
       case 'sync:log': set({ syncTick: st.syncTick + 1 }); break;
       case 'evolution:event': set({ evolutionTick: st.evolutionTick + 1 }); break;
       default: break;

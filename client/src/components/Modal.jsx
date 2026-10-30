@@ -3,10 +3,10 @@ import { createPortal } from 'react-dom';
 import { X, Maximize2, Minimize2 } from 'lucide-react';
 import { cx, IconButton } from './ui.jsx';
 
-const SIZES = { sm: 'w-[min(440px,94vw)]', md: 'w-[min(620px,94vw)]', lg: 'w-[min(920px,95vw)] h-[min(720px,90vh)]', xl: 'w-[min(1280px,96vw)] h-[min(860px,92vh)]' };
+const SIZES = { sm: 'w-[min(440px,94vw)]', md: 'w-[min(620px,94vw)]', lg: 'w-[min(920px,95vw)] h-[min(720px,90vh)]', xl: 'w-[min(1280px,96vw)] h-[min(860px,92vh)]', full: 'w-[97vw] h-[94vh]' };
 
 /** Dialog that can be "spread" to fill the viewport. */
-export function Modal({ open, onClose, title, icon: Icon, subtitle, size = 'md', actions, footer, children, bodyClass, spreadable = size !== 'sm' && size !== 'md' }) {
+export function Modal({ open, onClose, title, icon: Icon, subtitle, size = 'md', actions, footer, children, bodyClass, spreadable = size === 'lg' || size === 'xl' }) {
   const [spread, setSpread] = useState(false);
   useEffect(() => {
     if (!open) return;

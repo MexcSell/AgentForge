@@ -11,11 +11,13 @@ import { pool, migrate, one } from './db/pool.js';
 import { seed, getSettings, sanitizeMonitor } from './db/seed.js';
 import { addClient, emit, clientCount } from './events.js';
 import { attachTerminal, killAllTerminals, terminalCount } from './services/terminal.js';
+import { killAllPreviews } from './services/runner.js';
 import { notify } from './services/notify.js';
 import { createSampler, measureOnce } from './services/metrics.js';
 import { busyState, recoverInterrupted } from './orchestrator/engine.js';
 import apiRoutes from './routes/api.js';
 import filesRoutes from './routes/files.js';
+import previewRoutes, { previewHook } from './routes/preview.js';
 
 const startedAt = new Date();
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
@@ -28,6 +30,8 @@ let supervisor = { attached: config.supervised, pendingRestart: false, building:
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL || 'warn' }, bodyLimit: 25 * 1024 * 1024 });
 await app.register(websocket);
 await app.register(multipart, { limits: { fileSize: 200 * 1024 * 1024, files: 50 } });
+// /preview/<id>/* (and root-absolute requests from a preview page) are served before routing and body parsing.
+app.addHook('onRequest', previewHook);
 
 async function systemStatus() {
   let db = false;
@@ -117,6 +121,7 @@ await app.register(apiRoutes, {
   },
 });
 await app.register(filesRoutes);
+await app.register(previewRoutes);
 
 await app.register(fastifyStatic, { root: config.uploadsDir, prefix: '/uploads/', decorateReply: false });
 if (fs.existsSync(config.clientDist)) {
@@ -175,6 +180,7 @@ async function shutdown(reason) {
   metricsHalted = true;
   syncMetrics();
   killAllTerminals();
+  await killAllPreviews();
   await app.close().catch(() => {});
   await pool.end().catch(() => {});
   process.exit(0);

@@ -13,6 +13,7 @@ export default defineConfig({
     proxy: {
       '/api': { target: api, ws: true },
       '/uploads': api,
+      '/preview': { target: api, ws: true }, // project previews (dev servers proxied by the API, HMR sockets included)
     },
   },
 });

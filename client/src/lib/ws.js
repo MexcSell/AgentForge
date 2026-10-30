@@ -21,6 +21,7 @@ export function connectEvents() {
     // Resync everything after a reconnect (e.g. the server restarted).
     st.loadAll().catch(() => {});
     for (const pid of Object.keys(st.topics)) reloadProject(pid).catch(() => {});
+    for (const pid of Object.keys(st.previews)) st.loadPreview(pid).catch(() => {});
   };
   socket.onmessage = (e) => {
     try {

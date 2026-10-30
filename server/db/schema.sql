@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at      timestamptz NOT NULL DEFAULT now(),
   updated_at      timestamptz NOT NULL DEFAULT now()
 );
+-- Run & preview settings; NULL means auto-detect (package.json dev/start, index.html) and a free port.
+ALTER TABLE projects
+  ADD COLUMN IF NOT EXISTS run_command  text,
+  ADD COLUMN IF NOT EXISTS preview_port int,
+  ADD COLUMN IF NOT EXISTS preview_path text;
 
 CREATE TABLE IF NOT EXISTS missions (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
