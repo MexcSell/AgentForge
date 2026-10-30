@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft, ArrowRight, ArrowUp, RefreshCw, FilePlus, FolderPlus, Upload, Copy, Scissors, ClipboardPaste, Trash2, Pencil, Plus, X, Eye, EyeOff,
-  LayoutList, LayoutGrid, Download, TerminalSquare, ChevronRight, ChevronDown, FolderTree, Link, Files as FilesIcon, Search, CopyPlus, FolderOpen,
+  LayoutList, LayoutGrid, Download, TerminalSquare, ChevronRight, ChevronDown, FolderTree, Link, Files as FilesIcon, Search, CopyPlus, FolderOpen, ClipboardCopy,
 } from 'lucide-react';
 import { api } from '../../lib/api.js';
 import { useStore } from '../../lib/store.js';
@@ -200,6 +200,11 @@ function FilePane({ pane, index, count, root, active, onFocus, onClose, onSplit 
   };
 
   const crumbs = path ? path.split('/').filter(Boolean) : [];
+  // mousedown preventDefault keeps focus in the path input, so copying doesn't end edit mode.
+  const copyPath = (
+    <IconButton icon={ClipboardCopy} size="sm" label="Copy path" className="mr-0.5" onMouseDown={(e) => e.preventDefault()}
+      onClick={async (e) => { e.stopPropagation(); if (await copyText(path)) toast.success('Path copied', path); else toast.error('Could not copy path'); }} />
+  );
   return (
     <div ref={box} tabIndex={0} onKeyDown={onKey} onMouseDown={onFocus} className={cx('h-full flex flex-col outline-none', active && count > 1 && 'ring-1 ring-inset ring-accent/40')}>
       <div className="flex items-center gap-0.5 h-10 px-1.5 border-b border-line shrink-0">
@@ -207,16 +212,19 @@ function FilePane({ pane, index, count, root, active, onFocus, onClose, onSplit 
         <IconButton icon={ArrowRight} label="Forward" disabled={!hist.fwd.length} onClick={fwd} />
         <IconButton icon={ArrowUp} label="Up (Backspace)" disabled={!data?.parent} onClick={() => go(data.parent)} />
         {editPath != null ? (
-          <Input autoFocus className="flex-1 mx-1 mono" value={editPath} onChange={(e) => setEditPath(e.target.value)} onBlur={() => setEditPath(null)}
+          <Input autoFocus className="flex-1 mx-1 mono" value={editPath} onChange={(e) => setEditPath(e.target.value)} onBlur={() => setEditPath(null)} right={copyPath}
             onKeyDown={(e) => { if (e.key === 'Enter') { go(editPath.trim()); setEditPath(null); } if (e.key === 'Escape') setEditPath(null); }} />
         ) : (
-          <div className="flex-1 min-w-0 flex items-center gap-0.5 mx-1 h-7 px-1.5 rounded-md bg-sunken border border-line text-xs overflow-x-auto cursor-text" onClick={(e) => e.target === e.currentTarget && setEditPath(path)}>
-            <button className="px-1 rounded hover:bg-hover" onClick={() => go('/')}>/</button>
-            {crumbs.map((c, i) => (
-              <span key={i} className="flex items-center shrink-0"><ChevronRight size={11} className="text-subtle" />
-                <button className="px-1 rounded hover:bg-hover" {...dropHandlers('/' + crumbs.slice(0, i + 1).join('/'))} onClick={() => go('/' + crumbs.slice(0, i + 1).join('/'))}>{c}</button></span>
-            ))}
-            <span className="flex-1 self-stretch" onClick={() => setEditPath(path)} />
+          <div className="flex-1 min-w-0 flex items-center mx-1 h-7 rounded-md bg-sunken border border-line text-xs">
+            <div className="flex-1 min-w-0 self-stretch flex items-center gap-0.5 pl-1.5 overflow-x-auto cursor-text" onClick={(e) => e.target === e.currentTarget && setEditPath(path)}>
+              <button className="px-1 rounded hover:bg-hover" onClick={() => go('/')}>/</button>
+              {crumbs.map((c, i) => (
+                <span key={i} className="flex items-center shrink-0"><ChevronRight size={11} className="text-subtle" />
+                  <button className="px-1 rounded hover:bg-hover" {...dropHandlers('/' + crumbs.slice(0, i + 1).join('/'))} onClick={() => go('/' + crumbs.slice(0, i + 1).join('/'))}>{c}</button></span>
+              ))}
+              <span className="flex-1 self-stretch" onClick={() => setEditPath(path)} />
+            </div>
+            {copyPath}
           </div>
         )}
         <IconButton icon={FilePlus} label="New file" onClick={() => setCreating('file')} />
@@ -330,11 +338,6 @@ export default function Files({ layout }) {
 
   // Keep a map of pane → current path (FilePane persists into the store).
   useEffect(() => { setPaths(Object.fromEntries(panes.map((p) => [p.id, p.path]))); }, [panes]);
-  useEffect(() => {
-    const on = (e) => { if (useStore.getState().termFollow === false) useStore.getState().set({ termFollow: true }); setPaths((x) => ({ ...x, [activeId]: e.detail })); };
-    window.addEventListener('af:terminal-cd', on);
-    return () => window.removeEventListener('af:terminal-cd', on);
-  }, [activeId]);
 
   const split = useCallback((path) => {
     if (panes.length >= 4) return toast.warn('Up to 4 panes');

@@ -3,7 +3,7 @@ import { api } from './api.js';
 import { toast } from './toast.js';
 
 const PREF_KEY = 'af.prefs';
-const PREFS = ['theme', 'accent', 'layoutId', 'view', 'activeProjectId', 'activeTopic', 'filePanes', 'activePane', 'termFollow', 'showHidden', 'notifFilter'];
+const PREFS = ['theme', 'accent', 'layoutId', 'view', 'activeProjectId', 'activeTopic', 'filePanes', 'activePane', 'showHidden', 'notifFilter'];
 
 function loadPrefs() {
   try { return JSON.parse(localStorage.getItem(PREF_KEY) || '{}'); } catch { return {}; }
@@ -53,7 +53,6 @@ export const useStore = create((set, get) => ({
   activeTopic: prefs.activeTopic || {}, // { [projectId]: topicId }
   filePanes: prefs.filePanes?.length ? prefs.filePanes : [{ id: 'p1', path: null }],
   activePane: prefs.activePane || 'p1',
-  termFollow: prefs.termFollow ?? true,
   showHidden: prefs.showHidden ?? false,
   notifFilter: prefs.notifFilter || 'all',
 

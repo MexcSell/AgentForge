@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
-import { Plus, X, TerminalSquare, Link2, Link2Off } from 'lucide-react';
+import { Plus, X, TerminalSquare } from 'lucide-react';
 import { useStore } from '../../lib/store.js';
 import { cx, IconButton } from '../../components/ui.jsx';
 
@@ -39,26 +39,24 @@ function TermView({ id, cwd, active, dark, onExit }) {
   return <div ref={ref} className={cx('absolute inset-0', !active && 'invisible')} />;
 }
 
-/** Sends a cd to the active terminal (used when the file manager navigates). */
+/** Sends a one-time cd to a terminal (used by the file manager's "Open terminal here"). */
 export function terminalCd(id, path) {
   const s = sessions.get(id);
   if (s?.ws.readyState === 1) s.ws.send(JSON.stringify({ type: 'input', data: ` cd -- '${path.replace(/'/g, "'\\''")}'\r` }));
 }
 
+/** `cwd` only seeds new tabs; folder navigation never sends input to the shell. */
 export function TerminalPanel({ cwd }) {
   const theme = useStore((s) => s.theme);
-  const follow = useStore((s) => s.termFollow);
-  const set = useStore((s) => s.set);
   const dark = theme === 'dark' || (theme === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
   const [tabs, setTabs] = useState(() => [{ id: `t${Date.now()}`, cwd, n: 1 }]);
   const [active, setActive] = useState(tabs[0].id);
-  const lastCwd = useRef(cwd);
 
   useEffect(() => {
-    if (!follow || !cwd || cwd === lastCwd.current) return;
-    lastCwd.current = cwd;
-    terminalCd(active, cwd);
-  }, [cwd, follow]);
+    const on = (e) => e.detail && terminalCd(active, e.detail);
+    window.addEventListener('af:terminal-cd', on);
+    return () => window.removeEventListener('af:terminal-cd', on);
+  }, [active]);
 
   const add = () => {
     const t = { id: `t${Date.now()}`, cwd, n: Math.max(0, ...tabs.map((x) => x.n)) + 1 };
@@ -82,10 +80,6 @@ export function TerminalPanel({ cwd }) {
           </div>
         ))}
         <IconButton icon={Plus} size="sm" label="New terminal" onClick={add} />
-        <div className="ml-auto flex items-center gap-1 shrink-0">
-          <span className="text-[0.68rem] text-subtle mono truncate max-w-64 hidden md:block">{cwd}</span>
-          <IconButton icon={follow ? Link2 : Link2Off} size="sm" active={follow} label={follow ? 'Following the active folder (click to unlink)' : 'Not following the active folder'} onClick={() => set({ termFollow: !follow })} />
-        </div>
       </div>
       <div className="relative flex-1 min-h-0">
         {tabs.map((t) => <TermView key={t.id} id={t.id} cwd={t.cwd} active={active === t.id} dark={dark} />)}
