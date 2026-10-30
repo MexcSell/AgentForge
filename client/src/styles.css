@@ -30,6 +30,10 @@
   --color-warn-soft: color-mix(in oklab, var(--af-warn) 16%, transparent);
   --color-bad-soft: color-mix(in oklab, var(--af-bad) 14%, transparent);
   --color-info-soft: color-mix(in oklab, var(--af-info) 14%, transparent);
+  /* Text-safe tone inks for small text on the -soft fills (tag chips): >= 4.5:1 in both themes. */
+  --color-info-ink: color-mix(in oklab, var(--af-info) var(--af-ink-mix), var(--af-fg));
+  --color-ok-ink: color-mix(in oklab, var(--af-ok) var(--af-ink-mix), var(--af-fg));
+  --color-warn-ink: color-mix(in oklab, var(--af-warn) var(--af-ink-mix), var(--af-fg));
 }
 
 :root {
@@ -51,6 +55,7 @@
   --af-warn: #b7791f;
   --af-bad: #d03b3b;
   --af-info: #2a78d6;
+  --af-ink-mix: 70%;
   --af-series-1: #2a78d6;
   --af-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 8px 24px -12px rgba(0, 0, 0, 0.12);
   --af-shadow-lg: 0 24px 64px -16px rgba(0, 0, 0, 0.28), 0 0 0 1px rgba(0, 0, 0, 0.06);
@@ -72,6 +77,7 @@
   --af-warn: #f5b041;
   --af-bad: #f05252;
   --af-info: #3987e5;
+  --af-ink-mix: 80%;
   --af-series-1: #3987e5;
   --af-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -12px rgba(0, 0, 0, 0.6);
   --af-shadow-lg: 0 24px 80px -12px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(255, 255, 255, 0.06);

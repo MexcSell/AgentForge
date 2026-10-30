@@ -10,6 +10,7 @@ import { getSettings } from '../db/seed.js';
 import { ROLES, TIERS } from '../roles.js';
 import { listAgents, getAgent, createAgent, cloneAgent, publishAgent } from '../services/agents.js';
 import { listProjects, getProject, createProjectRecord, publishProject } from '../services/projects.js';
+import { listTopics, getTopic, createTopic, updateTopic, deleteTopic, isUuid } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
 import { gitInfo } from '../services/git.js';
 import { listModels, publishModels, PROVIDERS, runModel, recordRunUsage } from '../models/index.js';
@@ -60,27 +61,64 @@ export default async function apiRoutes(app) {
     return { deleted, refused };
   });
 
-  app.get('/api/projects/:id/messages', async (req) => many(
-    `SELECT * FROM (SELECT m.*, a.name AS agent_name, a.role AS agent_role, a.title AS agent_title FROM messages m LEFT JOIN agents a ON a.id = m.agent_id
-     WHERE m.project_id = $1 ORDER BY m.created_at DESC LIMIT $2) x ORDER BY created_at`,
-    [req.params.id, Math.min(1000, Number(req.query.limit) || 300)]));
+  // Optional ?topic=<id> narrows to one topic thread; without it the whole project chat is returned.
+  app.get('/api/projects/:id/messages', async (req, reply) => {
+    const topic = req.query.topic || null;
+    if (topic && !isUuid(topic)) return err(reply, 400, 'Invalid topic id');
+    return many(
+      `SELECT * FROM (SELECT m.*, a.name AS agent_name, a.role AS agent_role, a.title AS agent_title FROM messages m LEFT JOIN agents a ON a.id = m.agent_id
+       WHERE m.project_id = $1${topic ? ' AND m.topic_id = $3' : ''} ORDER BY m.created_at DESC LIMIT $2) x ORDER BY created_at`,
+      [req.params.id, Math.min(1000, Number(req.query.limit) || 300), ...(topic ? [topic] : [])]);
+  });
 
   app.get('/api/projects/:id/tasks', async (req) => many(
     `SELECT t.*, a.name AS agent_name, a.role AS agent_role FROM tasks t LEFT JOIN agents a ON a.id = t.agent_id
      WHERE t.project_id = $1 ORDER BY t.created_at DESC LIMIT 150`, [req.params.id]));
 
   app.post('/api/projects/:id/command', async (req, reply) => {
-    const { content, attachments } = req.body || {};
+    const { content, attachments, topic_id } = req.body || {};
     if (!content?.trim() && !attachments?.length) return err(reply, 400, 'Empty command');
-    return submitCommand(req.params.id, { content: content || '(see attached images)', attachments: attachments || [] });
+    return submitCommand(req.params.id, { content: content || '(see attached images)', attachments: attachments || [], topicId: topic_id || null });
   });
   app.post('/api/projects/:id/cancel', (req) => cancelMission(req.params.id).then((ok) => ({ ok })));
-  app.post('/api/projects/:id/standup', (req) => standup(req.params.id));
+  app.post('/api/projects/:id/standup', (req) => standup(req.params.id, req.body?.topic_id || null));
   app.post('/api/projects/:id/sync', (req) => syncNow(req.params.id, 'Manual sync from AgentForge'));
   app.get('/api/projects/:id/git', async (req, reply) => {
     const p = await getProject(req.params.id);
     if (!p) return err(reply, 404, 'Not found');
     return { ...(await gitInfo(p.path)), logs: await many(`SELECT * FROM sync_logs WHERE project_id = $1 ORDER BY created_at DESC LIMIT 20`, [p.id]) };
+  });
+
+  // ---- topics (chat threads) ---------------------------------------------
+  app.get('/api/projects/:id/topics', async (req, reply) => {
+    if (!isUuid(req.params.id)) return err(reply, 404, 'Not found');
+    return listTopics(req.params.id);
+  });
+
+  app.post('/api/projects/:id/topics', async (req, reply) => {
+    if (!isUuid(req.params.id) || !(await one(`SELECT 1 FROM projects WHERE id = $1`, [req.params.id]))) return err(reply, 404, 'Not found');
+    const { title, tags } = req.body || {};
+    const named = typeof title === 'string' && !!title.trim();
+    const t = await createTopic({ project_id: req.params.id, title: named ? title : undefined, tags, title_locked: named });
+    emit('topic:new', t);
+    return t;
+  });
+
+  app.patch('/api/topics/:id', async (req, reply) => {
+    const t = await getTopic(req.params.id);
+    if (!t) return err(reply, 404, 'Not found');
+    const { title, tags, archived } = req.body || {};
+    if (title !== undefined && !String(title ?? '').trim()) return err(reply, 400, 'Title cannot be empty');
+    // A human rename pins the title so the manager stops auto-naming the topic.
+    return updateTopic(t.id, { title, tags, archived, title_locked: title !== undefined ? true : undefined });
+  });
+
+  app.delete('/api/topics/:id', async (req, reply) => {
+    const t = await getTopic(req.params.id);
+    if (!t) return err(reply, 404, 'Not found');
+    if (t.running) return err(reply, 409, 'This topic has a mission in progress');
+    await deleteTopic(t.id);
+    return { ok: true };
   });
 
   app.post('/api/tasks/:id/approve', (req) => approveProposal(req.params.id));

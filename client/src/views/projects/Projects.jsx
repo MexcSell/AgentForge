@@ -186,9 +186,15 @@ function ProjectList() {
 export default function Projects({ layout }) {
   const st = useStore();
   const project = st.projects.find((p) => p.id === st.activeProjectId);
+  const topicId = project ? st.activeTopic[project.id] : null;
+  const cached = !!(topicId && st.messages[topicId]);
+  // Topics first (that picks the active topic), then the active topic's messages whenever they are not cached.
   useEffect(() => {
-    if (project && !st.messages[project.id]) st.loadMessages(project.id).catch(() => {});
+    if (project && !st.topics[project.id]) st.loadTopics(project.id).catch(() => {});
   }, [project?.id]);
+  useEffect(() => {
+    if (project && topicId && !cached) st.loadMessages(project.id, topicId).catch(() => {});
+  }, [project?.id, topicId, cached]);
   const L = layout.project;
   const nodes = {
     list: { id: 'list', size: L.sizes.list ?? 20, min: 12, node: <ProjectList /> },

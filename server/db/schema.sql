@@ -155,6 +155,48 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_project_idx ON messages(project_id, created_at);
 
+-- A project's chat is split into topic threads.
+CREATE TABLE IF NOT EXISTS topics (
+  id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id        uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title             text NOT NULL DEFAULT 'New topic',
+  tags              jsonb NOT NULL DEFAULT '[]',
+  title_locked      boolean NOT NULL DEFAULT false,   -- true once a human (or the backfill) named it
+  archived          boolean NOT NULL DEFAULT false,
+  created_at        timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  last_activity_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS topics_project_idx ON topics(project_id, last_activity_at DESC);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS topic_id uuid REFERENCES topics(id) ON DELETE CASCADE;
+ALTER TABLE missions ADD COLUMN IF NOT EXISTS topic_id uuid REFERENCES topics(id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS messages_topic_idx ON messages(topic_id, created_at);
+CREATE INDEX IF NOT EXISTS missions_topic_idx ON missions(topic_id);
+-- Backfill: history without a topic goes to one locked 'General' topic per project (reused, never duplicated).
+-- Missions left without a topic by a topic delete stay unassigned once the project already has topics.
+DO $$
+DECLARE r record; tid uuid; created boolean; newest timestamptz;
+BEGIN
+  FOR r IN
+    SELECT p.id FROM projects p
+    WHERE EXISTS (SELECT 1 FROM messages m WHERE m.project_id = p.id AND m.topic_id IS NULL)
+       OR (EXISTS (SELECT 1 FROM missions s WHERE s.project_id = p.id AND s.topic_id IS NULL)
+           AND NOT EXISTS (SELECT 1 FROM topics t WHERE t.project_id = p.id))
+  LOOP
+    SELECT id INTO tid FROM topics WHERE project_id = r.id AND title = 'General' AND title_locked ORDER BY created_at LIMIT 1;
+    created := tid IS NULL;
+    IF created THEN
+      INSERT INTO topics(project_id, title, tags, title_locked) VALUES (r.id, 'General', '["history"]', true) RETURNING id INTO tid;
+    END IF;
+    UPDATE messages SET topic_id = tid WHERE project_id = r.id AND topic_id IS NULL;
+    UPDATE missions SET topic_id = tid WHERE project_id = r.id AND topic_id IS NULL;
+    SELECT max(created_at) INTO newest FROM messages WHERE topic_id = tid;
+    IF newest IS NOT NULL THEN
+      UPDATE topics SET last_activity_at = CASE WHEN created THEN newest ELSE greatest(last_activity_at, newest) END WHERE id = tid;
+    END IF;
+  END LOOP;
+END $$;
+
 CREATE TABLE IF NOT EXISTS notifications (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   source_type  text NOT NULL DEFAULT 'system',   -- admin | manager | agent | system

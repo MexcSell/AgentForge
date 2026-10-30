@@ -19,7 +19,20 @@ const imageNote = (attachments) => {
   return imgs.length ? `\nAttached images (open them with the Read tool):\n${imgs.map((a) => `- ${a.path}`).join('\n')}\n` : '';
 };
 
-export function planPrompt({ project, gm, command, attachments, agents, recent }) {
+const clip = (s, n) => {
+  const t = String(s || '').replace(/\s+/g, ' ').trim();
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+};
+
+/** Compact context of the current chat topic: title, tags and up to 4 earlier missions (newest first). Hard cap 1500 chars. */
+export function topicContext(topic, history = []) {
+  if (!topic) return '';
+  const head = `"${topic.title}"${topic.tags?.length ? ` · tags: ${topic.tags.join(', ')}` : ''}`;
+  const lines = history.slice(0, 4).map((m) => `- [${m.status}] ${clip(m.command, 120)} → ${clip(String(m.summary || '').replace(/^\*\*Mission \w+\*\*[^\n]*/, '').replace(/\*\*/g, ''), 240) || '—'}`);
+  return (lines.length ? `${head}\nRecent missions in this topic:\n${lines.join('\n')}` : `${head} · first order in this topic`).slice(0, 1500);
+}
+
+export function planPrompt({ project, gm, command, attachments, agents, topic }) {
   const roster = agents
     .filter((a) => !['executive', 'evolution', 'analyst', 'optimizer', 'manager'].includes(a.role))
     .map((a) => `- ${a.name} · ${a.role} · L${a.level} · skills: ${a.skills.map((s) => `${s.name}:${s.level}`).join(', ')} · ${a.status}`)
@@ -32,11 +45,12 @@ Rules:
 - Valid roles: ${Object.keys(ROLES).filter((r) => !['executive', 'evolution', 'analyst', 'optimizer', 'manager'].includes(r)).join(', ')}. You may invent a new specialist role (kebab-case) when none fits; the platform will recruit that agent.
 - Code-changing work must be followed by an independent verification task (role "reviewer" or "qa") that depends on it.
 - If the message is a question or small talk that needs no work, answer it in "reply" and return an empty "tasks" array.
-- Never include git commit/push steps: the platform syncs GitHub automatically after the mission.`;
+- Never include git commit/push steps: the platform syncs GitHub automatically after the mission.
+- Orders arrive in chat topics. Give "topic" a title of at most 6 words and 1-3 short lowercase tags for this order. Set "new": true only when the order is clearly unrelated to the current topic's title and recent missions; small talk and follow-ups stay in the topic.`;
   const prompt = `Project: ${project.name}
 Working directory: ${project.path}
 Project brief: ${project.description || '(none)'}
-${recent ? `Recent missions:\n${recent}\n` : ''}
+${topic ? `Current topic: ${topic}\n` : ''}
 Agent registry:
 ${roster || '(empty)'}
 
@@ -49,6 +63,7 @@ You may inspect the project files (read-only) to plan precisely. Respond with ON
 {
   "analysis": "one or two sentences on what is needed",
   "reply": "optional direct answer to the user (for questions/small talk)",
+  "topic": { "title": "≤6 words", "tags": ["1-3 short lowercase tags"], "new": false },
   "tasks": [
     { "key": "T1", "title": "short imperative title", "role": "frontend", "skills": ["react"],
       "description": "precise scope: what to change and where", "acceptance": ["verifiable criterion"], "depends_on": [] }

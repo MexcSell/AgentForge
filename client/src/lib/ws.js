@@ -4,6 +4,14 @@ const RETRY_MS = 5000; // while the connection is down, try again every 5 s
 
 let socket = null;
 
+// Topics first (they pick the active topic), then every topic whose messages were cached plus the active one.
+async function reloadProject(pid) {
+  await useStore.getState().loadTopics(pid);
+  const st = useStore.getState();
+  const active = st.activeTopic[pid];
+  await Promise.all((st.topics[pid] || []).filter((t) => t.id === active || st.messages[t.id]).map((t) => st.loadMessages(pid, t.id)));
+}
+
 export function connectEvents() {
   const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`;
   socket = new WebSocket(url);
@@ -12,7 +20,7 @@ export function connectEvents() {
     st.set({ connected: true });
     // Resync everything after a reconnect (e.g. the server restarted).
     st.loadAll().catch(() => {});
-    for (const pid of Object.keys(st.messages)) st.loadMessages(pid).catch(() => {});
+    for (const pid of Object.keys(st.topics)) reloadProject(pid).catch(() => {});
   };
   socket.onmessage = (e) => {
     try {

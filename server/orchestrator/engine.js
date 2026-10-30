@@ -5,11 +5,12 @@ import { getSettings } from '../db/seed.js';
 import { normalizeRole, roleInfo } from '../roles.js';
 import { getAgent, listAgents, createAgent, cloneAgent, setAgentStatus, publishAgent } from '../services/agents.js';
 import { getProject, publishProject, setProjectStatus } from '../services/projects.js';
+import { getTopic, createTopic, updateTopic, touchTopic, ensureTopic, publishTopic } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
 import { syncProject } from '../services/git.js';
 import { resolveModel, runModel, recordRunUsage, publishModels } from '../models/index.js';
-import { heuristicPlan } from './heuristics.js';
-import { planPrompt, taskPrompt, parseJson } from './prompts.js';
+import { heuristicPlan, topicTitle } from './heuristics.js';
+import { planPrompt, taskPrompt, parseJson, topicContext } from './prompts.js';
 import { learn, analyzeMission } from './evolution.js';
 
 const active = new Map(); // projectId -> { missionId, controller }
@@ -22,12 +23,15 @@ export function busyState() {
 
 // ---- messages ------------------------------------------------------------
 
-export async function postMessage({ project_id, mission_id = null, author_type, agent_id = null, kind = 'chat', content = '', attachments = [], meta = {} }) {
+// Without an explicit topic_id a mission's messages land in the mission's current topic.
+export async function postMessage({ project_id, mission_id = null, topic_id = null, author_type, agent_id = null, kind = 'chat', content = '', attachments = [], meta = {} }) {
+  if (!topic_id && mission_id) topic_id = (await one(`SELECT topic_id FROM missions WHERE id = $1`, [mission_id]))?.topic_id || null;
   const row = await one(
-    `INSERT INTO messages(project_id, mission_id, author_type, agent_id, kind, content, attachments, meta)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [project_id, mission_id, author_type, agent_id, kind, content, JSON.stringify(attachments), meta],
+    `INSERT INTO messages(project_id, mission_id, topic_id, author_type, agent_id, kind, content, attachments, meta)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [project_id, mission_id, topic_id, author_type, agent_id, kind, content, JSON.stringify(attachments), meta],
   );
+  if (topic_id) await touchTopic(topic_id);
   const full = await one(`SELECT m.*, a.name AS agent_name, a.role AS agent_role, a.title AS agent_title FROM messages m LEFT JOIN agents a ON a.id = m.agent_id WHERE m.id = $1`, [row.id]);
   emit('message:new', full);
   return full;
@@ -101,18 +105,19 @@ async function bumpAgentStats(agentId, out) {
 
 // ---- commands ------------------------------------------------------------
 
-export async function submitCommand(projectId, { content, attachments = [] }) {
+export async function submitCommand(projectId, { content, attachments = [], topicId = null }) {
   const project = await getProject(projectId);
   if (!project) throw new Error('project not found');
+  const topic = await ensureTopic(projectId, topicId);
   const text = String(content || '').trim();
-  const userMsg = await postMessage({ project_id: projectId, author_type: 'user', content: text, attachments });
+  const userMsg = await postMessage({ project_id: projectId, topic_id: topic.id, author_type: 'user', content: text, attachments });
 
   const slash = text.match(/^\/(\w+)/)?.[1]?.toLowerCase();
-  if (slash === 'stop') { await cancelMission(projectId); return userMsg; }
-  if (slash === 'standup') { await standup(projectId); return userMsg; }
-  if (slash === 'sync') { await syncNow(projectId, 'Manual sync'); return userMsg; }
+  if (slash === 'stop') { await cancelMission(projectId, topic.id); return userMsg; }
+  if (slash === 'standup') { await standup(projectId, topic.id); return userMsg; }
+  if (slash === 'sync') { await syncNow(projectId, 'Manual sync', topic.id); return userMsg; }
 
-  const mission = await one(`INSERT INTO missions(project_id, command) VALUES ($1,$2) RETURNING *`, [projectId, text]);
+  const mission = await one(`INSERT INTO missions(project_id, command, topic_id) VALUES ($1,$2,$3) RETURNING *`, [projectId, text, topic.id]);
   await query(`UPDATE messages SET mission_id = $2 WHERE id = $1`, [userMsg.id, mission.id]);
   mission.attachments = attachments;
   const q = queues.get(projectId) || [];
@@ -142,27 +147,28 @@ function pump(projectId) {
     });
 }
 
-export async function cancelMission(projectId) {
+// topicId: where /stop was typed. Without it the reply goes to the running mission's topic.
+export async function cancelMission(projectId, topicId = null) {
   const a = active.get(projectId);
   queues.set(projectId, []);
   const project = await getProject(projectId);
   if (!a) {
-    await postMessage({ project_id: projectId, author_type: 'agent', agent_id: project?.manager_id, kind: 'status', content: 'Nothing is running.' });
+    await postMessage({ project_id: projectId, topic_id: (await ensureTopic(projectId, topicId)).id, author_type: 'agent', agent_id: project?.manager_id, kind: 'status', content: 'Nothing is running.' });
     return false;
   }
   a.controller.abort();
-  await postMessage({ project_id: projectId, mission_id: a.missionId, author_type: 'agent', agent_id: project?.manager_id, kind: 'status', content: 'Stopping all agents on this mission.' });
+  // mission_id stays off a reply posted in another topic, so mission messages always share the mission's topic.
+  await postMessage({ project_id: projectId, mission_id: topicId ? null : a.missionId, topic_id: topicId, author_type: 'agent', agent_id: project?.manager_id, kind: 'status', content: 'Stopping all agents on this mission.' });
   return true;
 }
 
 // ---- planning & staffing -------------------------------------------------
 
-async function plan({ project, gm, mission, signal }) {
+// Context is scoped to the mission's topic: a brand-new topic sends no prior missions at all.
+async function plan({ project, gm, mission, topic, history, signal }) {
   const agents = await listAgents();
-  const recent = (await many(`SELECT command, status, summary FROM missions WHERE project_id = $1 AND id <> $2 ORDER BY created_at DESC LIMIT 4`, [project.id, mission.id]))
-    .map((m) => `- [${m.status}] ${m.command.slice(0, 120)}`).join('\n');
   const model = await resolveModel(gm.model_id);
-  const { system, prompt } = planPrompt({ project, gm, command: mission.command, attachments: mission.attachments, agents, recent });
+  const { system, prompt } = planPrompt({ project, gm, command: mission.command, attachments: mission.attachments, agents, topic: topicContext(topic, history) });
   let parsed = null;
   let out = null;
   try {
@@ -179,6 +185,25 @@ async function plan({ project, gm, mission, signal }) {
     parsed = heuristicPlan(mission.command);
   }
   return parsed;
+}
+
+/** Name an untitled topic after its first order, or move a clearly unrelated order (and its mission) into a new topic. */
+async function assignTopic({ project, gm, mission, topic, history, p, settings }) {
+  const t = p.topic && typeof p.topic === 'object' ? p.topic : {};
+  const title = topicTitle(t.title) || topicTitle(mission.command);
+  const tags = Array.isArray(t.tags) ? t.tags.slice(0, 3) : undefined;
+  if (!history.length || t.new !== true || settings.orchestrator.autoTopics === false) {
+    if (!topic.title_locked && (!history.length || topic.title === 'New topic')) await updateTopic(topic.id, { title, tags });
+    return;
+  }
+  const fresh = await createTopic({ project_id: project.id, title, tags });
+  await query(`UPDATE missions SET topic_id = $2 WHERE id = $1`, [mission.id, fresh.id]);
+  const moved = await many(`UPDATE messages SET topic_id = $2 WHERE mission_id = $1 RETURNING id`, [mission.id, fresh.id]);
+  mission.topic_id = fresh.id;
+  emit('topic:new', { ...(await getTopic(fresh.id)), moved_from: topic.id, mission_id: mission.id });
+  emit('topic:moved', { project_id: project.id, mission_id: mission.id, moved_from: topic.id, topic_id: fresh.id, message_ids: moved.map((m) => m.id) });
+  await postMessage({ project_id: project.id, topic_id: topic.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: `Continued in new topic: ${fresh.title}`, meta: { topic_id: fresh.id } });
+  await publishTopic(topic.id);
 }
 
 function normalizeTasks(raw, settings) {
@@ -260,8 +285,20 @@ async function runMission(mission, signal) {
   const started = Date.now();
   try {
     await query(`UPDATE missions SET status='planning' WHERE id=$1`, [mission.id]);
+    // The topic may have been deleted while this order waited in the queue.
+    let topic = await getTopic(mission.topic_id);
+    if (!topic) {
+      topic = await ensureTopic(project.id);
+      await query(`UPDATE missions SET topic_id=$2 WHERE id=$1`, [mission.id, topic.id]);
+      mission.topic_id = topic.id;
+    }
     await publishMission(mission.id);
-    const p = await plan({ project, gm, mission, signal });
+    await publishTopic(topic.id);
+    const history = await many(
+      `SELECT command, status, summary FROM missions WHERE topic_id = $1 AND created_at < (SELECT created_at FROM missions WHERE id = $2) ORDER BY created_at DESC LIMIT 4`,
+      [topic.id, mission.id]);
+    const p = await plan({ project, gm, mission, topic, history, signal });
+    await assignTopic({ project, gm, mission, topic, history, p, settings });
     const tasks = normalizeTasks(p.tasks, settings);
 
     if (!tasks.length) {
@@ -329,6 +366,7 @@ async function runMission(mission, signal) {
   } finally {
     await setAgentStatus(gm.id, 'idle');
     await publishProject(project.id);
+    await publishTopic(mission.topic_id).catch(() => {});
   }
 }
 
@@ -452,11 +490,11 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
 // ---- proposals, meetings, sync ------------------------------------------
 
 export async function approveProposal(taskId) {
-  const t = await one(`SELECT * FROM tasks WHERE id = $1 AND status = 'proposed'`, [taskId]);
+  const t = await one(`SELECT t.*, m.topic_id FROM tasks t LEFT JOIN missions m ON m.id = t.mission_id WHERE t.id = $1 AND t.status = 'proposed'`, [taskId]);
   if (!t) throw new Error('proposal not found');
   await query(`UPDATE tasks SET status='cancelled', result='Approved → new mission' WHERE id=$1`, [taskId]);
   await publishTask(taskId);
-  return submitCommand(t.project_id, { content: `${t.title}\n\n${t.description || ''}`.trim() });
+  return submitCommand(t.project_id, { content: `${t.title}\n\n${t.description || ''}`.trim(), topicId: t.topic_id });
 }
 
 export async function rejectProposal(taskId) {
@@ -464,8 +502,9 @@ export async function rejectProposal(taskId) {
   return publishTask(taskId);
 }
 
-export async function standup(projectId) {
+export async function standup(projectId, topicId = null) {
   const project = await getProject(projectId);
+  const topic = await ensureTopic(projectId, topicId);
   const rows = await many(
     `SELECT DISTINCT ON (a.id) a.name, a.title, a.status, t.key, t.title AS task, t.status AS task_status, t.progress
      FROM tasks t JOIN agents a ON a.id = t.agent_id WHERE t.project_id = $1 ORDER BY a.id, t.created_at DESC`, [projectId]);
@@ -474,16 +513,16 @@ export async function standup(projectId) {
     ? rows.map((r) => `- **${r.name}** (${r.title}) · ${r.status} — last: ${r.key} ${r.task} · ${r.task_status}${r.task_status === 'running' ? ` ${r.progress}%` : ''}`).join('\n')
     : '- No agents have worked on this project yet.';
   return postMessage({
-    project_id: projectId, author_type: 'agent', agent_id: project.manager_id, kind: 'meeting',
+    project_id: projectId, topic_id: topic.id, author_type: 'agent', agent_id: project.manager_id, kind: 'meeting',
     content: `**Stand-up · ${project.name}**\n\n${body}\n\n**Blockers:** ${blockers.length ? blockers.map((b) => `${b.key} (${b.name})`).join(', ') : 'none'}\n**Next:** ${active.has(projectId) ? 'mission in progress' : 'awaiting your next order'}`,
   });
 }
 
-export async function syncNow(projectId, reason) {
+export async function syncNow(projectId, reason, topicId = null) {
   const project = await getProject(projectId);
   const settings = await getSettings();
   const log = await syncProject(project, `${reason}\n\nAgentForge sync`, settings.github);
-  await postMessage({ project_id: projectId, author_type: 'system', kind: 'status', content: `GitHub: ${log.status}${log.commit ? ` · ${log.commit}` : ''} — ${log.message}` });
+  await postMessage({ project_id: projectId, topic_id: (await ensureTopic(projectId, topicId)).id, author_type: 'system', kind: 'status', content: `GitHub: ${log.status}${log.commit ? ` · ${log.commit}` : ''} — ${log.message}` });
   await publishProject(projectId);
   return log;
 }

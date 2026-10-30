@@ -14,3 +14,6 @@ reference/
 .DS_Store
 coverage/
 .vite/
+
+# added by AgentForge (source-only uploads)
+build/

@@ -15,10 +15,13 @@ const RULES = [
 
 const CONVERSATIONAL = /^(hi|hello|hey|thanks|thank you|status|what('?s| is) (the )?status|who are you|help)\b/i;
 
+/** Topic title fallback: the first 6 words, without trailing punctuation. */
+export const topicTitle = (text) => String(text || '').replace(/\s+/g, ' ').trim().split(' ').slice(0, 6).join(' ').replace(/[\s.,;:!?…-]+$/, '');
+
 export function heuristicPlan(command) {
   const text = String(command || '').trim();
   if (!text || (CONVERSATIONAL.test(text) && text.length < 60)) {
-    return { analysis: 'Conversational message; no work required.', reply: 'Ready. Give me a goal and I will break it down, staff it and report back.', tasks: [] };
+    return { analysis: 'Conversational message; no work required.', reply: 'Ready. Give me a goal and I will break it down, staff it and report back.', topic: { title: topicTitle(text), tags: ['chat'], new: false }, tasks: [] };
   }
   const hits = RULES.filter((r) => r.re.test(text));
   const tasks = [];
@@ -46,5 +49,6 @@ export function heuristicPlan(command) {
   }
   push({ title: 'Independent verification', role: 'reviewer', skills: ['code-review'], description: `Independently verify the result of: ${goal}`, acceptance: ['Acceptance criteria of every task checked'], depends_on: tasks.map((t) => t.key) });
 
-  return { analysis: `Detected areas: ${[...new Set(tasks.map((t) => t.role))].join(', ')}.`, tasks };
+  const roles = [...new Set(tasks.map((t) => t.role))];
+  return { analysis: `Detected areas: ${roles.join(', ')}.`, topic: { title: topicTitle(text), tags: roles.filter((r) => !['qa', 'reviewer'].includes(r)).slice(0, 3), new: false }, tasks };
 }
