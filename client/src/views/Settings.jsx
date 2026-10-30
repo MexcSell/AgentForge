@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Settings as SettingsIcon, Sun, Moon, Monitor, Palette, Layers, Workflow, Dna, Server, RefreshCw, Check, Database, Boxes, Layout, Cpu, Zap, ShieldCheck } from 'lucide-react';
+import { Settings as SettingsIcon, Sun, Moon, Monitor, Palette, Layers, Workflow, Dna, Server, RefreshCw, Check, Database, Boxes, Layout, Cpu, Zap, ShieldCheck, Gauge } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { useStore } from '../lib/store.js';
 import { toast } from '../lib/toast.js';
@@ -43,7 +43,10 @@ export default function Settings() {
   const st = useStore();
   const [orc, setOrc] = useState(null);
   const [evo, setEvo] = useState(null);
-  useEffect(() => { if (st.settings) { setOrc(st.settings.orchestrator); setEvo(st.settings.evolution); } }, [st.settings]);
+  const [mon, setMon] = useState(null);
+  useEffect(() => {
+    if (st.settings) { setOrc(st.settings.orchestrator); setEvo(st.settings.evolution); setMon({ enabled: true, intervalSec: 3, ...st.settings.monitor }); }
+  }, [st.settings]);
   const sys = st.system;
   const save = async (key, value) => { await api.put(`/api/settings/${key}`, value); toast.success('Settings saved'); };
   return (
@@ -108,6 +111,20 @@ export default function Settings() {
               <Field label="Playbook size"><Input type="number" min="1" max="20" value={evo.playbookSize} onChange={(e) => setEvo({ ...evo, playbookSize: Number(e.target.value) })} /></Field>
             </div>
             <Button className="mt-4" variant="primary" onClick={() => save('evolution', evo)}>Save learning settings</Button>
+          </Section>
+        )}
+
+        {mon && (
+          <Section icon={Gauge} title="System monitor" desc="CPU, memory, disk and network usage of this machine">
+            <div className="grid gap-4 md:grid-cols-2 items-end">
+              <div className="flex items-center h-8"><Toggle checked={mon.enabled} onChange={(v) => setMon({ ...mon, enabled: v })} label="Show machine usage in the status bar" /></div>
+              <Field label="Redraw interval (seconds)"><Input type="number" min="1" max="60" value={mon.intervalSec} onChange={(e) => setMon({ ...mon, intervalSec: Number(e.target.value) })} /></Field>
+            </div>
+            <Button className="mt-4" variant="primary" onClick={() => {
+              const v = { enabled: mon.enabled, intervalSec: Math.min(60, Math.max(1, Math.round(mon.intervalSec) || 3)) };
+              setMon(v);
+              save('monitor', v);
+            }}>Save monitor settings</Button>
           </Section>
         )}
 

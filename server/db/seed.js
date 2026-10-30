@@ -6,7 +6,18 @@ export const DEFAULT_SETTINGS = {
   orchestrator: { maxParallel: 3, taskTimeoutMin: 30, autoApproveProposals: false, verification: true, retryFailed: true },
   github: { autoSync: true, userName: config.github.userName, userEmail: config.github.userEmail, branch: 'main' },
   evolution: { enabled: true, playbookSize: 8, lessonsPerVersion: 4 },
+  monitor: { enabled: true, intervalSec: 3 },
 };
+
+// Host-metrics status bar: boolean switch + redraw interval clamped to 1–60 s. Bad input keeps `base`.
+export function sanitizeMonitor(value, base = DEFAULT_SETTINGS.monitor) {
+  const v = value && typeof value === 'object' ? value : {};
+  const enabled = v.enabled === undefined ? base.enabled !== false
+    : typeof v.enabled === 'string' ? !/^(false|0|off|no|)$/i.test(v.enabled.trim()) : Boolean(v.enabled);
+  const n = v.intervalSec === null || v.intervalSec === '' ? NaN : Number(v.intervalSec);
+  const intervalSec = Math.min(60, Math.max(1, Math.round(Number.isFinite(n) ? n : Number(base.intervalSec) || DEFAULT_SETTINGS.monitor.intervalSec)));
+  return { enabled, intervalSec };
+}
 
 const DEFAULT_LIMITS = { dailyTokens: 2_000_000, weeklyTokens: 10_000_000, dailyPrompts: 400, weeklyPrompts: 2000, resetHour: 0, weeklyResetDay: 1 };
 

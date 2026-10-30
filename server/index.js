@@ -8,10 +8,11 @@ import fastifyStatic from '@fastify/static';
 import multipart from '@fastify/multipart';
 import { config, ROOT } from './config.js';
 import { pool, migrate, one } from './db/pool.js';
-import { seed } from './db/seed.js';
+import { seed, getSettings, sanitizeMonitor } from './db/seed.js';
 import { addClient, emit, clientCount } from './events.js';
 import { attachTerminal, killAllTerminals, terminalCount } from './services/terminal.js';
 import { notify } from './services/notify.js';
+import { createSampler, measureOnce } from './services/metrics.js';
 import { busyState, recoverInterrupted } from './orchestrator/engine.js';
 import apiRoutes from './routes/api.js';
 import filesRoutes from './routes/files.js';
@@ -42,8 +43,53 @@ async function systemStatus() {
   };
 }
 
+// ---- host metrics (status bar) ---------------------------------------------
+// Sampled only on the real server (not the candidate), while the monitor setting is on and a browser is connected.
+const sampler = createSampler();
+let monitor = sanitizeMonitor();
+let metrics = null; // latest snapshot
+let metricsTimer = null;
+let metricsBusy = false;
+let metricsHalted = false; // set on shutdown
+
+const metricsWanted = () => !config.candidate && !metricsHalted && monitor.enabled && clientCount() > 0;
+
+function armMetrics(sec) {
+  clearTimeout(metricsTimer);
+  metricsTimer = setTimeout(() => metricsTick().catch(() => {}), sec * 1000);
+  metricsTimer.unref();
+}
+
+async function metricsTick() {
+  metricsTimer = null;
+  metricsBusy = true;
+  const snap = await sampler.sample(monitor.intervalSec).catch(() => null);
+  metricsBusy = false;
+  if (!metricsWanted()) return syncMetrics();
+  if (snap) { metrics = snap; emit('system:metrics', snap); }
+  armMetrics(snap ? monitor.intervalSec : 1); // the first reading after priming comes 1 s later
+}
+
+// Start or stop the sampler to match the current state; `rearm` applies a new interval right away.
+function syncMetrics(rearm = false) {
+  if (!metricsWanted()) {
+    clearTimeout(metricsTimer);
+    metricsTimer = null;
+    metrics = null;
+    sampler.reset();
+    return;
+  }
+  if (metricsBusy) return; // the running tick re-arms with the current interval
+  if (!metricsTimer) metricsTick().catch(() => {});
+  else if (rearm) armMetrics(monitor.intervalSec);
+}
+
 app.get('/api/health', async () => ({ ok: true, candidate: config.candidate }));
 app.get('/api/system/status', systemStatus);
+app.get('/api/system/metrics', async () => {
+  if (!monitor.enabled) return { enabled: false };
+  return metrics || measureOnce(monitor.intervalSec);
+});
 app.post('/api/system/restart', async (req, reply) => {
   if (!config.supervised) return reply.code(400).send({ error: 'Not running under the supervisor (start with npm start).' });
   process.send({ type: 'restart-request', force: !!req.body?.force });
@@ -53,14 +99,23 @@ app.post('/api/system/restart', async (req, reply) => {
 app.register(async (scope) => {
   scope.get('/api/events', { websocket: true }, (socket) => {
     addClient(socket);
+    socket.on('close', () => syncMetrics());
     systemStatus().then((s) => socket.send(JSON.stringify({ type: 'system:status', payload: s, ts: Date.now() })));
+    if (metrics) socket.send(JSON.stringify({ type: 'system:metrics', payload: metrics, ts: Date.now() }));
+    syncMetrics();
   });
   scope.get('/api/terminal', { websocket: true }, (socket, req) => {
     attachTerminal(socket, { cwd: req.query.cwd, cols: req.query.cols, rows: req.query.rows });
   });
 });
 
-await app.register(apiRoutes);
+await app.register(apiRoutes, {
+  onSettingsChange: (key, value) => {
+    if (key !== 'monitor') return;
+    monitor = sanitizeMonitor(value);
+    syncMetrics(true);
+  },
+});
 await app.register(filesRoutes);
 
 await app.register(fastifyStatic, { root: config.uploadsDir, prefix: '/uploads/', decorateReply: false });
@@ -79,6 +134,7 @@ if (fs.existsSync(config.clientDist)) {
 // ---- boot ----------------------------------------------------------------
 await migrate();
 await seed();
+monitor = sanitizeMonitor((await getSettings()).monitor);
 if (!config.candidate) await recoverInterrupted();
 
 await app.listen({ port: config.port, host: config.host });
@@ -116,6 +172,8 @@ async function shutdown(reason) {
   closing = true;
   console.log(`[agentforge] shutting down (${reason})`);
   emit('system:restarting', { reason });
+  metricsHalted = true;
+  syncMetrics();
   killAllTerminals();
   await app.close().catch(() => {});
   await pool.end().catch(() => {});

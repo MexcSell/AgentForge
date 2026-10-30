@@ -60,6 +60,7 @@ export const useStore = create((set, get) => ({
   connected: false,
   loaded: false,
   system: null,
+  metrics: null, // latest system:metrics sample (machine usage); stays null with servers that don't send it
   projects: [],
   agents: [],
   models: [],
@@ -161,7 +162,8 @@ export const useStore = create((set, get) => ({
     const st = get();
     switch (type) {
       case 'system:status': set({ system: p }); break;
-      case 'system:restarting': set({ system: { ...(st.system || {}), status: 'restarting' } }); break;
+      case 'system:metrics': set({ metrics: p }); break;
+      case 'system:restarting':set({ system: { ...(st.system || {}), status: 'restarting' } }); break;
       case 'system:client-updated': set({ clientUpdate: p.version }); break;
       case 'project:update': set({ projects: upsert(st.projects, p) }); break;
       case 'project:delete': set({ projects: st.projects.filter((x) => x.id !== p.id), activeProjectId: st.activeProjectId === p.id ? null : st.activeProjectId }); break;

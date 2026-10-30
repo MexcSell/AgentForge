@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   LayoutDashboard, FolderKanban, Bot, FolderTree, Cpu, Settings, Bell, Sun, Moon, Monitor, Search, Command, GitBranch, Activity,
-  CircleCheck, CircleX, TriangleAlert, Info, X, RefreshCw, Zap, WifiOff, Layers, Plus, Users, Dna,
+  CircleCheck, CircleX, TriangleAlert, Info, X, RefreshCw, Zap, WifiOff, Layers, Plus, Users, Dna, MemoryStick, HardDrive, Network,
 } from 'lucide-react';
 import { useStore, selectUnread, selectWorkingAgents, selectRunningProjects } from '../lib/store.js';
 import { useToasts } from '../lib/toast.js';
@@ -137,6 +137,78 @@ function LayoutMenu({ onClose }) {
   );
 }
 
+const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+const fixed = (v, d) => (isNum(v) ? v.toFixed(d) : '—');
+const big = (v) => fixed(v, v >= 100 ? 0 : 1); // GB and Mb/s: one decimal below 100
+const pctText = (v) => (isNum(v) ? `${Math.round(v)}%` : '—');
+/** Milliseconds since the epoch for a sample timestamp (ms, unix seconds or ISO string); NaN if unknown. */
+const tsMs = (ts) => (typeof ts === 'number' ? (ts < 1e12 ? ts * 1000 : ts) : ts ? Date.parse(ts) : NaN);
+
+/** True once `at + ms` has passed; re-renders by itself at that moment. An unknown time never expires. */
+function useExpired(at, ms) {
+  const [, tick] = useState(0);
+  const left = at + ms - Date.now();
+  useEffect(() => {
+    if (!(left > 0)) return undefined;
+    const t = setTimeout(() => tick((n) => n + 1), left + 50);
+    return () => clearTimeout(t);
+  }, [at, ms]);
+  return left <= 0;
+}
+
+/** A number in a fixed-width slot, so redraws don't shift the footer. */
+const Num = ({ w, left, children }) => <span className={cx('inline-block tabular', left ? 'text-left' : 'text-right')} style={{ minWidth: `${w}ch` }}>{children}</span>;
+
+function Pct({ v }) {
+  if (!isNum(v)) return <Num w={3}>—</Num>;
+  const r = Math.round(v);
+  return <span className={r >= 90 ? 'text-bad' : r >= 75 ? 'text-warn' : undefined}><Num w={3}>{r}</Num>%</span>;
+}
+
+function Usage({ icon: I, show, title, children }) {
+  return <span className={cx('hidden items-center gap-1 h-6 shrink-0', show)} title={title}><I size={11} className="shrink-0" />{children}</span>;
+}
+
+/**
+ * Machine usage of the host (system:metrics). Renders nothing until the server sends a sample.
+ * Items hide by priority: breakpoints first, then any item that still doesn't fit wraps onto the
+ * strip's clipped second line, so the other footer items keep their room and nothing is cut mid-text.
+ */
+function MachineUsage() {
+  const m = useStore((s) => s.metrics);
+  const enabled = useStore((s) => s.settings?.monitor?.enabled !== false);
+  const connected = useStore((s) => s.connected);
+  const savedSec = useStore((s) => s.settings?.monitor?.intervalSec);
+  const sec = m?.intervalSec || savedSec || 3;
+  const stale = useExpired(tsMs(m?.ts), 3 * sec * 1000);
+  if (!m || !enabled) return null;
+  const c = m.cpu || {};
+  const mem = m.memory || {};
+  const d = m.storage || {};
+  const n = m.network || {};
+  const link = isNum(n.linkMbps) && n.linkMbps > 0;
+  const note = !connected ? '\nOffline: showing the last sample' : stale ? `\nStale: no new sample for over ${3 * sec}s` : '';
+  return (
+    <div role="group" aria-label={`Machine usage${!connected ? ' (offline)' : stale ? ' (stale)' : ''}`}
+      className={cx('hidden sm:flex flex-wrap items-center gap-x-3 h-6 min-w-0 overflow-hidden transition-opacity',(!connected || stale) && 'opacity-50')}>
+      <Usage icon={Cpu} show="sm:flex" title={`CPU: ${pctText(c.percent)} in use\nClock: ${fixed(c.ghz, 2)} GHz · max ${fixed(c.maxGhz, 2)} GHz\nCores: ${c.cores ?? '—'}${note}`}>
+        CPU <Num w={3}>{fixed(c.ghz, 1)}</Num> GHz · <Pct v={c.percent} />
+      </Usage>
+      <Usage icon={MemoryStick} show="md:flex" title={`Memory: ${fixed(mem.usedGb, 1)} GB used of ${fixed(mem.totalGb, 1)} GB (${pctText(mem.percent)})${note}`}>
+        RAM <Num w={4}>{big(mem.usedGb)}</Num>/{big(mem.totalGb)} GB · <Pct v={mem.percent} />
+      </Usage>
+      <Usage icon={HardDrive} show="lg:flex"
+        title={`Disk${d.mount ? ` ${d.mount}` : ''}: ${fixed(d.usedGb, 1)} GB used of ${fixed(d.totalGb, 1)} GB (${pctText(d.percent)})\nI/O busy: ${pctText(d.busyPercent)} · read ${fixed(d.readMBps, 1)} MB/s · write ${fixed(d.writeMBps, 1)} MB/s${note}`}>
+        Disk <Num w={4}>{big(d.usedGb)}</Num>/{big(d.totalGb)} GB · <Pct v={d.percent} /> · I/O <Pct v={d.busyPercent} />
+      </Usage>
+      <Usage icon={Network} show="lg:flex"
+        title={`Network${n.iface ? ` ${n.iface}` : ''}: ↓ ${fixed(n.rxMbps, 2)} Mb/s · ↑ ${fixed(n.txMbps, 2)} Mb/s\nLink: ${link ? `${n.linkMbps} Mb/s · ${pctText(n.percent)} used` : 'speed unknown'}${note}`}>
+        Net ↓<Num w={4} left>{big(n.rxMbps)}</Num> ↑<Num w={4} left>{big(n.txMbps)}</Num> Mb/s{link && <> · <Pct v={n.percent} /></>}
+      </Usage>
+    </div>
+  );
+}
+
 export function StatusBar() {
   const st = useStore();
   const working = useStore((s) => selectWorkingAgents(s).length);
@@ -158,6 +230,7 @@ export function StatusBar() {
       {sup.lastError && <span className="flex items-center gap-1 text-bad truncate max-w-72" title={sup.lastError}><TriangleAlert size={11} />{sup.lastError.split('\n')[0]}</span>}
       {project && <span className="hidden md:flex items-center gap-1"><GitBranch size={11} />{project.name}</span>}
       <span className="flex items-center gap-1"><Activity size={11} className={working ? 'text-accent' : ''} />{working} agent{working === 1 ? '' : 's'} working</span>
+      <MachineUsage />
       <div className="flex-1" />
       {def && <span className="hidden md:flex items-center gap-1" title="Default model · tokens today"><Zap size={11} />{def.name} · {compact(def.usage?.daily?.tokens)} today</span>}
       <button className="hidden sm:flex items-center gap-1 hover:text-fg" onClick={() => st.set({ view: 'settings' })}><Layers size={11} />{layout.name}</button>

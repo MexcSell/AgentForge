@@ -6,7 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { one, many, query } from '../db/pool.js';
 import { config } from '../config.js';
 import { emit } from '../events.js';
-import { getSettings } from '../db/seed.js';
+import { getSettings, sanitizeMonitor } from '../db/seed.js';
 import { ROLES, TIERS } from '../roles.js';
 import { listAgents, getAgent, createAgent, cloneAgent, publishAgent } from '../services/agents.js';
 import { listProjects, getProject, createProjectRecord, publishProject } from '../services/projects.js';
@@ -19,7 +19,8 @@ import { evolutionOverview, analyzeMission } from '../orchestrator/evolution.js'
 
 const err = (reply, code, message) => reply.code(code).send({ error: message });
 
-export default async function apiRoutes(app) {
+// opts.onSettingsChange(key, value) lets the server react to a saved setting without a restart.
+export default async function apiRoutes(app, opts = {}) {
   // ---- projects ----------------------------------------------------------
   app.get('/api/projects', () => listProjects());
 
@@ -267,12 +268,14 @@ export default async function apiRoutes(app) {
   // ---- settings ----------------------------------------------------------
   app.get('/api/settings', () => getSettings());
   app.put('/api/settings/:key', async (req, reply) => {
-    const allowed = ['orchestrator', 'github', 'evolution'];
+    const allowed = ['orchestrator', 'github', 'evolution', 'monitor'];
     if (!allowed.includes(req.params.key)) return err(reply, 400, 'Unknown settings key');
     const cur = (await getSettings())[req.params.key] || {};
-    const value = { ...cur, ...(req.body || {}) };
+    let value = { ...cur, ...(req.body || {}) };
+    if (req.params.key === 'monitor') value = sanitizeMonitor(value, sanitizeMonitor(cur));
     await query(`INSERT INTO settings(key, value, updated_at) VALUES ($1,$2,now()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`, [req.params.key, value]);
     emit('settings:update', { key: req.params.key, value });
+    opts.onSettingsChange?.(req.params.key, value);
     return value;
   });
 
