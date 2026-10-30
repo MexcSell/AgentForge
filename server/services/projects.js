@@ -4,8 +4,12 @@ import { one, many } from '../db/pool.js';
 import { emit } from '../events.js';
 import { createAgent } from './agents.js';
 
+// running_agents: distinct agents working on the project now, i.e. its running tasks' agents plus the GM while a mission plans or runs.
 const PROJECT_COLS = `p.*, m.name AS manager_name,
-  (SELECT count(DISTINCT t.agent_id)::int FROM tasks t WHERE t.project_id = p.id AND t.status = 'running') AS running_agents,
+  (SELECT count(w.agent_id)::int FROM (
+     SELECT t.agent_id FROM tasks t WHERE t.project_id = p.id AND t.status = 'running'
+     UNION SELECT p.manager_id WHERE p.status = 'running' AND EXISTS (SELECT 1 FROM missions s WHERE s.project_id = p.id AND s.status IN ('planning', 'running'))
+   ) w(agent_id)) AS running_agents,
   (SELECT count(*)::int FROM tasks t WHERE t.project_id = p.id AND t.status = 'done') AS tasks_done,
   (SELECT count(*)::int FROM tasks t WHERE t.project_id = p.id) AS tasks_total`;
 
@@ -17,15 +21,25 @@ export async function getProject(id) {
   return one(`SELECT ${PROJECT_COLS} FROM projects p LEFT JOIN agents m ON m.id = p.manager_id WHERE p.id = $1`, [id]);
 }
 
-export async function publishProject(id) {
-  const p = await getProject(id);
-  if (p) emit('project:update', p);
-  return p;
+const publishing = new Map(); // projectId -> last publish
+
+// One at a time per project, in call order, so a stale read from parallel tasks can never be the last update.
+export function publishProject(id) {
+  const run = (publishing.get(id) || Promise.resolve()).then(async () => {
+    const p = await getProject(id);
+    if (p) emit('project:update', p);
+    return p;
+  });
+  const tail = run.catch(() => {});
+  publishing.set(id, tail);
+  tail.then(() => { if (publishing.get(id) === tail) publishing.delete(id); });
+  return run;
 }
 
 export async function setProjectStatus(id, status) {
   await one(`UPDATE projects SET status=$2, updated_at=now() WHERE id=$1 RETURNING id`, [id, status]);
-  return publishProject(id);
+  // The status is saved; a failed publish must not abort the mission that set it.
+  return publishProject(id).catch(() => null);
 }
 
 // Every project gets its own General Manager agent who reports to the executive.

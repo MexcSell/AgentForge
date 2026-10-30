@@ -49,6 +49,11 @@ async function publishMission(id) {
   return m;
 }
 
+// running_agents follows every task and GM status change; a failed publish never blocks or fails the mission.
+function refreshProject(id) {
+  publishProject(id).catch(() => {});
+}
+
 // ---- runs ----------------------------------------------------------------
 
 // timeoutMs overrides the task timeout and is also a hard deadline for providers that ignore it (HTTP, simulator).
@@ -286,6 +291,7 @@ async function runMission(mission, signal) {
   const gm = await getAgent(project.manager_id);
   await setProjectStatus(project.id, 'running');
   await setAgentStatus(gm.id, 'working');
+  refreshProject(project.id);
   const started = Date.now();
   try {
     await query(`UPDATE missions SET status='planning' WHERE id=$1`, [mission.id]);
@@ -368,11 +374,12 @@ async function runMission(mission, signal) {
     const status = signal.aborted ? 'cancelled' : 'failed';
     await query(`UPDATE missions SET status=$2, summary=$3, finished_at=now() WHERE id=$1`, [mission.id, status, err.message]);
     await query(`UPDATE tasks SET status='cancelled', finished_at=now() WHERE mission_id=$1 AND status IN ('pending','running')`, [mission.id]);
+    refreshProject(project.id);
     await publishMission(mission.id);
     await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: status === 'cancelled' ? 'status' : 'error', content: status === 'cancelled' ? 'Mission cancelled.' : `Mission failed: ${err.message}` });
   } finally {
     await setAgentStatus(gm.id, 'idle');
-    await publishProject(project.id);
+    await publishProject(project.id).catch(() => {});
     await publishTopic(mission.topic_id).catch(() => {});
   }
 }
@@ -391,6 +398,7 @@ async function schedule({ rows, project, gm, mission, settings, signal }) {
         t.status = 'cancelled';
         await query(`UPDATE tasks SET status='cancelled', result=$2, finished_at=now() WHERE id=$1`, [t.id, `Blocked: dependency ${blocked} did not complete`]);
         await publishTask(t.id);
+        refreshProject(project.id);
       }
     }
     const ready = Object.values(state).filter((t) => t.status === 'pending' && t.depends_on.every((k) => state[k]?.status === 'done'));
@@ -409,6 +417,7 @@ async function schedule({ rows, project, gm, mission, settings, signal }) {
   if (signal.aborted) {
     await Promise.allSettled(running.values());
     await query(`UPDATE tasks SET status='cancelled', finished_at=now() WHERE mission_id=$1 AND status IN ('pending','running')`, [mission.id]);
+    refreshProject(project.id);
   }
 }
 
@@ -424,6 +433,7 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
   await query(`UPDATE tasks SET status='running', started_at=now(), progress=5 WHERE id=$1`, [task.id]);
   await setAgentStatus(agent.id, 'working', task.id);
   await publishTask(task.id);
+  refreshProject(project.id);
 
   const deps = await many(`SELECT t.*, a.name AS agent_name FROM tasks t LEFT JOIN agents a ON a.id = t.agent_id WHERE t.mission_id = $1 AND t.key = ANY($2)`, [mission.id, task.depends_on]);
   const playbook = agent.stats?.experiment?.playbook || agent.playbook;
@@ -456,6 +466,7 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
     await query(`UPDATE tasks SET status='cancelled', finished_at=now() WHERE id=$1`, [task.id]);
     await setAgentStatus(agent.id, 'idle');
     await publishTask(task.id);
+    refreshProject(project.id);
     return 'cancelled';
   }
 
@@ -464,6 +475,7 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
     [task.id, status, ok ? 100 : 0, String(report.summary || out?.text || errorText || '').slice(0, 8000), report]);
   await setAgentStatus(agent.id, 'idle');
   await publishTask(task.id);
+  refreshProject(project.id);
 
   // Report upward to the General Manager.
   await postMessage({
@@ -489,6 +501,7 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
     await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: `${task.key} failed — asking ${agent.name} to retry once with the failure context.` });
     task.description = `${task.description}\n\nPREVIOUS ATTEMPT FAILED:\n${String(report.summary || errorText).slice(0, 1500)}\nFix the cause and complete the task.`;
     await query(`UPDATE tasks SET description=$2, status='running' WHERE id=$1`, [task.id, task.description]);
+    refreshProject(project.id);
     return runTask({ task, state, project, gm, mission, settings, signal, attempt: 2 });
   }
   return status;
