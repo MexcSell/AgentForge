@@ -10,7 +10,7 @@ import { notify, audit } from '../services/notify.js';
 import { syncProject } from '../services/git.js';
 import { resolveModel, runModel, recordRunUsage, publishModels } from '../models/index.js';
 import { heuristicPlan, topicTitle } from './heuristics.js';
-import { planPrompt, taskPrompt, parseJson, topicContext } from './prompts.js';
+import { planPrompt, taskPrompt, commitPrompt, parseJson, topicContext } from './prompts.js';
 import { learn, analyzeMission } from './evolution.js';
 
 const active = new Map(); // projectId -> { missionId, controller }
@@ -51,7 +51,8 @@ async function publishMission(id) {
 
 // ---- runs ----------------------------------------------------------------
 
-async function executeRun({ kind, agent, project, mission, task, model, prompt, system, access, attachments, signal, meta }) {
+// timeoutMs overrides the task timeout and is also a hard deadline for providers that ignore it (HTTP, simulator).
+async function executeRun({ kind, agent, project, mission, task, model, prompt, system, access, attachments, signal, meta, timeoutMs = null }) {
   const run = await one(
     `INSERT INTO runs(task_id, mission_id, agent_id, project_id, model_id, kind) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
     [task?.id || null, mission?.id || null, agent.id, project.id, model.id, kind],
@@ -66,16 +67,19 @@ async function executeRun({ kind, agent, project, mission, task, model, prompt, 
   };
   const images = (attachments || []).map((a) => a.path).filter(Boolean);
   const settings = await getSettings();
+  const deadline = timeoutMs ? AbortSignal.timeout(timeoutMs + 5000) : null;
   try {
     const out = await runModel(model, {
-      prompt, system, cwd: project.path, access, images, addDirs: images.length ? [config.uploadsDir] : [], signal, onEvent,
-      timeoutMs: (settings.orchestrator.taskTimeoutMin || 30) * 60000, meta,
+      prompt, system, cwd: project.path, access, images, addDirs: images.length ? [config.uploadsDir] : [],
+      signal: deadline ? AbortSignal.any([signal, deadline].filter(Boolean)) : signal, onEvent,
+      timeoutMs: timeoutMs || (settings.orchestrator.taskTimeoutMin || 30) * 60000, meta,
     });
     await recordRunUsage(run.id, out);
     await query(`UPDATE runs SET status='done', output=$2, finished_at=now() WHERE id=$1`, [run.id, String(out.text || '').slice(0, 200000)]);
     await bumpAgentStats(agent.id, out);
     return { ...out, runId: run.id };
   } catch (err) {
+    if (deadline?.aborted && !signal?.aborted) err = Object.assign(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s`), { partial: err.partial });
     await recordRunUsage(run.id, err.partial);
     await query(`UPDATE runs SET status=$2, error=$3, finished_at=now() WHERE id=$1`, [run.id, signal?.aborted ? 'cancelled' : 'failed', err.message]);
     if (err.partial) await bumpAgentStats(agent.id, err.partial);
@@ -330,11 +334,8 @@ async function runMission(mission, signal) {
 
     const final = await many(`SELECT t.*, a.name AS agent_name FROM tasks t LEFT JOIN agents a ON a.id = t.agent_id WHERE t.mission_id = $1 AND t.origin <> 'proposal' ORDER BY t.created_at`, [mission.id]);
     const done = final.filter((t) => t.status === 'done').length;
-    const usage = await one(`SELECT coalesce(sum(input_tokens + output_tokens),0) AS tokens, coalesce(sum(cost_usd),0) AS cost FROM runs WHERE mission_id = $1`, [mission.id]);
     const status = signal.aborted ? 'cancelled' : done === final.length ? 'done' : 'failed';
-    const secs = Math.round((Date.now() - started) / 1000);
     const lines = final.map((t) => `- ${t.status === 'done' ? '✓' : t.status === 'cancelled' ? '⊘' : '✗'} **${t.key} ${t.title}** — ${t.agent_name || '—'}: ${(t.report?.summary || t.result || t.status).split('\n')[0].slice(0, 220)}`);
-    let summary = `**Mission ${status}** · ${done}/${final.length} tasks · ${fmtDuration(secs)} · ${Number(usage.tokens).toLocaleString()} tokens\n\n${lines.join('\n')}`;
 
     // GitHub: upload the result when files may have changed.
     const wrote = !!(await one(
@@ -342,10 +343,16 @@ async function runMission(mission, signal) {
        WHERE r.mission_id = $1 AND r.status = 'done' AND m.provider = 'claude-code' AND t.status = 'done' LIMIT 1`, [mission.id]))
       && final.some((t) => t.status === 'done' && roleInfo(t.role).access === 'write');
     project = await getProject(project.id);
+    let github = '';
     if (wrote && project.auto_sync && settings.github.autoSync && !signal.aborted) {
-      const log = await syncProject(project, `${mission.command.split('\n')[0].slice(0, 72)}\n\nAgentForge mission ${mission.id}`, settings.github);
-      summary += `\n\nGitHub: ${log.status}${log.commit ? ` · ${log.commit}` : ''} — ${log.message}`;
+      const log = await syncProject(project, commitMessageBuilder({ project, gm, mission, tasks: final, signal }), settings.github);
+      github = `\n\n${syncReport(log)}`;
     }
+
+    // Measured after the sync so the GM's commit-message run is counted too.
+    const usage = await one(`SELECT coalesce(sum(input_tokens + output_tokens),0) AS tokens, coalesce(sum(cost_usd),0) AS cost FROM runs WHERE mission_id = $1`, [mission.id]);
+    const secs = Math.round((Date.now() - started) / 1000);
+    const summary = `**Mission ${status}** · ${done}/${final.length} tasks · ${fmtDuration(secs)} · ${Number(usage.tokens).toLocaleString()} tokens\n\n${lines.join('\n')}${github}`;
 
     await query(`UPDATE missions SET status=$2, summary=$3, finished_at=now() WHERE id=$1`, [mission.id, status, summary]);
     await publishMission(mission.id);
@@ -487,6 +494,113 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
   return status;
 }
 
+// ---- commit messages -----------------------------------------------------
+
+const COMMIT_TIMEOUT = 3 * 60000; // stays under git.js's 4 min builder guard, so our fallback (with trailer) wins
+const SUBJECT_MAX = 72;
+const BODY_MAX = 2000;
+const TRAILER = /^\s*(co-authored-by|signed-off-by|reviewed-by|acked-by|tested-by|reported-by|suggested-by|helped-by|change-id|generated-by)\s*:|^\s*(🤖\s*)?generated (with|by) \[?claude|^\s*agentforge (mission|sync)\b/i;
+const plain = (s) => String(s || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+
+/** Cut to ≤ max chars at a word boundary, without dangling punctuation or a final period. */
+function cutSubject(text, max = SUBJECT_MAX) {
+  let s = String(text || '').replace(/\s+/g, ' ').trim();
+  if (s.length > max) {
+    const sp = s.lastIndexOf(' ', max);
+    s = s.slice(0, sp > max / 2 ? sp : max);
+  }
+  return s.replace(/[\s.,;:!?…-]+$/, '');
+}
+
+/** Model output → { subject, body } as plain commit text, or null when nothing usable is left. */
+export function cleanCommitMessage(text) {
+  let s = String(text ?? '').replace(/\0/g, '').replace(/\r\n?/g, '\n').trim();
+  const fenced = s.match(/```[^\n]*\n([\s\S]*?)```/);
+  if (fenced?.[1].trim()) s = fenced[1].trim();
+  if (/^["'“]/.test(s) && /["'”]$/.test(s)) s = s.slice(1, -1).trim();
+  const lines = s.split('\n').filter((l) => !/^\s*```/.test(l) && !TRAILER.test(l)).map((l) => l.trimEnd());
+  // Chatty lead-ins such as "Here is the commit message:".
+  while (lines.length && (!lines[0].trim() || /^(here|sure|ok|okay|certainly|below)\b.*:$|^(proposed |suggested )?commit message:?$/i.test(lines[0].trim()))) lines.shift();
+  if (!lines.length) return null;
+  const subject = cutSubject(lines.shift()
+    .replace(/^\s*(#{1,6}|[-*•])\s+/, '')
+    .replace(/^(subject|title|commit message)\s*:\s*/i, '')
+    .replace(/\*\*|__|`/g, '')
+    .replace(/^["'“‘]+|["'”’]+$/g, ''));
+  if (!/\p{L}{2,}\S*\s+\S*\p{L}/u.test(subject) || /^[{[<]/.test(subject) || /^(i('m| am)? (sorry|cannot|can't|unable)|as an ai)\b/i.test(subject)) return null;
+
+  const body = [];
+  let bullets = 0;
+  for (const line of lines) {
+    if (/^\s*#{1,6}\s/.test(line)) continue;
+    const l = line.replace(/^(\s*)([*•]|\d{1,2}[.)])\s+/, '$1- ').replace(/\*\*|__/g, '');
+    if (/^- /.test(l) && ++bullets > 6) break;
+    body.push(l);
+  }
+  const paras = body.join('\n').replace(/\n{3,}/g, '\n\n').trim().split('\n\n');
+  // A trailing "Key-Name: value" block is a trailer, whatever its key.
+  if (paras.length > 1 && paras.at(-1).split('\n').every((l) => /^[A-Za-z]+(-[A-Za-z]+)+:\s/.test(l))) paras.pop();
+  let rest = paras.join('\n\n').trim();
+  if (rest.length > BODY_MAX) {
+    const cut = rest.lastIndexOf('\n', BODY_MAX);
+    rest = rest.slice(0, cut > BODY_MAX / 2 ? cut : BODY_MAX).trimEnd();
+  }
+  return { subject, body: rest };
+}
+
+/** Deterministic message: topic title or first done task, done task titles and the diffstat summary. */
+function fallbackCommit({ title, tasks, files, stat, order }) {
+  const done = tasks.filter((t) => t.status === 'done');
+  const areas = [...new Set(files.map((f) => (f.includes('/') ? f.split('/')[0] : 'root')))].slice(0, 3);
+  const generic = `Update ${files.length} file${files.length === 1 ? '' : 's'}${areas.length ? ` in ${areas.join(', ')}` : ''}`;
+  const subject = cutSubject([title, done[0]?.title].find((c) => plain(c) && plain(c) !== plain(order)) || generic);
+  const bullets = done.slice(0, 5).map((t) => `- ${cutSubject(t.title, 100)}`);
+  if (!bullets.length && files.length) bullets.push(`- Update ${files.slice(0, 3).join(', ')}${files.length > 3 ? ` and ${files.length - 3} more` : ''}`);
+  const total = String(stat || '').trim().split('\n').pop()?.trim();
+  if (total && / changed/.test(total)) bullets.push(`- ${total}`);
+  return { subject: subject.charAt(0).toUpperCase() + subject.slice(1), body: bullets.join('\n') };
+}
+
+/**
+ * The async ({ files, stat, diff }) => message builder for syncProject(). The GM writes the message
+ * from the staged diff; a failure, abort, timeout or junk output falls back to a deterministic one.
+ * `mission` is null for manual syncs, where `reason` stands in for the order.
+ */
+export function commitMessageBuilder({ project, gm, mission, tasks = [], signal, reason = 'Manual sync' }) {
+  const trailer = mission ? `AgentForge mission ${mission.id}` : 'AgentForge sync';
+  return async ({ files = [], stat = '', diff = '' } = {}) => {
+    let msg = null;
+    if (gm && !signal?.aborted) {
+      try {
+        const model = await resolveModel(gm.model_id);
+        const { system, prompt } = commitPrompt({ project, gm, command: mission?.command, reason, tasks, files, stat, diff });
+        const out = await executeRun({ kind: 'commit', agent: gm, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'commit' }, timeoutMs: COMMIT_TIMEOUT });
+        msg = cleanCommitMessage(out.text);
+      } catch (err) {
+        console.error('[commit message]', err.message);
+      }
+    }
+    let title = null;
+    if (mission?.topic_id) title = await getTopic(mission.topic_id).then((t) => (t && t.title !== 'New topic' ? t.title : null), () => null);
+    const order = String(mission?.command || '').split('\n')[0];
+    const fb = fallbackCommit({ title, tasks, files, stat, order });
+    // The subject must summarize the change, not echo the order.
+    if (msg && order && [order, cutSubject(order)].some((c) => plain(c) === plain(msg.subject))) msg.subject = fb.subject;
+    const { subject, body } = msg ? { subject: msg.subject, body: msg.body || fb.body } : fb;
+    return `${subject}\n\n${body ? `${body}\n\n` : ''}${trailer}`;
+  };
+}
+
+/** "GitHub: …" status line, then the commit message (minus the AgentForge trailer) as a short quote. */
+function syncReport(log) {
+  const lines = String(log.commit_message || '').split('\n');
+  const subject = lines[0];
+  const status = subject && log.message.endsWith(` · ${subject}`) ? log.message.slice(0, -(subject.length + 3)) : log.message;
+  const text = `GitHub: ${log.status}${log.commit ? ` · ${log.commit}` : ''} — ${status}`;
+  const quote = lines.filter((l) => !/^AgentForge (mission|sync)\b/.test(l)).slice(0, 12).join('\n').trim();
+  return quote ? `${text}\n\n${quote.split('\n').map((l) => (l ? `> ${l.slice(0, 300)}` : '>')).join('\n')}` : text;
+}
+
 // ---- proposals, meetings, sync ------------------------------------------
 
 export async function approveProposal(taskId) {
@@ -521,8 +635,11 @@ export async function standup(projectId, topicId = null) {
 export async function syncNow(projectId, reason, topicId = null) {
   const project = await getProject(projectId);
   const settings = await getSettings();
-  const log = await syncProject(project, `${reason}\n\nAgentForge sync`, settings.github);
-  await postMessage({ project_id: projectId, topic_id: (await ensureTopic(projectId, topicId)).id, author_type: 'system', kind: 'status', content: `GitHub: ${log.status}${log.commit ? ` · ${log.commit}` : ''} — ${log.message}` });
+  const gm = project.manager_id ? await getAgent(project.manager_id) : null;
+  const log = await syncProject(project, commitMessageBuilder({ project, gm, mission: null, reason }), settings.github);
+  const content = syncReport(log);
+  // The chat shows a 'status' as one plain line; the quoted commit message needs the Markdown card.
+  await postMessage({ project_id: projectId, topic_id: (await ensureTopic(projectId, topicId)).id, author_type: 'system', kind: content.includes('\n') ? 'chat' : 'status', content });
   await publishProject(projectId);
   return log;
 }

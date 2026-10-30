@@ -4,6 +4,7 @@ client/dist/
 client/dist-*/
 data/
 .runtime/
+.claude/
 reference/
 *.pptx
 *.pdf
