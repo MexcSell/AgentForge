@@ -443,16 +443,6 @@ export function CommandWindow({ project }) {
           </div>
         )}
         <div className={cx('rounded-xl border bg-sunken transition-colors focus-within:border-accent focus-within:ring-2 focus-within:ring-accent-soft', drag ? 'border-accent border-dashed' : 'border-line')}>
-          {files.length > 0 && (
-            <div className="flex flex-wrap gap-2 p-2 pb-0">
-              {files.map((f, i) => (
-                <div key={f.url} className="relative group">
-                  <img src={f.url} alt="" className="h-16 w-16 object-cover rounded-lg border border-line" />
-                  <button onClick={() => setFiles(files.filter((_, j) => j !== i))} className="absolute -top-1.5 -right-1.5 size-5 rounded-full bg-raised border border-line flex items-center justify-center opacity-0 group-hover:opacity-100"><X size={11} /></button>
-                </div>
-              ))}
-            </div>
-          )}
           <textarea ref={ta} value={text} rows={Math.min(8, Math.max(2, text.split('\n').length))}
             placeholder={drag ? 'Drop images to attach…' : `Order for ${project.manager_name}${topic ? ` in "${topic.title}"` : ''}…  (Enter to send · Shift+Enter newline · / for commands · paste images)`}
             onChange={(e) => setText(e.target.value)}
@@ -463,11 +453,24 @@ export function CommandWindow({ project }) {
               else if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); send(); }
             }}
             className="w-full bg-transparent resize-none outline-none px-3 pt-2.5 text-[0.86rem] placeholder:text-subtle" />
-          <div className="flex items-center gap-1 px-2 pb-2">
+          {/* items-end: the add-image button and Send stay level at the bottom however many thumbnail rows wrap between them. */}
+          <div className="flex items-end gap-2 px-2 pb-2">
             <input ref={fileInput} type="file" accept="image/*" multiple hidden onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }} />
             <IconButton icon={ImagePlus} label="Attach images" onClick={() => fileInput.current?.click()} />
-            {running && <span className="text-[0.7rem] text-subtle ml-1">New orders are queued after the current mission</span>}
-            <Button variant="primary" size="sm" icon={Send} className="ml-auto" loading={sending} disabled={!text.trim() && !files.length} onClick={send}>Send</Button>
+            {files.length > 0 && (
+              <div className="flex-1 flex flex-wrap gap-2 pt-1.5">
+                {files.map((f, i) => (
+                  <div key={f.url} className="relative group">
+                    <img src={f.url} alt="" className="h-16 w-16 object-cover rounded-lg border border-line" />
+                    <button onClick={() => setFiles(files.filter((_, j) => j !== i))} className="absolute -top-1.5 -right-1.5 size-5 rounded-full bg-raised border border-line flex items-center justify-center opacity-0 group-hover:opacity-100"><X size={11} /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="ml-auto flex items-center gap-2">
+              {running && <span className="text-[0.7rem] text-subtle">New orders are queued after the current mission</span>}
+              <Button variant="primary" size="sm" icon={Send} loading={sending} disabled={!text.trim() && !files.length} onClick={send}>Send</Button>
+            </div>
           </div>
         </div>
       </div>
