@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft, ArrowRight, ArrowUp, RefreshCw, FilePlus, FolderPlus, Upload, Copy, Scissors, ClipboardPaste, Trash2, Pencil, Plus, X, Eye, EyeOff,
-  LayoutList, LayoutGrid, Download, TerminalSquare, ChevronRight, ChevronDown, FolderTree, Link, Files as FilesIcon, Search, CopyPlus, FolderOpen, ClipboardCopy,
+  LayoutList, LayoutGrid, Download, TerminalSquare, ChevronRight, Link, Files as FilesIcon, Search, CopyPlus, FolderOpen, ClipboardCopy,
 } from 'lucide-react';
 import { api } from '../../lib/api.js';
 import { useStore } from '../../lib/store.js';
@@ -11,8 +11,8 @@ import { FileIcon } from '../../lib/icons.jsx';
 import { Split } from '../../components/Split.jsx';
 import { Confirm } from '../../components/Modal.jsx';
 import { openContextMenu } from '../../components/ContextMenu.jsx';
-import { cx, IconButton, Input, Spinner, Empty, Select } from '../../components/ui.jsx';
-import { useFs, DRAG_TYPE, join, parentOf, baseName, transfer, removePaths, uploadTo } from './fsStore.js';
+import { cx, IconButton, Input, Spinner, Empty } from '../../components/ui.jsx';
+import { useFs, DRAG_TYPE, join, parentOf, transfer, removePaths, uploadTo } from './fsStore.js';
 import { FileViewer } from './FileViewer.jsx';
 import { TerminalPanel } from './Terminal.jsx';
 
@@ -278,58 +278,9 @@ function FilePane({ pane, index, count, root, active, onFocus, onClose, onSplit 
   );
 }
 
-function TreeNode({ entry, depth, current, onPick }) {
-  const tick = useFs((s) => s.tick);
-  const showHidden = useStore((s) => s.showHidden);
-  const [open, setOpen] = useState(depth === 0 || current?.startsWith(entry.path + '/'));
-  const [kids, setKids] = useState(null);
-  const [over, setOver] = useState(false);
-  useEffect(() => { if (current?.startsWith(entry.path + '/') && !open) setOpen(true); }, [current]);
-  useEffect(() => {
-    if (!open || entry.type !== 'dir') return;
-    api.get(`/api/fs/list?path=${encodeURIComponent(entry.path)}`, { quiet: true }).then((d) => setKids(d.entries)).catch(() => setKids([]));
-  }, [open, tick, entry.path]);
-  const isDir = entry.type === 'dir';
-  const visible = (kids || []).filter((k) => showHidden || !k.hidden);
-  return (
-    <div>
-      <div draggable onDragStart={(e) => { e.dataTransfer.setData(DRAG_TYPE, JSON.stringify([entry.path])); e.dataTransfer.effectAllowed = 'copyMove'; }}
-        {...(isDir ? dropHandlers(entry.path, setOver) : {})}
-        onClick={() => { if (isDir) { setOpen(!open || current !== entry.path ? true : !open); onPick(entry); } else onPick(entry); }}
-        className={cx('flex items-center gap-1 h-[26px] pr-2 cursor-pointer text-[0.8rem] select-none', current === entry.path ? 'bg-accent-soft text-fg' : 'text-muted hover:bg-hover hover:text-fg', over && 'ring-1 ring-inset ring-accent')}
-        style={{ paddingLeft: 6 + depth * 12 }}>
-        {isDir ? <button className="size-4 flex items-center justify-center shrink-0" onClick={(e) => { e.stopPropagation(); setOpen(!open); }}>{open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</button> : <span className="w-4 shrink-0" />}
-        <FileIcon entry={entry} open={open} size={15} />
-        <span className="truncate">{entry.name}</span>
-      </div>
-      {open && isDir && visible.map((k) => <TreeNode key={k.path} entry={k} depth={depth + 1} current={current} onPick={onPick} />)}
-    </div>
-  );
-}
-
-function Tree({ root, current, onPick, onRoot }) {
-  const projects = useStore((s) => s.projects);
-  return (
-    <div className="h-full flex flex-col">
-      <div className="flex items-center gap-2 h-10 px-2.5 border-b border-line shrink-0">
-        <FolderTree size={14} className="text-subtle" />
-        <Select value={root} onChange={(e) => onRoot(e.target.value)} className="flex-1 h-7 text-xs min-w-0">
-          {projects.map((p) => <option key={p.id} value={p.path}>{p.name}</option>)}
-          {!projects.some((p) => p.path === root) && <option value={root}>{root}</option>}
-          <option value="/">/ (filesystem root)</option>
-        </Select>
-      </div>
-      <div className="flex-1 min-h-0 overflow-auto py-1">
-        <TreeNode key={root} entry={{ name: baseName(root) || '/', path: root, type: 'dir' }} depth={0} current={current} onPick={onPick} />
-      </div>
-    </div>
-  );
-}
-
 export default function Files({ layout }) {
   const st = useStore();
   const project = st.projects.find((p) => p.id === st.activeProjectId) || st.projects[0];
-  const [treeRoot, setTreeRoot] = useState(project?.path || '/');
   const panes = st.filePanes;
   const activeId = panes.some((p) => p.id === st.activePane) ? st.activePane : panes[0].id;
   const [paths, setPaths] = useState({});
@@ -348,10 +299,6 @@ export default function Files({ layout }) {
     const next = panes.filter((p) => p.id !== id);
     st.set({ filePanes: next, activePane: next[0].id });
   };
-  const pick = (entry) => {
-    if (entry.type === 'dir') st.set({ filePanes: panes.map((p) => (p.id === activeId ? { ...p, path: entry.path } : p)) });
-    else st.set({ openFile: { path: entry.path } });
-  };
 
   const paneArea = (
     <Split id={`files-panes-${panes.length}`} orientation="horizontal" panels={panes.map((p, i) => ({
@@ -360,15 +307,10 @@ export default function Files({ layout }) {
         onFocus={() => activeId !== p.id && st.set({ activePane: p.id })} onClose={() => close(p.id)} onSplit={split} />,
     }))} />
   );
-  const tree = layout.files.tree && { id: 'tree', size: 22, min: 12, node: <Tree root={treeRoot} current={activePath} onPick={pick} onRoot={setTreeRoot} /> };
-  const top = (
-    <Split id={`files-top-${layout.files.treeSide}`} orientation="horizontal"
-      panels={layout.files.treeSide === 'left' ? [tree, { id: 'panes', size: 78, min: 30, node: paneArea }] : [{ id: 'panes', size: 78, min: 30, node: paneArea }, tree]} />
-  );
   return (
     <>
       <Split id={`files-${layout.id}`} orientation="vertical" floating={layout.floating}
-        panels={[{ id: 'top', size: 100 - layout.files.terminal, min: 20, node: top }, { id: 'terminal', size: layout.files.terminal, min: 10, node: <TerminalPanel key={termKey} cwd={activePath} /> }]} />
+        panels={[{ id: 'top', size: 100 - layout.files.terminal, min: 20, node: paneArea }, { id: 'terminal', size: layout.files.terminal, min: 10, node: <TerminalPanel key={termKey} cwd={activePath} /> }]} />
       <FileViewer />
     </>
   );

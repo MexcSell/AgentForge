@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { api } from '../../lib/api.js';
 import { toast } from '../../lib/toast.js';
 
-// Shared refresh tick so every pane and the tree reload after a mutation.
+// Shared refresh tick so every pane reloads after a mutation.
 export const useFs = create((set) => ({ tick: 0, bump: () => set((s) => ({ tick: s.tick + 1 })) }));
 
 export const DRAG_TYPE = 'application/x-agentforge-paths';
