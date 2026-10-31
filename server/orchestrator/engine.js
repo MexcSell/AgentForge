@@ -689,14 +689,20 @@ function handOverText(gone, moves) {
 /**
  * The task's agent as stored now (a merge or delete may have handed the task over since staffing). One that is archived
  * or missing is replaced the way handOver() does it, and the mission's chat says so. The update is conditional, so a
- * hand-over at the same moment wins and its choice is read on the next pass.
+ * hand-over at the same moment wins and its choice is read on the next pass (the row is re-read on every pass).
+ * Returns null, with nothing written, once the mission is aborted (checked on each pass and after replacementFor) or
+ * the task row is gone (its project or mission was deleted).
  */
-async function liveAgent({ task, project, gm, mission }) {
+async function liveAgent({ task, project, gm, mission, signal }) {
   for (;;) {
-    const id = (await one(`SELECT agent_id FROM tasks WHERE id = $1`, [task.id]))?.agent_id ?? null;
+    if (signal.aborted) return null;
+    const row = await one(`SELECT agent_id FROM tasks WHERE id = $1`, [task.id]);
+    if (!row) return null;
+    const id = row.agent_id;
     const assigned = id && (await getAgent(id));
     if (assigned && !assigned.archived) return assigned;
     const pick = await replacementFor(assigned || null, task);
+    if (signal.aborted) return null;
     if (!(await one(`UPDATE tasks SET agent_id = $2 WHERE id = $1 AND agent_id IS NOT DISTINCT FROM $3::uuid RETURNING id`, [task.id, pick.agent.id, id]))) continue;
     task.agent_id = pick.agent.id;
     const content = handOverText(assigned || null, [{ ...pick, key: task.key }]);
@@ -783,7 +789,15 @@ export async function previewHandOver(goneIds, { mergeInto = null, excludeProjec
 async function runTask({ task, state, project, gm, mission, settings, signal, attempt = 1 }) {
   let agent;
   for (let claimed = null; !claimed;) {
-    agent = await liveAgent({ task, project, gm, mission });
+    agent = signal.aborted ? null : await liveAgent({ task, project, gm, mission, signal });
+    if (!agent) {
+      // Aborted, or the task row is gone (project or mission deleted): nothing to run. A gone row has nothing to publish.
+      if (await one(`UPDATE tasks SET status='cancelled', finished_at=now() WHERE id=$1 RETURNING id`, [task.id])) {
+        await publishTask(task.id);
+        refreshProject(project.id);
+      }
+      return 'cancelled';
+    }
     claimed = await claim(task, agent.id); // null: archived since it was read, look again
     if (claimed === false) {
       // The assigned agent is busy elsewhere: duplicate it rather than wait.
