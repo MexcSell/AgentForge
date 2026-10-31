@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
-import { one, query } from '../db/pool.js';
+import { many, one, query } from '../db/pool.js';
 import { emit } from '../events.js';
 import { childEnv } from './env.js';
 import { notify } from './notify.js';
@@ -26,6 +26,88 @@ function run(cmd, args, cwd, timeout = 60000, { input, maxBuffer = 8 * 1024 * 10
 
 const git = (cwd, ...args) => run('git', args, cwd);
 
+// One git writer per repo in this process: a mission sync and a manual /sync, or two missions
+// finishing together, would otherwise race on .git/index.lock.
+const repoLocks = new Map();
+
+function repoKey(dir) {
+  try { return fs.realpathSync(dir); } catch { return path.resolve(String(dir ?? '')); }
+}
+
+/** Runs fn once every earlier holder of dir's lock has settled; returns fn's result. */
+export function withRepoLock(dir, fn) {
+  const key = repoKey(dir);
+  const result = (repoLocks.get(key) || Promise.resolve()).then(() => fn());
+  const tail = result.then(() => {}, () => {});
+  repoLocks.set(key, tail);
+  tail.then(() => { if (repoLocks.get(key) === tail) repoLocks.delete(key); });
+  return result;
+}
+
+/**
+ * Repo-relative POSIX paths from a list of absolute or project-relative ones. Paths with a `..`
+ * segment, outside the project or naming the project itself are dropped; duplicates collapse.
+ */
+export function repoPaths(dir, list) {
+  const roots = [path.resolve(dir)];
+  try { const real = fs.realpathSync(dir); if (real !== roots[0]) roots.push(real); } catch {}
+  const inside = (r) => r && r !== '..' && !r.startsWith('../') && !path.isAbsolute(r);
+  const out = new Set();
+  for (const p of Array.isArray(list) ? list : []) {
+    if (typeof p !== 'string' || !p || p.includes('\0') || p.split('/').includes('..')) continue;
+    const rel = path.isAbsolute(p) ? roots.map((r) => path.relative(r, p)).find(inside) : path.posix.normalize(p).replace(/\/+$/, '');
+    if (inside(rel) && rel !== '.') out.add(rel);
+  }
+  return [...out];
+}
+
+/** Repo-relative paths with uncommitted changes (staged, unstaged or untracked; ignored files excluded). */
+async function changedPaths(dir) {
+  const r = await run('git', ['--no-optional-locks', 'status', '--porcelain', '-z', '--untracked-files=all', '--no-renames'], dir);
+  return r.raw.split('\0').filter(Boolean).map((e) => e.slice(3).replace(/\/$/, ''));
+}
+
+const under = (f, p) => f === p || f.startsWith(`${p}/`);
+
+/**
+ * Stages only the selected changes: the `only` paths (all changes when absent) minus the `exclude` ones,
+ * passed as literal pathspecs. Anything else already in the index is unstaged again, so the commit holds
+ * the selection alone. Returns the changed paths that stay out of the commit, untouched in the working tree.
+ */
+async function stageSelected(dir, opts, step) {
+  const only = opts.only ? repoPaths(dir, opts.only) : null;
+  const exclude = repoPaths(dir, opts.exclude);
+  const selected = (f) => (!only || only.some((p) => under(f, p))) && !exclude.some((p) => under(f, p));
+  const excludeSpecs = exclude.map((p) => `:(exclude,literal)${p}`);
+  if (only) {
+    // A pathspec that matches nothing fails the whole `git add`, so unchanged and missing paths are skipped.
+    const changed = await changedPaths(dir);
+    const specs = only.filter((p) => changed.some((f) => under(f, p))).map((p) => `:(literal)${p}`);
+    if (specs.length) await step(`git add -A (${specs.length} selected path${specs.length === 1 ? '' : 's'})`, git(dir, 'add', '-A', '--', ...specs, ...excludeSpecs));
+  } else {
+    await step(`git add -A (${exclude.length} path${exclude.length === 1 ? '' : 's'} excluded)`, git(dir, 'add', '-A', '--', ':/', ...excludeSpecs));
+  }
+  const staged = (await git(dir, 'diff', '--cached', '--name-only', '-z')).raw.split('\0').filter(Boolean);
+  const outside = staged.filter((f) => !selected(f));
+  if (outside.length) await step('git reset (outside the selection)', git(dir, 'reset', '-q', '--', ...outside.map((f) => `:(literal)${f}`)));
+  const deferred = (await changedPaths(dir)).filter((f) => !selected(f));
+  if (deferred.length) await step(`deferred (${deferred.length})`, Promise.resolve({ out: deferred.slice(0, 50).join('\n') }));
+  return deferred;
+}
+
+/**
+ * Repo-relative paths that a mission's runs edited, from the `files` that model adapters attach to
+ * run_events (Edit/Write tool calls, Codex file changes), in first-touch order. Paths outside
+ * projectPath (/tmp, uploads, other repos) are left out.
+ */
+export async function touchedFiles(missionId, projectPath) {
+  const rows = await many(
+    `SELECT f #>> '{}' AS path FROM runs r JOIN run_events e ON e.run_id = r.id,
+       jsonb_array_elements(CASE WHEN jsonb_typeof(e.data->'files') = 'array' THEN e.data->'files' ELSE '[]' END) AS f
+     WHERE r.mission_id = $1 AND jsonb_typeof(f) = 'string' GROUP BY 1 ORDER BY min(e.id), 1`, [missionId]);
+  return repoPaths(projectPath, rows.map((r) => r.path));
+}
+
 let ghHelper;
 async function credentialArgs() {
   if (ghHelper === undefined) {
@@ -42,7 +124,7 @@ export async function gitInfo(dir) {
   const [branch, remote, status, last] = await Promise.all([
     git(dir, 'rev-parse', '--abbrev-ref', 'HEAD'),
     git(dir, 'remote', 'get-url', 'origin'),
-    git(dir, 'status', '--porcelain'),
+    git(dir, '--no-optional-locks', 'status', '--porcelain'), // no index refresh write that a sync's `git add` could trip over
     git(dir, 'log', '-1', '--format=%h%x09%s%x09%cI'),
   ]);
   const [hash, subject, date] = last.stdout.split('\t');
@@ -102,18 +184,28 @@ async function buildMessage(dir, builder, files, steps) {
  * Commit everything that is source code and push it. Returns a sync log row.
  * `message` is the commit message, or an async builder `({ files, stat, diff }) => string`
  * that is only called when something is staged.
+ * `opts.only` (repo-relative or absolute paths) commits just those changes; `opts.exclude` leaves its
+ * paths out of the usual `add -A`. Changes left out stay unstaged and are listed in the row's `deferred`.
+ * Syncs of one repo run one at a time.
  */
-export async function syncProject(project, message, settings) {
+export async function syncProject(project, message, settings, opts = {}) {
+  return withRepoLock(project.path, () => sync(project, message, settings, opts || {}));
+}
+
+async function sync(project, message, settings, opts) {
   const dir = project.path;
   const steps = [];
   let commitMessage = null;
+  let deferred = [];
   const step = async (label, p) => { const r = await p; steps.push(`$ ${label}\n${r.out}`); return r; };
   const log = async (status, commit, msg) => {
+    if (deferred.length) msg = `${msg} · ${deferred.length} file${deferred.length === 1 ? '' : 's'} deferred to an in-flight mission`;
     if (commitMessage) msg = `${msg} · ${commitMessage.split('\n')[0]}`;
     const row = await one(`INSERT INTO sync_logs(project_id, status, commit, message, output) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
       [project.id, status, commit, msg, steps.join('\n').slice(-12000)]);
     if (status !== 'noop') await query(`UPDATE projects SET last_synced_at = now() WHERE id = $1`, [project.id]);
     row.commit_message = commitMessage;
+    row.deferred = deferred;
     emit('sync:log', row);
     return row;
   };
@@ -133,7 +225,8 @@ export async function syncProject(project, message, settings) {
     else if (remote.stdout !== project.github_url) await step('git remote set-url origin', git(dir, 'remote', 'set-url', 'origin', project.github_url));
   }
 
-  await step('git add -A', git(dir, 'add', '-A'));
+  if (opts.only || opts.exclude?.length) deferred = await stageSelected(dir, opts, step);
+  else await step('git add -A', git(dir, 'add', '-A'));
   const staged = (await git(dir, 'diff', '--cached', '--name-only')).stdout.split('\n').filter(Boolean);
   const tooBig = staged.filter((f) => { try { return fs.statSync(path.join(dir, f)).size > MAX_FILE_BYTES; } catch { return false; } });
   if (tooBig.length) await step('git reset (files > 50MB)', git(dir, 'reset', '-q', '--', ...tooBig));

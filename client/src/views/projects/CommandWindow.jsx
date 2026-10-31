@@ -5,7 +5,7 @@ import {
   Hash, Plus, Pencil, Split, CornerDownRight, Archive, ArchiveRestore, MonitorPlay,
 } from 'lucide-react';
 import { api } from '../../lib/api.js';
-import { useStore, selectRun } from '../../lib/store.js';
+import { useStore, selectRuns } from '../../lib/store.js';
 import { toast } from '../../lib/toast.js';
 import { copyText, clockTime, dateTime } from '../../lib/format.js';
 import { parseNew, isUntitled, tagCounts, MAX_TAGS } from '../../lib/topics.js';
@@ -21,7 +21,7 @@ const SLASH = [
   { cmd: '/new', desc: 'Start a new topic — /new [title] [#tag …]', args: true },
   { cmd: '/standup', desc: 'Agent coordination meeting: status, blockers, next' },
   { cmd: '/sync', desc: 'Commit and push this project to GitHub now' },
-  { cmd: '/stop', desc: 'Cancel the running mission' },
+  { cmd: '/stop', desc: "Cancel this topic's mission" },
 ];
 
 function CopyButton({ text, count }) {
@@ -267,7 +267,6 @@ export function CommandWindow({ project }) {
   // Only the active topic's messages. A project without any topic yet has an empty chat.
   const messages = topicId ? st.messages[topicId] : topics ? EMPTY : undefined;
   const tasks = st.tasks[project.id];
-  const mission = st.missions[project.id];
   const [text, setText] = useState('');
   const [files, setFiles] = useState([]);
   const [sending, setSending] = useState(false);
@@ -303,14 +302,17 @@ export function CommandWindow({ project }) {
     if (el && stick.current) el.scrollTop = el.scrollHeight;
   }, [grouped.length, project.id, topicId]);
 
-  const running = project.status === 'running';
-  const currentMissionId = mission?.id || tasks?.[0]?.mission_id;
-  const live = running && mission?.status !== 'planning' ? tasks?.filter((t) => t.mission_id === currentMissionId && t.origin !== 'proposal') : null;
+  // Topics run their missions side by side. The header, mission bar and "Agents are working…" follow the active topic's
+  // own mission; missions of other topics only get an informational line with links.
+  const runs = selectRuns(st, project);
+  const run = topicId ? runs[topicId] : null;
+  const queued = !run && project.status === 'running' && !!topic?.running; // an order of this topic waits for a free slot
+  const busy = !!run || queued;
+  const mission = run ? st.missionsByTopic[topicId] : null;
+  const live = run && !run.planning && run.missionId ? tasks?.filter((t) => t.mission_id === run.missionId && t.origin !== 'proposal') : null;
   const doneCount = live ? live.filter((t) => t.status === 'done').length : 0;
-  // The mission bar and "Agents are working…" belong to the topic that owns the mission; other topics get a link to it.
-  const run = { ...selectRun(st, project), progress: live?.length ? `${doneCount}/${live.length}` : null };
-  const owns = running && !!run.id && run.id === topicId;
-  const runTopic = run.id ? topics?.find((t) => t.id === run.id) : null;
+  const order = mission?.command || messages?.find((m) => m.mission_id === run?.missionId && m.author_type === 'user')?.content;
+  const others = topics?.filter((t) => t.id !== topicId && runs[t.id]) || EMPTY;
   const origin = topicId && st.movedFrom[topicId] ? topics?.find((t) => t.id === st.movedFrom[topicId]) : null;
   const othersHaveHistory = !!topics?.some((t) => t.id !== topicId && t.message_count > 0);
   // Argument hint for "/new …" once the command is followed by a space (bare "/new" still shows the slash menu).
@@ -361,7 +363,7 @@ export function CommandWindow({ project }) {
           <div className="flex items-center gap-2">
             {project.protected && <Lock size={13} className="text-accent shrink-0" />}
             <span className="font-semibold text-[0.92rem] truncate">{project.name}</span>
-            <Badge tone={running ? 'accent' : 'neutral'}>{running ? (mission?.status === 'planning' ? 'planning' : 'running') : 'idle'}</Badge>
+            <Badge tone={run ? 'accent' : queued ? 'warn' : 'neutral'}>{run ? (run.planning ? 'planning' : 'running') : queued ? 'queued' : 'idle'}</Badge>
           </div>
           <div className="flex items-center gap-2 text-[0.7rem] text-subtle min-w-0">
             <button className="mono truncate hover:text-accent" title="Open in Files" onClick={() => st.set({ view: 'files', filePanes: [{ id: 'p1', path: project.path }], activePane: 'p1' })}>{project.path}</button>
@@ -375,27 +377,35 @@ export function CommandWindow({ project }) {
           <IconButton icon={Users} label="Stand-up meeting" onClick={() => api.post(`/api/projects/${project.id}/standup`, { topic_id: topicId || undefined })} />
           <IconButton icon={FolderOpen} label="Open in Files" onClick={() => st.set({ view: 'files', filePanes: [{ id: 'p1', path: project.path }], activePane: 'p1' })} />
           <IconButton icon={Settings2} label="Project settings" onClick={() => setSettings(true)} />
-          {running && <Button size="sm" variant="danger" icon={Square} title="Stop the mission" className="@max-md:px-1.5" onClick={() => api.post(`/api/projects/${project.id}/cancel`)}><span className="@max-md:sr-only">Stop</span></Button>}
+          {busy && (
+            <Button size="sm" variant="danger" icon={Square} title={queued ? "Cancel this topic's queued order" : "Stop this topic's mission"} className="@max-md:px-1.5"
+              onClick={() => api.post(`/api/projects/${project.id}/cancel`, { topic_id: topicId })}><span className="@max-md:sr-only">Stop</span></Button>
+          )}
           <IconButton icon={Trash2} label={project.protected ? 'Protected project — cannot be deleted' : 'Delete project'} tone="danger" disabled={project.protected} onClick={() => setConfirmDel(true)} />
         </div>
       </div>
 
-      <TopicBar project={project} run={run} onCompose={focusComposer} />
+      <TopicBar project={project} runs={runs} onCompose={focusComposer} />
 
-      {owns && live && live.length > 0 && (
+      {live?.length > 0 && (
         <div className="px-4 py-2 border-b border-line bg-sunken/50 shrink-0">
-          <div className="flex items-center gap-2 text-xs mb-1.5"><Loader2 size={12} className="animate-spin text-accent" /><span className="font-medium">Mission in progress</span><span className="text-subtle truncate">{mission?.command?.split('\n')[0]}</span><span className="ml-auto tabular text-muted">{doneCount}/{live.length}</span></div>
+          <div className="flex items-center gap-2 text-xs mb-1.5"><Loader2 size={12} className="animate-spin text-accent" /><span className="font-medium">Mission in progress</span><span className="text-subtle truncate">{order?.split('\n')[0]}</span><span className="ml-auto tabular text-muted">{doneCount}/{live.length}</span></div>
           <Progress value={(doneCount / live.length) * 100} striped />
         </div>
       )}
-      {running && !owns && (
-        <div className="flex items-center gap-2 min-w-0 px-4 py-2 border-b border-line bg-sunken/50 text-xs shrink-0">
+      {others.length > 0 && (
+        <div className="flex items-center gap-1.5 min-w-0 px-4 py-2 border-b border-line bg-sunken/50 text-xs shrink-0">
           <Loader2 size={12} className="animate-spin text-accent shrink-0 motion-reduce:animate-none" />
-          <span className="truncate">
-            {runTopic ? <>Mission {run.planning ? 'planning' : 'running'} in <b className="font-medium">{runTopic.title}</b></> : 'A mission is running in this project'}
-          </span>
-          {run.progress && <span className="tabular text-muted shrink-0">· {run.progress}</span>}
-          {runTopic && <Button size="sm" variant="ghost" icon={ArrowRight} className="ml-auto -my-1 shrink-0" onClick={() => st.setActiveTopic(project.id, runTopic.id)}>Go to topic</Button>}
+          <span className="text-muted shrink-0">Also running:</span>
+          {/* Equal shares, each capped at its own width: a long title cannot squeeze a short one to "F…". */}
+          {others.slice(0, 2).map((t, i) => (
+            <span key={t.id} className="flex-1 max-w-max flex min-w-0">
+              <button type="button" className="truncate font-medium text-fg hover:underline focus-visible:outline-accent!" onClick={() => st.setActiveTopic(project.id, t.id)}
+                title={`${t.title} — ${runs[t.id].planning ? 'planning' : `running${runs[t.id].progress ? ` · ${runs[t.id].progress}` : ''}`}`}>{t.title}</button>
+              {i === 0 && others.length > 1 && <span className="text-muted">,</span>}
+            </span>
+          ))}
+          {others.length > 2 && <span className="tabular text-muted shrink-0" title={others.slice(2).map((t) => t.title).join(', ')}>+{others.length - 2}</span>}
         </div>
       )}
 
@@ -427,10 +437,10 @@ export function CommandWindow({ project }) {
             {grouped.map(({ m, count }) => <Message key={m.id} m={m} count={count} tasks={tasks} />)}
           </div>
         )}
-        {owns && (
+        {run && (
           <div className="flex items-center gap-2 px-4 py-2 text-xs text-muted">
             <span className="flex gap-1">{[0, 1, 2].map((i) => <span key={i} className="size-1.5 rounded-full bg-accent animate-af-pulse" style={{ animationDelay: `${i * 0.2}s` }} />)}</span>
-            {mission?.status === 'planning' ? `${project.manager_name} is planning and staffing…` : 'Agents are working…'}
+            {run.planning ? `${project.manager_name} is planning and staffing…` : 'Agents are working…'}
           </div>
         )}
       </div>
@@ -503,7 +513,7 @@ export function CommandWindow({ project }) {
               </div>
             )}
             <Button variant="primary" size="sm" icon={Send} className="ml-auto" loading={sending} disabled={!text.trim() && !files.length} onClick={send}
-              title={running ? 'New orders are queued after the current mission' : undefined}>Send</Button>
+              title={busy ? "Queued after this topic's current mission" : undefined}>Send</Button>
             <Modal open={!!preview} onClose={() => setPreview(null)} title={preview?.file.name || 'Image'} size="lg" bodyClass="p-2 flex items-center justify-center bg-sunken">
               {preview && <img src={preview.url} alt={preview.file.name} className="max-w-full max-h-full object-contain" />}
             </Modal>

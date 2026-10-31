@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { one, many, query } from '../db/pool.js';
 import { config } from '../config.js';
 import { emit } from '../events.js';
@@ -7,15 +8,80 @@ import { getAgent, listAgents, createAgent, cloneAgent, publishAgent, refreshAge
 import { getProject, publishProject, setProjectStatus } from '../services/projects.js';
 import { getTopic, createTopic, updateTopic, touchTopic, ensureTopic, publishTopic } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
-import { syncProject } from '../services/git.js';
+import { syncProject, touchedFiles, repoPaths } from '../services/git.js';
 import { PROVIDERS, resolveModel, runModel, recordRunUsage, publishModels } from '../models/index.js';
 import { heuristicPlan, topicTitle } from './heuristics.js';
-import { planPrompt, taskPrompt, commitPrompt, parseJson, topicContext } from './prompts.js';
+import { planPrompt, taskPrompt, commitPrompt, parseJson, topicContext, inflightContext } from './prompts.js';
 import { learn, analyzeMission } from './evolution.js';
 
-const active = new Map(); // projectId -> { missionId, controller }
-const queues = new Map(); // projectId -> [missionId]
+// Missions run in per-topic lanes: one at a time per topic (FIFO), different topics in parallel up to
+// settings.orchestrator.maxMissions per project. The lane is the mission's topic at submit time.
+const active = new Map(); // missionId -> { projectId, topicId (lane), mission, controller, tasks (planned), phase ('done' once it will commit nothing more) }
+const queues = new Map(); // projectId -> [mission], oldest first
 const liveRuns = new Map(); // runId -> { agentId, taskId }
+
+// File leases between missions of one project (one working tree). A running write task holds the files its plan declared
+// plus every file it was seen editing; none declared = exclusive. A write task of another mission whose files overlap
+// waits, still pending, until a task of the project finishes. Only running tasks hold leases, so waiting can't deadlock;
+// tasks of one mission are never checked against each other (depends_on orders those).
+const leases = new Map(); // taskId -> { projectId, missionId, mission, key, files: [path] | null, live: Set<path> }
+const finishes = new Map(); // projectId -> { promise, resolve }: settles when the next task of the project finishes
+const sweeps = new Set(); // projectIds whose scoped sync left changes for the last mission to commit
+
+const overlaps = (a, b) => a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+const leased = (l) => [...new Set([...(l.files || []), ...l.live])];
+
+/** Other missions' running write tasks that a write task declaring `files` would collide with. */
+function blockersOf(projectId, missionId, files) {
+  return [...leases.values()].filter((l) => l.projectId === projectId && l.missionId !== missionId
+    && (!files?.length || !l.files || files.some((f) => leased(l).some((p) => overlaps(f, p)))));
+}
+
+/** Takes the task's lease (write roles only) unless it collides; returns the colliding leases. Check and take are one step. */
+function lease(projectId, mission, t) {
+  if (roleInfo(t.role).access !== 'write') return [];
+  const found = blockersOf(projectId, mission.id, t.files);
+  if (!found.length) leases.set(t.id, { projectId, missionId: mission.id, mission, key: t.key, files: t.files?.length ? t.files : null, live: new Set() });
+  return found;
+}
+
+/** A task of the project finished: drop its lease and wake every task waiting for one. */
+function taskFinished(projectId, taskId) {
+  leases.delete(taskId);
+  const f = finishes.get(projectId);
+  if (f) { finishes.delete(projectId); f.resolve(); }
+}
+
+function nextFinish(projectId) {
+  if (!finishes.has(projectId)) {
+    let resolve;
+    const promise = new Promise((r) => { resolve = r; });
+    finishes.set(projectId, { promise, resolve });
+  }
+  return finishes.get(projectId).promise;
+}
+
+/** 'T2 waits for <topic> · T3 (server/foo.js) to avoid editing the same files.' */
+async function waitText(t, found) {
+  const parts = [];
+  for (const l of found.slice(0, 3)) {
+    const topic = await getTopic(l.mission.topic_id).catch(() => null);
+    const paths = l.files ? leased(l).filter((p) => !t.files?.length || t.files.some((f) => overlaps(f, p))) : [];
+    const shown = paths.length ? `${paths.slice(0, 3).join(', ')}${paths.length > 3 ? ` +${paths.length - 3}` : ''}` : 'files not declared';
+    parts.push(`${topic?.title || 'another topic'} · ${l.key} (${shown})`);
+  }
+  return `${t.key} waits for ${parts.join(', ')}${found.length > 3 ? ` and ${found.length - 3} more` : ''} to avoid editing the same files.`;
+}
+
+/** Repo-relative files that these missions' runs edited or that their running tasks lease now. */
+async function filesOf(project, missions) {
+  const out = new Set();
+  for (const a of missions) {
+    for (const f of await touchedFiles(a.mission.id, project.path)) out.add(f);
+    for (const l of leases.values()) if (l.missionId === a.mission.id) for (const f of leased(l)) out.add(f);
+  }
+  return [...out];
+}
 
 export function busyState() {
   return { missions: active.size, runs: liveRuns.size, busy: active.size > 0 || liveRuns.size > 0 };
@@ -64,7 +130,9 @@ async function executeRun({ kind, agent, project, mission, task, model, prompt, 
   );
   liveRuns.set(run.id, { agentId: agent.id, taskId: task?.id });
   emit('run:start', { ...run, agent_name: agent.name });
+  const held = task && leases.get(task.id);
   const onEvent = (e) => {
+    if (held && Array.isArray(e.files)) for (const f of repoPaths(project.path, e.files)) held.live.add(f); // seen editing: part of its lease
     const data = { ...e };
     delete data.type;
     query(`INSERT INTO run_events(run_id, type, data) VALUES ($1,$2,$3)`, [run.id, e.type, data]).catch(() => {});
@@ -129,50 +197,109 @@ export async function submitCommand(projectId, { content, attachments = [], topi
   const mission = await one(`INSERT INTO missions(project_id, command, topic_id) VALUES ($1,$2,$3) RETURNING *`, [projectId, text, topic.id]);
   await query(`UPDATE messages SET mission_id = $2 WHERE id = $1`, [userMsg.id, mission.id]);
   mission.attachments = attachments;
-  const q = queues.get(projectId) || [];
-  q.push(mission);
-  queues.set(projectId, q);
-  if (active.has(projectId)) {
-    await postMessage({ project_id: projectId, mission_id: mission.id, author_type: 'agent', agent_id: project.manager_id, kind: 'status', content: `Queued. I will start this after the current mission (${q.length} waiting).` });
-  } else {
-    pump(projectId);
+  const cap = await missionCap();
+  queues.set(projectId, [...(queues.get(projectId) || []), mission]);
+  pump(projectId, cap);
+  // Started right away (in parallel with other topics): nothing to say.
+  const waiting = queues.get(projectId) || [];
+  if (waiting.includes(mission)) {
+    const mine = activeIn(projectId);
+    const content = mine.some((a) => inTopic(a, topic.id))
+      ? `Queued. I will start this after the current mission in this topic (${waiting.filter((m) => m.topic_id === topic.id).length} waiting here).`
+      : `Queued. ${mine.length} mission${mine.length === 1 ? ' is' : 's are'} already running in this project (limit ${cap}); this starts when one finishes.`;
+    await postMessage({ project_id: projectId, mission_id: mission.id, author_type: 'agent', agent_id: project.manager_id, kind: 'status', content });
   }
   return userMsg;
 }
 
-function pump(projectId) {
-  if (active.has(projectId)) return;
-  const q = queues.get(projectId) || [];
-  const next = q.shift();
-  if (!next) return;
+async function missionCap() {
+  const settings = await getSettings().catch(() => null);
+  return Math.max(1, Math.floor(Number(settings?.orchestrator.maxMissions)) || 3);
+}
+
+const activeIn = (projectId) => [...active.values()].filter((a) => a.projectId === projectId);
+
+// A mission that assignTopic moves to a fresh topic keeps its original lane until it finishes: later orders in the
+// original topic still wait for it. Orders typed in the topic it moved to wait for it too, so a topic never runs two.
+const inTopic = (a, topicId) => a.topicId === topicId || a.mission.topic_id === topicId;
+
+/** Start every queued order that may run now: oldest first, never two in one topic, at most `cap` in the project. */
+function pump(projectId, cap) {
+  const mine = activeIn(projectId);
+  const busy = new Set(mine.flatMap((a) => [a.topicId, a.mission.topic_id]));
+  let running = mine.length;
+  const waiting = [];
+  for (const m of queues.get(projectId) || []) {
+    if (running >= cap || busy.has(m.topic_id)) { waiting.push(m); continue; }
+    busy.add(m.topic_id);
+    running++;
+    start(projectId, m);
+  }
+  if (waiting.length) queues.set(projectId, waiting);
+  else queues.delete(projectId);
+}
+
+function start(projectId, mission) {
   const controller = new AbortController();
-  active.set(projectId, { missionId: next.id, controller });
-  runMission(next, controller.signal)
+  active.set(mission.id, { projectId, topicId: mission.topic_id, mission, controller });
+  runMission(mission, controller.signal)
     .catch((err) => console.error('[mission]', err))
     .finally(async () => {
-      active.delete(projectId);
-      if (!(queues.get(projectId) || []).length) {
-        await setProjectStatus(projectId, 'idle').catch(() => {});
-        // Queued orders dropped by /stop keep status 'planning'; with the project idle they no longer keep the GM working.
-        const p = await one(`SELECT manager_id FROM projects WHERE id = $1`, [projectId]).catch(() => null);
-        if (p?.manager_id) await refreshAgentStatus(p.manager_id).catch(() => {});
-      }
-      pump(projectId);
+      active.delete(mission.id);
+      pump(projectId, await missionCap());
+      await settleProject(projectId).catch(() => {});
     });
 }
 
-// topicId: where /stop was typed. Without it the reply goes to the running mission's topic.
+/**
+ * 'running' while a mission of the project is active; 'idle' (and the GM's status re-derived) once none is active and
+ * nothing is queued. Decided when the write runs and serialized per project, so a mission starting while another
+ * ends can never be left under an idle project.
+ */
+function settleProject(projectId) {
+  // withAgentLock is a plain keyed lane; here it orders one project's status writes.
+  return withAgentLock('project-status', projectId, async () => {
+    if (activeIn(projectId).length) return setProjectStatus(projectId, 'running');
+    if ((queues.get(projectId) || []).length) return;
+    await setProjectStatus(projectId, 'idle');
+    const p = await one(`SELECT manager_id FROM projects WHERE id = $1`, [projectId]);
+    if (p?.manager_id) await refreshAgentStatus(p.manager_id);
+  });
+}
+
+/**
+ * topicId (where /stop was typed, or the API's topic_id): stop only that topic's mission and drop only its queued
+ * orders. Without it every mission of the project stops and the whole queue is dropped (e.g. project delete).
+ */
 export async function cancelMission(projectId, topicId = null) {
-  const a = active.get(projectId);
-  queues.set(projectId, []);
+  const stopping = activeIn(projectId).filter((a) => !topicId || inTopic(a, topicId));
+  const q = queues.get(projectId) || [];
+  const dropped = q.filter((m) => !topicId || m.topic_id === topicId);
+  const kept = q.filter((m) => !dropped.includes(m));
+  if (kept.length) queues.set(projectId, kept);
+  else queues.delete(projectId);
+  for (const a of stopping) a.controller.abort();
   const project = await getProject(projectId);
-  if (!a) {
-    await postMessage({ project_id: projectId, topic_id: (await ensureTopic(projectId, topicId)).id, author_type: 'agent', agent_id: project?.manager_id, kind: 'status', content: 'Nothing is running.' });
-    return false;
+  const say = async (topic_id, mission_id, content) => postMessage({ project_id: projectId, mission_id, topic_id, author_type: 'agent', agent_id: project?.manager_id, kind: 'status', content });
+
+  // Dropped orders never started: close them so their topics stop showing a running mission.
+  if (dropped.length) {
+    await query(`UPDATE missions SET status='cancelled', summary='Cancelled before it started', finished_at=now() WHERE id = ANY($1::uuid[]) AND status = 'planning'`, [dropped.map((m) => m.id)]);
+    for (const m of dropped) await publishMission(m.id);
+    for (const id of new Set(dropped.map((m) => m.topic_id))) await publishTopic(id).catch(() => {});
   }
-  a.controller.abort();
-  // mission_id stays off a reply posted in another topic, so mission messages always share the mission's topic.
-  await postMessage({ project_id: projectId, mission_id: topicId ? null : a.missionId, topic_id: topicId, author_type: 'agent', agent_id: project?.manager_id, kind: 'status', content: 'Stopping all agents on this mission.' });
+  const queued = dropped.length ? ` ${dropped.length} queued order${dropped.length === 1 ? '' : 's'} dropped.` : '';
+  if (!stopping.length) {
+    const here = (await ensureTopic(projectId, topicId)).id;
+    await say(here, null, `${topicId ? 'Nothing is running in this topic.' : 'Nothing is running.'}${queued}`);
+    return dropped.length > 0;
+  }
+  if (topicId) {
+    // mission_id stays off a reply posted where /stop was typed, so mission messages always share the mission's topic.
+    await say((await ensureTopic(projectId, topicId)).id, null, `Stopping all agents on this mission.${queued}`);
+  } else {
+    for (const a of stopping) await say(null, a.mission.id, 'Stopping all agents on this mission.');
+  }
   return true;
 }
 
@@ -182,7 +309,8 @@ export async function cancelMission(projectId, topicId = null) {
 async function plan({ project, gm, mission, topic, history, signal }) {
   const agents = await listAgents();
   const model = await resolveModel(gm.model_id);
-  const { system, prompt } = planPrompt({ project, gm, command: mission.command, attachments: mission.attachments, agents, topic: topicContext(topic, history) });
+  const inflight = inflightContext(await inflightMissions(project.id, mission.id));
+  const { system, prompt } = planPrompt({ project, gm, command: mission.command, attachments: mission.attachments, agents, topic: topicContext(topic, history), inflight });
   let parsed = null;
   let out = null;
   try {
@@ -201,6 +329,20 @@ async function plan({ project, gm, mission, topic, history, signal }) {
   return parsed;
 }
 
+/** The project's other active missions, for the planner: topic, order and tasks with status and declared files. */
+async function inflightMissions(projectId, missionId) {
+  const others = activeIn(projectId).filter((a) => a.mission.id !== missionId);
+  if (!others.length) return [];
+  const ids = others.map((a) => a.mission.id);
+  const topics = await many(`SELECT m.id, t.title FROM missions m LEFT JOIN topics t ON t.id = m.topic_id WHERE m.id = ANY($1::uuid[])`, [ids]);
+  const rows = await many(`SELECT mission_id, key, title, role, status FROM tasks WHERE mission_id = ANY($1::uuid[]) AND origin <> 'proposal' ORDER BY created_at`, [ids]);
+  return others.map((a) => {
+    const declared = new Map((a.tasks || []).map((t) => [t.key, t.files || []]));
+    const tasks = rows.filter((t) => t.mission_id === a.mission.id).map((t) => ({ ...t, files: declared.get(t.key) || [] }));
+    return { topic: topics.find((t) => t.id === a.mission.id)?.title, order: a.mission.command, tasks };
+  });
+}
+
 /** Name an untitled topic after its first order, or move a clearly unrelated order (and its mission) into a new topic. */
 async function assignTopic({ project, gm, mission, topic, history, p, settings }) {
   const t = p.topic && typeof p.topic === 'object' ? p.topic : {};
@@ -213,23 +355,38 @@ async function assignTopic({ project, gm, mission, topic, history, p, settings }
   const fresh = await createTopic({ project_id: project.id, title, tags });
   await query(`UPDATE missions SET topic_id = $2 WHERE id = $1`, [mission.id, fresh.id]);
   const moved = await many(`UPDATE messages SET topic_id = $2 WHERE mission_id = $1 RETURNING id`, [mission.id, fresh.id]);
-  mission.topic_id = fresh.id;
+  mission.topic_id = fresh.id; // it keeps its original lane (the topic it was submitted in) until it finishes; see inTopic()
   emit('topic:new', { ...(await getTopic(fresh.id)), moved_from: topic.id, mission_id: mission.id });
   emit('topic:moved', { project_id: project.id, mission_id: mission.id, moved_from: topic.id, topic_id: fresh.id, message_ids: moved.map((m) => m.id) });
   await postMessage({ project_id: project.id, topic_id: topic.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: `Continued in new topic: ${fresh.title}`, meta: { topic_id: fresh.id } });
   await publishTopic(topic.id);
 }
 
+/** A task's declared files: up to 20 repo-relative paths or directories; absolute paths and `..` segments are dropped. */
+function declaredFiles(list) {
+  const out = new Set();
+  for (const f of Array.isArray(list) ? list : []) {
+    if (typeof f !== 'string' || f.includes('\0')) continue;
+    const p = path.posix.normalize(f.trim() || '.').replace(/\/+$/, '');
+    if (p && p !== '.' && p.length <= 300 && !path.posix.isAbsolute(p) && !p.split('/').includes('..')) out.add(p);
+  }
+  return [...out].slice(0, 20);
+}
+
 function normalizeTasks(raw, settings) {
-  const tasks = (raw || []).slice(0, 20).map((t, i) => ({
-    key: String(t.key || `T${i + 1}`).slice(0, 12),
-    title: String(t.title || `Task ${i + 1}`).slice(0, 200),
-    description: String(t.description || t.title || '').slice(0, 4000),
-    role: normalizeRole(t.role),
-    skills: (Array.isArray(t.skills) ? t.skills : []).map((s) => String(s).toLowerCase()).slice(0, 8),
-    acceptance: (Array.isArray(t.acceptance) ? t.acceptance : []).map(String).slice(0, 10),
-    depends_on: (Array.isArray(t.depends_on) ? t.depends_on : []).map(String),
-  }));
+  const tasks = (raw || []).slice(0, 20).map((t, i) => {
+    const files = declaredFiles(t.files); // kept in missions.plan; the file leases use it
+    return {
+      key: String(t.key || `T${i + 1}`).slice(0, 12),
+      title: String(t.title || `Task ${i + 1}`).slice(0, 200),
+      description: String(t.description || t.title || '').slice(0, 4000),
+      role: normalizeRole(t.role),
+      skills: (Array.isArray(t.skills) ? t.skills : []).map((s) => String(s).toLowerCase()).slice(0, 8),
+      acceptance: (Array.isArray(t.acceptance) ? t.acceptance : []).map(String).slice(0, 10),
+      depends_on: (Array.isArray(t.depends_on) ? t.depends_on : []).map(String),
+      ...(files.length ? { files } : {}),
+    };
+  });
   const keys = new Set(tasks.map((t) => t.key));
   for (const t of tasks) t.depends_on = t.depends_on.filter((k) => keys.has(k) && k !== t.key);
   // Independent verification: code-changing work must be checked by someone else.
@@ -294,7 +451,7 @@ async function runMission(mission, signal) {
   const settings = await getSettings();
   let project = await getProject(mission.project_id);
   const gm = await getAgent(project.manager_id);
-  await setProjectStatus(project.id, 'running');
+  await settleProject(project.id); // 'running' while this mission is active
   await refreshAgentStatus(gm.id); // working: its project is running and this mission is planning
   refreshProject(project.id);
   const started = Date.now();
@@ -315,6 +472,8 @@ async function runMission(mission, signal) {
     const p = await plan({ project, gm, mission, topic, history, signal });
     await assignTopic({ project, gm, mission, topic, history, p, settings });
     const tasks = normalizeTasks(p.tasks, settings);
+    const self = active.get(mission.id);
+    if (self) self.tasks = tasks; // declared files for other topics' planners
 
     if (!tasks.length) {
       await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'chat', content: p.reply || p.analysis || 'Done.' });
@@ -326,11 +485,13 @@ async function runMission(mission, signal) {
     const notes = await staff(tasks, project);
     const rows = [];
     for (const t of tasks) {
-      rows.push(await one(
+      const row = await one(
         `INSERT INTO tasks(project_id, mission_id, key, title, description, role, skills, acceptance, depends_on, agent_id)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
         [project.id, mission.id, t.key, t.title, t.description, t.role, JSON.stringify(t.skills), JSON.stringify(t.acceptance), JSON.stringify(t.depends_on), t.agent_id],
-      ));
+      );
+      if (t.files) row.files = t.files;
+      rows.push(row);
     }
     await query(`UPDATE missions SET status='running', plan=$2 WHERE id=$1`, [mission.id, { analysis: p.analysis, tasks }]);
     await publishMission(mission.id);
@@ -357,10 +518,11 @@ async function runMission(mission, signal) {
        WHERE r.mission_id = $1 AND r.status = 'done' AND m.provider = ANY($2::text[]) AND t.status = 'done' LIMIT 1`, [mission.id, editProviders]));
     project = await getProject(project.id);
     let github = '';
-    if (wrote && project.auto_sync && settings.github.autoSync && !signal.aborted) {
-      const log = await syncProject(project, commitMessageBuilder({ project, gm, mission, tasks: final, signal }), settings.github);
-      github = `\n\n${syncReport(log)}`;
-    }
+    if (project.auto_sync && settings.github.autoSync && !signal.aborted) {
+      // Marked done inside the sync lane, so the next mission's sync never counts it as still active.
+      const log = await syncMission({ project, mission, wrote, tasks, final, settings, message: commitMessageBuilder({ project, gm, mission, tasks: final, signal }) });
+      if (log) github = `\n\n${syncReport(log)}${deferredNote(log)}`;
+    } else if (self) self.phase = 'done';
 
     // Measured after the sync so the GM's commit-message run is counted too.
     const usage = await one(`SELECT coalesce(sum(input_tokens + output_tokens),0) AS tokens, coalesce(sum(cost_usd),0) AS cost FROM runs WHERE mission_id = $1`, [mission.id]);
@@ -379,6 +541,8 @@ async function runMission(mission, signal) {
     analyzeMission(mission.id).catch((e) => console.error('[evolution]', e.message));
   } catch (err) {
     const status = signal.aborted ? 'cancelled' : 'failed';
+    const self = active.get(mission.id);
+    if (self) self.phase = 'done'; // commits nothing: its changes are left to the last mission's sweep
     await query(`UPDATE missions SET status=$2, summary=$3, finished_at=now() WHERE id=$1`, [mission.id, status, err.message]);
     await query(`UPDATE tasks SET status='cancelled', finished_at=now() WHERE mission_id=$1 AND status IN ('pending','running')`, [mission.id]);
     refreshProject(project.id);
@@ -394,10 +558,49 @@ async function runMission(mission, signal) {
 
 const fmtDuration = (s) => (s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`);
 
+/**
+ * Commit a finished mission's work; one sync at a time per project, so the choice below still holds at commit time.
+ * While another mission of the project is active and has not committed yet, only this mission's files are committed
+ * (what its runs edited plus its done tasks' declared files) minus what those missions touched or lease; the rest stays
+ * for the last one, which sweeps with the usual add -A. Returns the sync log, or null when there is nothing to sync now.
+ */
+function syncMission({ project, mission, wrote, tasks, final, settings, message }) {
+  return withAgentLock('sync', project.id, async () => {
+    const self = active.get(mission.id);
+    try {
+      const others = activeIn(project.id).filter((a) => a.mission.id !== mission.id && a.phase !== 'done');
+      if (!others.length) {
+        if (!wrote && !sweeps.has(project.id)) return null;
+        const log = await syncProject(project, message, settings.github);
+        if (log.status !== 'error') sweeps.delete(project.id);
+        return log;
+      }
+      if (!wrote) return null;
+      const done = new Set(final.filter((t) => t.status === 'done').map((t) => t.key));
+      const declared = tasks.filter((t) => done.has(t.key)).flatMap((t) => t.files || []);
+      const only = [...new Set([...(await touchedFiles(mission.id, project.path)), ...declared])];
+      const log = await syncProject(project, message, settings.github, { only, exclude: await filesOf(project, others) });
+      if (log.deferred?.length) sweeps.add(project.id);
+      return log;
+    } finally {
+      if (self) self.phase = 'done';
+    }
+  });
+}
+
+const fileList = (files, n = 12) => `${[...files].sort().slice(0, n).map((f) => `\`${f}\``).join(', ')}${files.length > n ? ` and ${files.length - n} more` : ''}`;
+
+/** Summary note for the changes a scoped sync left uncommitted. */
+const deferredNote = (log) => (log.deferred?.length
+  ? `\n\nDeferred while other missions in this project are active (the last one to finish commits them): ${fileList(log.deferred)}`
+  : '');
+
 async function schedule({ rows, project, gm, mission, settings, signal }) {
   const state = Object.fromEntries(rows.map((r) => [r.key, r]));
   const running = new Map();
   const limit = Math.max(1, settings.orchestrator.maxParallel || 3);
+  const announced = new Set(); // keys whose file-lease wait was posted
+  const aborted = new Promise((r) => { if (signal.aborted) r(); else signal.addEventListener('abort', r, { once: true }); });
   while (!signal.aborted) {
     for (const t of Object.values(state)) {
       if (t.status !== 'pending') continue;
@@ -410,17 +613,27 @@ async function schedule({ rows, project, gm, mission, settings, signal }) {
       }
     }
     const ready = Object.values(state).filter((t) => t.status === 'pending' && t.depends_on.every((k) => state[k]?.status === 'done'));
+    let wake = null; // set when a ready task waits for another mission's file lease
     for (const t of ready) {
       if (running.size >= limit) break;
+      const found = lease(project.id, mission, t);
+      if (found.length) {
+        wake ||= nextFinish(project.id); // taken with the check, so a finish during the post below still wakes it
+        if (!announced.has(t.key)) {
+          announced.add(t.key);
+          await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: await waitText(t, found) });
+        }
+        continue;
+      }
       t.status = 'running';
       const p = runTask({ task: t, state, project, gm, mission, settings, signal })
         .then((status) => { t.status = status; })
         .catch((err) => { t.status = 'failed'; console.error('[task]', err.message); })
-        .finally(() => running.delete(t.key));
+        .finally(() => { running.delete(t.key); taskFinished(project.id, t.id); });
       running.set(t.key, p);
     }
-    if (!running.size) break;
-    await Promise.race(running.values());
+    if (!running.size && !wake) break;
+    await Promise.race(wake ? [...running.values(), wake, aborted] : running.values());
   }
   if (signal.aborted) {
     await Promise.allSettled(running.values());
@@ -529,7 +742,9 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
 
   const deps = await many(`SELECT t.*, a.name AS agent_name FROM tasks t LEFT JOIN agents a ON a.id = t.agent_id WHERE t.mission_id = $1 AND t.key = ANY($2)`, [mission.id, task.depends_on]);
   const playbook = agent.stats?.experiment?.playbook || agent.playbook;
-  const { system, prompt } = taskPrompt({ project, agent, task: { ...task, acceptance: task.acceptance }, gm, supervisor: agent.supervisor_name, deps, mission, attachments: mission.attachments, playbook });
+  const others = activeIn(project.id).filter((a) => a.mission.id !== mission.id);
+  const shared = others.length ? await filesOf(project, others) : null;
+  const { system, prompt } = taskPrompt({ project, agent, task: { ...task, acceptance: task.acceptance }, gm, supervisor: agent.supervisor_name, deps, mission, attachments: mission.attachments, playbook, shared });
   const access = roleInfo(agent.role).access;
 
   let ok = false;
@@ -729,12 +944,13 @@ export async function standup(projectId, topicId = null) {
     `SELECT DISTINCT ON (a.id) a.name, a.title, a.status, t.key, t.title AS task, t.status AS task_status, t.progress
      FROM tasks t JOIN agents a ON a.id = t.agent_id WHERE t.project_id = $1 ORDER BY a.id, t.created_at DESC`, [projectId]);
   const blockers = rows.filter((r) => ['failed', 'cancelled'].includes(r.task_status));
+  const running = activeIn(projectId).length;
   const body = rows.length
     ? rows.map((r) => `- **${r.name}** (${r.title}) · ${r.status} — last: ${r.key} ${r.task} · ${r.task_status}${r.task_status === 'running' ? ` ${r.progress}%` : ''}`).join('\n')
     : '- No agents have worked on this project yet.';
   return postMessage({
     project_id: projectId, topic_id: topic.id, author_type: 'agent', agent_id: project.manager_id, kind: 'meeting',
-    content: `**Stand-up · ${project.name}**\n\n${body}\n\n**Blockers:** ${blockers.length ? blockers.map((b) => `${b.key} (${b.name})`).join(', ') : 'none'}\n**Next:** ${active.has(projectId) ? 'mission in progress' : 'awaiting your next order'}`,
+    content: `**Stand-up · ${project.name}**\n\n${body}\n\n**Blockers:** ${blockers.length ? blockers.map((b) => `${b.key} (${b.name})`).join(', ') : 'none'}\n**Next:** ${running ? `${running} mission${running === 1 ? '' : 's'} in progress` : 'awaiting your next order'}`,
   });
 }
 
@@ -742,8 +958,16 @@ export async function syncNow(projectId, reason, topicId = null) {
   const project = await getProject(projectId);
   const settings = await getSettings();
   const gm = project.manager_id ? await getAgent(project.manager_id) : null;
-  const log = await syncProject(project, commitMessageBuilder({ project, gm, mission: null, reason }), settings.github);
-  const content = syncReport(log);
+  // Files that missions still in progress touched or lease stay out: their own missions commit them.
+  const log = await withAgentLock('sync', projectId, async () => {
+    const others = activeIn(projectId).filter((a) => a.phase !== 'done');
+    const exclude = others.length ? await filesOf(project, others) : [];
+    const row = await syncProject(project, commitMessageBuilder({ project, gm, mission: null, reason }), settings.github, exclude.length ? { exclude } : {});
+    if (!others.length && row.status !== 'error') sweeps.delete(projectId);
+    return row;
+  });
+  let content = syncReport(log);
+  if (log.deferred?.length) content += `\n\nLeft out ${log.deferred.length === 1 ? 'a file' : `${log.deferred.length} files`} that missions in progress are still editing (they commit them): ${fileList(log.deferred)}`;
   // The chat shows a 'status' as one plain line; the quoted commit message needs the Markdown card.
   await postMessage({ project_id: projectId, topic_id: (await ensureTopic(projectId, topicId)).id, author_type: 'system', kind: content.includes('\n') ? 'chat' : 'status', content });
   await publishProject(projectId);

@@ -32,7 +32,26 @@ export function topicContext(topic, history = []) {
   return (lines.length ? `${head}\nRecent missions in this topic:\n${lines.join('\n')}` : `${head} · first order in this topic`).slice(0, 1500);
 }
 
-export function planPrompt({ project, gm, command, attachments, agents, topic }) {
+/**
+ * Missions running right now in other topics of the same working tree: topic, first line of the order and each task
+ * with its role, status and declared files. Hard cap 1500 chars.
+ */
+export function inflightContext(missions = []) {
+  const lines = [];
+  for (const m of missions) {
+    lines.push(`- "${clip(m.topic || 'Untitled', 60)}" · order: ${clip(String(m.order || '').split('\n')[0], 120)}`);
+    if (!m.tasks?.length) lines.push('  - (still planning)');
+    for (const t of m.tasks || []) lines.push(`  - ${t.key} ${clip(t.title, 80)} · ${t.role} · ${t.status} · files: ${t.files?.length ? clip(t.files.join(', '), 200) : 'not declared'}`);
+  }
+  let out = '';
+  for (const l of lines) {
+    if (out.length + l.length + 1 > 1500) return `${out}…`;
+    out += `${l}\n`;
+  }
+  return out.trimEnd();
+}
+
+export function planPrompt({ project, gm, command, attachments, agents, topic, inflight = '' }) {
   const roster = agents
     .filter((a) => !['executive', 'evolution', 'analyst', 'optimizer', 'manager'].includes(a.role))
     .map((a) => `- ${a.name} · ${a.role} · L${a.level} · skills: ${a.skills.map((s) => `${s.name}:${s.level}`).join(', ')} · ${a.status}`)
@@ -41,7 +60,8 @@ export function planPrompt({ project, gm, command, attachments, agents, topic })
 You receive orders from the user, decompose them into small, independently verifiable task contracts, and staff them from the agent registry. You do not write code yourself.
 Rules:
 - Split by independently testable outcome, not by file. Prefer 2–8 tasks; very large orders may use up to 14.
-- Use "depends_on" so independent tasks run in parallel; serialize tasks that edit the same files.
+- Use "depends_on" so independent tasks run in parallel; serialize tasks that edit the same files.${inflight ? `
+- Other missions are running in this working tree right now (IN-FLIGHT MISSIONS IN OTHER TOPICS). Every code-changing task declares "files": [repo-relative paths or directories it will edit]. Prefer a plan that avoids their files, but declare overlaps anyway: the platform makes an overlapping task wait until theirs finishes.` : ''}
 - Valid roles: ${Object.keys(ROLES).filter((r) => !['executive', 'evolution', 'analyst', 'optimizer', 'manager'].includes(r)).join(', ')}. You may invent a new specialist role (kebab-case) when none fits; the platform will recruit that agent.
 - Code-changing work must be followed by an independent verification task (role "reviewer" or "qa") that depends on it.
 - If the message is a question or small talk that needs no work, answer it in "reply" and return an empty "tasks" array.
@@ -53,7 +73,7 @@ Project brief: ${project.description || '(none)'}
 ${topic ? `Current topic: ${topic}\n` : ''}
 Agent registry:
 ${roster || '(empty)'}
-
+${inflight ? `\nIN-FLIGHT MISSIONS IN OTHER TOPICS (same working tree, running now):\n${inflight}\n` : ''}
 ORDER FROM THE USER:
 """
 ${command}
@@ -66,7 +86,7 @@ You may inspect the project files (read-only) to plan precisely. Respond with ON
   "topic": { "title": "≤6 words", "tags": ["1-3 short lowercase tags"], "new": false },
   "tasks": [
     { "key": "T1", "title": "short imperative title", "role": "frontend", "skills": ["react"],
-      "description": "precise scope: what to change and where", "acceptance": ["verifiable criterion"], "depends_on": [] }
+      "description": "precise scope: what to change and where", "acceptance": ["verifiable criterion"], "depends_on": []${inflight ? ', "files": ["src/path/file.js"]' : ''} }
   ]
 }`;
   return { system, prompt };
@@ -113,7 +133,11 @@ Write the commit message now: subject line, blank line, 2-6 "- " bullet lines. N
   return { system, prompt };
 }
 
-export function taskPrompt({ project, agent, task, gm, supervisor, deps, mission, attachments, playbook }) {
+/**
+ * `shared`: null when no other mission of the project is active, else the files those missions touched or lease
+ * (repo-relative). It adds the rule that keeps a worker off the other missions' edits.
+ */
+export function taskPrompt({ project, agent, task, gm, supervisor, deps, mission, attachments, playbook, shared = null }) {
   const info = roleInfo(agent.role);
   const lessons = (playbook || []).slice(0, 12);
   const system = `You are ${agent.name}, ${agent.title} (tier ${agent.tier}, ${info.department}) in the AgentForge engineering organization.
@@ -123,7 +147,8 @@ Skills: ${agent.skills.map((s) => `${s.name} (${s.level}/100)`).join(', ')}
 Hierarchy: you received this task from ${gm.name} (General Manager of "${project.name}")${supervisor ? `; your line supervisor is ${supervisor}` : ''}. Report results upward honestly; raise proposals for improvements you notice.
 ${lessons.length ? `Playbook v${agent.prompt_version} (lessons learned from previous projects):\n${lessons.map((l) => `- ${l}`).join('\n')}` : ''}
 Operating rules:
-- Stay strictly inside the task scope and the working directory ${project.path}.
+- Stay strictly inside the task scope and the working directory ${project.path}.${shared ? `
+- Other missions are editing this working tree right now (their files: ${shared.length ? clip(shared.join(', '), 400) : 'none yet'}). Never run git stash/checkout/reset/restore/clean or project-wide formatters; never revert, reformat or delete files you did not change; never build into the live dist.` : ''}
 - ${info.access === 'write' ? 'You may edit files needed for this task. Keep changes minimal and consistent with the existing code style.' : 'You have full tool authority: you may run commands, fetch the web and write scratch files (e.g. in /tmp). Your job is to inspect, analyze and report findings; do not rewrite project source unless the task asks for it.'}
 - Do not run git commit, git push, or restart services; the platform does that after verification.
 - Never print secrets.`;
@@ -131,7 +156,7 @@ Operating rules:
     ? `Results from upstream tasks:\n${deps.map((d) => `### ${d.key} ${d.title} (${d.agent_name || 'agent'}, ${d.status})\n${(d.report?.summary || d.result || '').slice(0, 1800)}`).join('\n\n')}\n`
     : '';
   const prompt = `TASK CONTRACT
-${JSON.stringify({ task_id: task.key, mission: mission.command.slice(0, 600), project: project.name, role: task.role, goal: task.title, description: task.description, acceptance: task.acceptance, depends_on: task.depends_on }, null, 2)}
+${JSON.stringify({ task_id: task.key, mission: mission.command.slice(0, 600), project: project.name, role: task.role, goal: task.title, description: task.description, acceptance: task.acceptance, depends_on: task.depends_on, ...(task.files?.length ? { files: task.files } : {}) }, null, 2)}
 
 ${depText}${imageNote(attachments)}
 Do the work now. When finished, end your reply with a JSON report in a \`\`\`json block:

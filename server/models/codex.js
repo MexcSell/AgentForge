@@ -82,7 +82,8 @@ export function runCodex({ model, prompt, system, cwd, addDirs = [], images = []
         if (!announced.has(item.id)) {
           announced.add(item.id);
           toolCalls[name] = (toolCalls[name] || 0) + 1;
-          onEvent?.({ type: 'tool_use', name, input: String(input ?? '').slice(0, 200) });
+          const files = item.type === 'file_change' ? (item.changes || []).map((c) => c.path).filter((f) => typeof f === 'string' && f) : [];
+          onEvent?.({ type: 'tool_use', name, input: String(input ?? '').slice(0, 200), ...(files.length ? { files } : {}) });
         }
         if (phase === 'item.completed') onEvent?.({ type: 'tool_result', name, ok, preview: String(output ?? '').slice(0, 400) });
         return;

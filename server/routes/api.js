@@ -89,7 +89,12 @@ export default async function apiRoutes(app, opts = {}) {
     if (!content?.trim() && !attachments?.length) return err(reply, 400, 'Empty command');
     return submitCommand(req.params.id, { content: content || '(see attached images)', attachments: attachments || [], topicId: topic_id || null });
   });
-  app.post('/api/projects/:id/cancel', (req) => cancelMission(req.params.id).then((ok) => ({ ok })));
+  // Optional { topic_id } stops only that topic's mission and queued orders; without it everything stops.
+  app.post('/api/projects/:id/cancel', async (req, reply) => {
+    const topic = req.body?.topic_id || null;
+    if (topic && !isUuid(topic)) return err(reply, 400, 'Invalid topic id');
+    return { ok: await cancelMission(req.params.id, topic) };
+  });
   app.post('/api/projects/:id/standup', (req) => standup(req.params.id, req.body?.topic_id || null));
   app.post('/api/projects/:id/sync', (req) => syncNow(req.params.id, 'Manual sync from AgentForge'));
   app.get('/api/projects/:id/git', async (req, reply) => {

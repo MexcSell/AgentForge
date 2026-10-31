@@ -8,6 +8,9 @@ function brief(input) {
   return String(v).slice(0, 200);
 }
 
+// Tools that write files; their events carry `files` so a mission's edits can be committed on their own.
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
 /** Runs one Claude Code turn non-interactively and streams normalized events. */
 export function runClaudeCode({ model, prompt, system, cwd, addDirs = [], signal, onEvent, timeoutMs }) {
   const cfg = model.config || {};
@@ -53,7 +56,8 @@ export function runClaudeCode({ model, prompt, system, cwd, addDirs = [], signal
           else if (b.type === 'tool_use') {
             toolCalls[b.name] = (toolCalls[b.name] || 0) + 1;
             toolNames[b.id] = b.name;
-            onEvent?.({ type: 'tool_use', name: b.name, input: brief(b.input) });
+            const file = EDIT_TOOLS.has(b.name) && (b.input?.file_path || b.input?.notebook_path);
+            onEvent?.({ type: 'tool_use', name: b.name, input: brief(b.input), ...(typeof file === 'string' && file ? { files: [file] } : {}) });
           }
         }
       } else if (e.type === 'user') {

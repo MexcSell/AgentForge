@@ -24,11 +24,15 @@ const remPx = () => parseFloat(getComputedStyle(document.documentElement).fontSi
 const scrollOpts = () => ({ block: 'nearest', inline: 'nearest', behavior: reducedMotion() ? 'auto' : 'smooth' });
 const tabEl = (id) => document.getElementById(`topic-tab-${id}`);
 
-/** Lead-slot state. Precedence: running › planning › failed › queued › archived › idle. */
-export function topicState(t, run, failed) {
-  if (t.id === run?.id) return run.planning ? 'planning' : 'running';
+/**
+ * Lead-slot state. Precedence: running › planning › failed › queued › archived › idle.
+ * runs = selectRuns(); busy = the project is running, so a flagged topic without a run of its own is waiting for a slot.
+ */
+export function topicState(t, runs, failed, busy) {
+  const run = runs?.[t.id];
+  if (run) return run.planning ? 'planning' : 'running';
   if (failed?.[t.id]) return 'failed';
-  if (t.running) return 'queued';
+  if (busy && t.running) return 'queued';
   if (t.archived) return 'archived';
   return 'idle';
 }
@@ -219,7 +223,7 @@ function highlight(text, needle) {
 }
 
 /** "All topics" popover (§3.3): search, AND tag filters, archived toggle, row actions. */
-function TopicList({ topics, activeId, run, failed, unread, tier, allTags, items, renaming, setRenaming, onOpen, onCreate, onClose, ignore }) {
+function TopicList({ topics, activeId, runs, busy, failed, unread, tier, allTags, items, renaming, setRenaming, onOpen, onCreate, onClose, ignore }) {
   const [q, setQ] = useState('');
   const [sel, setSel] = useState(EMPTY);
   const [showArchived, setShowArchived] = useState(false);
@@ -230,7 +234,7 @@ function TopicList({ topics, activeId, run, failed, unread, tier, allTags, items
   const needle = q.trim().toLowerCase();
   const match = (t) => (!needle || t.title.toLowerCase().includes(needle) || (t.tags || []).some((g) => g.includes(needle))) && sel.every((g) => t.tags?.includes(g));
   // Running, planning and queued topics are pinned on top; the rest follow by activity.
-  const rank = (t) => (t.id === run.id ? (run.planning ? 1 : 0) : t.running ? 2 : 3);
+  const rank = (t) => ({ running: 0, planning: 1, queued: 2 })[topicState(t, runs, null, busy)] ?? 3;
   const sorted = [...topics].sort((a, b) => rank(a) - rank(b) || new Date(b.last_activity_at) - new Date(a.last_activity_at));
   const openRows = sorted.filter((t) => !t.archived && match(t));
   const archivedRows = showArchived ? sorted.filter((t) => t.archived && match(t)) : EMPTY;
@@ -250,13 +254,13 @@ function TopicList({ topics, activeId, run, failed, unread, tier, allTags, items
     if (e.key === 'ArrowDown' && (i !== -1 || e.target === searchRef.current)) { e.preventDefault(); rows[Math.min(rows.length - 1, i + 1)]?.focus(); }
     else if (e.key === 'ArrowUp' && i !== -1) { e.preventDefault(); (i === 0 ? searchRef.current : rows[i - 1])?.focus(); }
   };
-  const metaLine = (t, state) => (state === 'running' ? `running${run.progress ? ` · ${run.progress}` : ''}` : state === 'planning' || state === 'queued' || state === 'archived' ? state
+  const metaLine = (t, state) => (state === 'running' ? `running${runs[t.id].progress ? ` · ${runs[t.id].progress}` : ''}` : state === 'planning' || state === 'queued' || state === 'archived' ? state
     : `${t.message_count || 0} msg${t.message_count === 1 ? '' : 's'}`);
 
   const row = (t) => {
     const isActive = t.id === activeId;
     const n = isActive ? 0 : unread[t.id] || 0;
-    const state = topicState(t, run, failed);
+    const state = topicState(t, runs, failed, busy);
     const tags = t.tags || EMPTY;
     const lead = <span className="mt-0.5 size-6 rounded-md bg-sunken border border-line flex items-center justify-center shrink-0"><TopicLead state={state} active={isActive} /></span>;
     return (
@@ -348,16 +352,17 @@ function TopicList({ topics, activeId, run, failed, unread, tier, allTags, items
 }
 
 /**
- * Topic strip under the command window header. run = { id, planning, progress } of the project's in-flight mission;
- * onCompose focuses the composer.
+ * Topic strip under the command window header. runs = selectRuns(): { [topicId]: { planning, progress } } of every
+ * topic with an in-flight mission; onCompose focuses the composer.
  */
-export function TopicBar({ project, run, onCompose }) {
+export function TopicBar({ project, runs, onCompose }) {
   const raw = useStore((s) => s.topics[project.id]);
   const topics = raw || EMPTY;
   const activeId = useStore((s) => s.activeTopic[project.id]) || null;
   const unread = useStore((s) => s.unread);
   const failed = useStore((s) => s.failedTopics);
   const movedFrom = useStore((s) => s.movedFrom);
+  const busy = project.status === 'running';
   const stripRef = useRef(null);
   const scrollRef = useRef(null);
   const triggerRef = useRef(null);
@@ -437,9 +442,9 @@ export function TopicBar({ project, run, onCompose }) {
     await useStore.getState().createTopic(project.id, { title }).catch(() => {});
     onCompose?.();
   };
-  // Archive / delete guardrails (§1.5).
+  // Archive / delete guardrails (§1.5): the topic's own mission, running, planning or queued.
   const guard = (t) => {
-    if (t.running || t.id === run.id) return 'mission running';
+    if (['running', 'planning', 'queued'].includes(topicState(t, runs, null, busy))) return 'mission running';
     if (!t.archived && open.length <= 1) return 'last open topic';
     return null;
   };
@@ -504,7 +509,7 @@ export function TopicBar({ project, run, onCompose }) {
 
   const renderTab = (t) => {
     const isActive = t.id === activeId;
-    const state = topicState(t, run, failed);
+    const state = topicState(t, runs, failed, busy);
     const n = isActive ? 0 : unread[t.id] || 0;
     const tags = t.tags || EMPTY;
     const max = tier === 'full' ? 2 : isActive ? 1 : 0;
@@ -556,7 +561,7 @@ export function TopicBar({ project, run, onCompose }) {
           className="flex-1 min-w-0 mx-2 self-center h-7 inline-flex items-center gap-1.5 px-2 rounded-md bg-raised border border-line shadow-sm text-[0.78rem] font-medium text-fg hover:border-line-strong aria-expanded:border-line-strong transition-colors focus-visible:outline-accent!">
           {active ? (
             <>
-              <TopicLead state={topicState(active, run, failed)} active />
+              <TopicLead state={topicState(active, runs, failed, busy)} active />
               <span className="truncate">{active.title || 'New topic'}</span>
               <span className="tabular text-[0.68rem] text-muted shrink-0">{compact(active.message_count)}</span>
             </>
@@ -592,7 +597,7 @@ export function TopicBar({ project, run, onCompose }) {
       </div>
 
       {listOpen && (
-        <TopicList topics={topics} activeId={activeId} run={run} failed={failed} unread={unread} tier={tier} allTags={allTags} items={items}
+        <TopicList topics={topics} activeId={activeId} runs={runs} busy={busy} failed={failed} unread={unread} tier={tier} allTags={allTags} items={items}
           renaming={rowRenaming} setRenaming={setRowRenaming} onOpen={openFromList} onCreate={createNamed} onClose={closeList} ignore={ignore} />
       )}
       {tagTopic && (

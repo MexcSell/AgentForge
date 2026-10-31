@@ -92,14 +92,25 @@ export default function Settings() {
 
         {orc && (
           <Section icon={Workflow} title="Orchestrator" desc="How General Managers run missions">
-            <div className="grid gap-4 md:grid-cols-2">
+            <div className="grid gap-4 md:grid-cols-3 items-start">
+              <Field label="Parallel missions per project" hint="Orders in different topics run at the same time; orders in one topic run in order.">
+                <Input type="number" min="1" max="8" value={orc.maxMissions ?? 3} onChange={(e) => setOrc({ ...orc, maxMissions: e.target.value === '' ? '' : Number(e.target.value) })} />
+              </Field>
               <Field label="Max parallel agents per mission"><Input type="number" min="1" max="12" value={orc.maxParallel} onChange={(e) => setOrc({ ...orc, maxParallel: Number(e.target.value) })} /></Field>
               <Field label="Task timeout (minutes)"><Input type="number" min="1" max="240" value={orc.taskTimeoutMin} onChange={(e) => setOrc({ ...orc, taskTimeoutMin: Number(e.target.value) })} /></Field>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2 mt-4">
               <Toggle checked={orc.verification} onChange={(v) => setOrc({ ...orc, verification: v })} label="Independent verification after code changes" />
               <Toggle checked={orc.retryFailed} onChange={(v) => setOrc({ ...orc, retryFailed: v })} label="Retry a failed task once with the failure context" />
               <Toggle checked={orc.autoApproveProposals} onChange={(v) => setOrc({ ...orc, autoApproveProposals: v })} label="Auto-approve agent proposals (agents start their own work)" />
             </div>
-            <Button className="mt-4" variant="primary" onClick={() => save('orchestrator', orc)}>Save orchestrator settings</Button>
+            <Button className="mt-4" variant="primary" onClick={() => {
+              // 1–8; an emptied field saves the default.
+              const n = Math.round(orc.maxMissions);
+              const v = { ...orc, maxMissions: orc.maxMissions === '' || !Number.isFinite(n) ? 3 : Math.min(8, Math.max(1, n)) };
+              setOrc(v);
+              save('orchestrator', v);
+            }}>Save orchestrator settings</Button>
           </Section>
         )}
 

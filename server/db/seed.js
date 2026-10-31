@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import { ROLES } from '../roles.js';
 
 export const DEFAULT_SETTINGS = {
-  orchestrator: { maxParallel: 3, taskTimeoutMin: 30, autoApproveProposals: false, verification: true, retryFailed: true },
+  orchestrator: { maxParallel: 3, maxMissions: 3, taskTimeoutMin: 30, autoApproveProposals: false, verification: true, retryFailed: true },
   github: { autoSync: true, userName: config.github.userName, userEmail: config.github.userEmail, branch: 'main' },
   evolution: { enabled: true, playbookSize: 8, lessonsPerVersion: 4 },
   monitor: { enabled: true, intervalSec: 3 },

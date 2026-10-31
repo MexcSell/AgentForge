@@ -27,6 +27,7 @@ const upsert = (list, item, key = 'id') => {
 };
 
 const prefs = loadPrefs();
+const EMPTY = [];
 
 const without = (obj, key) => {
   if (!obj || !(key in obj)) return obj;
@@ -35,6 +36,15 @@ const without = (obj, key) => {
   return next;
 };
 const byCreated = (a, b) => new Date(a.created_at) - new Date(b.created_at);
+const IN_FLIGHT = ['planning', 'running'];
+const inFlight = (m) => IN_FLIGHT.includes(m?.status);
+/** The mission a topic shows: its oldest in-flight one (orders in one topic run in order), else its newest. */
+function pickMission(prev, m) {
+  if (!prev || prev.id === m.id) return m;
+  if (inFlight(prev) !== inFlight(m)) return inFlight(prev) ? prev : m;
+  const newer = new Date(m.created_at) >= new Date(prev.created_at);
+  return inFlight(m) === newer ? prev : m;
+}
 export const PREVIEW_LOG_MAX = 2000; // output lines kept per preview session
 const capLog = (lines) => (lines.length > PREVIEW_LOG_MAX ? lines.slice(-PREVIEW_LOG_MAX) : lines);
 
@@ -76,7 +86,8 @@ export const useStore = create((set, get) => ({
   movedFrom: {}, // { [topicId]: originTopicId } — topics the GM split off (this session only)
   announce: '', // polite live-region text for topic changes
   tasks: {},
-  missions: {},
+  missionsByTopic: {}, // { [topicId]: Mission } — from mission:update; see pickMission
+  loadedRuns: {}, // { [topicId]: true } — already running when loadTopics fetched it; no mission:update seen since
   live: {},
   previews: {}, // { [projectId]: { status, mode, command, port, url, startedAt, exitCode, error, log: string[] } }
   syncTick: 0,
@@ -112,7 +123,15 @@ export const useStore = create((set, get) => ({
     const st = get();
     const saved = st.activeTopic[projectId];
     const active = topics.some((t) => t.id === saved) ? saved : topics[0]?.id || null;
-    set({ topics: { ...st.topics, [projectId]: topics }, tasks: { ...st.tasks, [projectId]: tasks }, activeTopic: { ...st.activeTopic, [projectId]: active } });
+    // A live mission the server disagrees with (an event missed while disconnected) gives way to the topic's running flag.
+    let missionsByTopic = st.missionsByTopic;
+    const loadedRuns = { ...st.loadedRuns };
+    for (const t of topics) {
+      if (missionsByTopic[t.id] && inFlight(missionsByTopic[t.id]) !== !!t.running) missionsByTopic = without(missionsByTopic, t.id);
+      if (t.running && !missionsByTopic[t.id]) loadedRuns[t.id] = true;
+      else delete loadedRuns[t.id];
+    }
+    set({ topics: { ...st.topics, [projectId]: topics }, tasks: { ...st.tasks, [projectId]: tasks }, activeTopic: { ...st.activeTopic, [projectId]: active }, missionsByTopic, loadedRuns });
     savePrefs(get());
     return topics;
   },
@@ -182,7 +201,18 @@ export const useStore = create((set, get) => ({
       case 'system:metrics': set({ metrics: p }); break;
       case 'system:restarting':set({ system: { ...(st.system || {}), status: 'restarting' } }); break;
       case 'system:client-updated': set({ clientUpdate: p.version }); break;
-      case 'project:update': set({ projects: upsert(st.projects, p) }); break;
+      case 'project:update': {
+        const patch = { projects: upsert(st.projects, p) };
+        // An idle project runs nothing: drop in-flight missions whose final update never arrived, and the load-time guesses.
+        if (p.status && p.status !== 'running') {
+          const stale = Object.keys(st.missionsByTopic).filter((k) => st.missionsByTopic[k].project_id === p.id && inFlight(st.missionsByTopic[k]));
+          if (stale.length) patch.missionsByTopic = stale.reduce(without, st.missionsByTopic);
+          const loaded = (st.topics[p.id] || EMPTY).filter((t) => st.loadedRuns[t.id]);
+          if (loaded.length) patch.loadedRuns = loaded.map((t) => t.id).reduce(without, st.loadedRuns);
+        }
+        set(patch);
+        break;
+      }
       case 'project:delete': set({ projects: st.projects.filter((x) => x.id !== p.id), activeProjectId: st.activeProjectId === p.id ? null : st.activeProjectId }); break;
       case 'agent:new':
       case 'agent:update': set({ agents: upsert(st.agents, p) }); break;
@@ -229,7 +259,10 @@ export const useStore = create((set, get) => ({
       }
       case 'topic:delete': {
         const list = st.topics[p.project_id];
-        const patch = { messages: without(st.messages, p.id), unread: without(st.unread, p.id), failedTopics: without(st.failedTopics, p.id) };
+        const patch = {
+          messages: without(st.messages, p.id), unread: without(st.unread, p.id), failedTopics: without(st.failedTopics, p.id),
+          missionsByTopic: without(st.missionsByTopic, p.id), loadedRuns: without(st.loadedRuns, p.id),
+        };
         if (list) patch.topics = { ...st.topics, [p.project_id]: list.filter((t) => t.id !== p.id) };
         if (st.activeTopic[p.project_id] === p.id) patch.activeTopic = { ...st.activeTopic, [p.project_id]: (list && nextTopic(list, p.id)?.id) || null };
         set(patch);
@@ -249,8 +282,13 @@ export const useStore = create((set, get) => ({
         const patch = { messages };
         const list = st.topics[p.project_id];
         if (list) patch.topics = { ...st.topics, [p.project_id]: list.map((t) => (t.id === p.moved_from ? { ...t, message_count: Math.max(0, (t.message_count || 0) - ids.size) } : t)) };
-        const m = st.missions[p.project_id];
-        if (m?.id === p.mission_id) patch.missions = { ...st.missions, [p.project_id]: { ...m, topic_id: p.topic_id } };
+        // The moved mission's live state follows it to the new topic.
+        const m = st.missionsByTopic[p.moved_from];
+        if (m?.id === p.mission_id) {
+          patch.missionsByTopic = { ...without(st.missionsByTopic, p.moved_from), [p.topic_id]: pickMission(st.missionsByTopic[p.topic_id], { ...m, topic_id: p.topic_id }) };
+        } else if (!m && st.loadedRuns[p.moved_from]) {
+          patch.loadedRuns = { ...without(st.loadedRuns, p.moved_from), [p.topic_id]: true };
+        }
         set(patch);
         break;
       }
@@ -263,7 +301,11 @@ export const useStore = create((set, get) => ({
         break;
       }
       case 'mission:update': {
-        const patch = { missions: { ...st.missions, [p.project_id]: p } };
+        const patch = {};
+        if (p.topic_id) {
+          patch.missionsByTopic = { ...st.missionsByTopic, [p.topic_id]: pickMission(st.missionsByTopic[p.topic_id], p) };
+          patch.loadedRuns = without(st.loadedRuns, p.topic_id);
+        }
         if (p.status === 'failed' && p.topic_id && p.topic_id !== st.activeTopic[p.project_id]) patch.failedTopics = { ...st.failedTopics, [p.topic_id]: true };
         set(patch);
         break;
@@ -312,14 +354,28 @@ export const selectWorkingAgents = (s) => s.agents.filter((a) => a.status === 'w
 export const selectRunningProjects = (s) => s.projects.filter((p) => p.status === 'running');
 
 /**
- * The topic that owns the project's in-flight mission: { id, planning }.
- * The live mission (mission:update) is authoritative; after a reload it falls back to the topics' `running` flag
- * when exactly one topic has one (queued orders also count as running there).
+ * In-flight missions by topic: { [topicId]: { planning, progress, missionId } }. Topics run their missions side by side.
+ * A topic's live mission (mission:update) is authoritative. Without one, a topic that was already running when it was
+ * loaded (after a reload) counts as running — queued orders included. Every other topic whose `running` flag is set
+ * has an order waiting that has not started (starting always sends mission:update): it is queued, not running.
  */
-export function selectRun(s, project) {
-  if (!project || project.status !== 'running') return { id: null, planning: false };
-  const m = s.missions[project.id];
-  if (m?.topic_id && ['planning', 'running'].includes(m.status)) return { id: m.topic_id, planning: m.status === 'planning' };
-  const flagged = (s.topics[project.id] || []).filter((t) => t.running);
-  return { id: flagged.length === 1 ? flagged[0].id : null, planning: false };
+export function selectRuns(s, project) {
+  const runs = {};
+  if (!project || project.status !== 'running') return runs;
+  const tasks = (s.tasks[project.id] || EMPTY).filter((x) => x.origin !== 'proposal');
+  for (const t of s.topics[project.id] || EMPTY) {
+    const m = s.missionsByTopic[t.id];
+    if (m ? !inFlight(m) : !(t.running && s.loadedRuns[t.id])) continue;
+    const planning = m?.status === 'planning';
+    // After a reload the mission id comes from the topic's messages: the one with unfinished tasks, else the latest order.
+    let id = m?.id || null;
+    if (!id && s.messages[t.id]) {
+      const ids = new Set(s.messages[t.id].map((x) => x.mission_id).filter(Boolean));
+      id = tasks.find((x) => ids.has(x.mission_id) && ['pending', 'running'].includes(x.status))?.mission_id
+        || s.messages[t.id].findLast((x) => x.mission_id)?.mission_id || null;
+    }
+    const live = !planning && id ? tasks.filter((x) => x.mission_id === id) : EMPTY;
+    runs[t.id] = { planning, progress: live.length ? `${live.filter((x) => x.status === 'done').length}/${live.length}` : null, missionId: id };
+  }
+  return runs;
 }
