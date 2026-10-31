@@ -11,7 +11,7 @@ import { notify, audit } from '../services/notify.js';
 import { syncProject, touchedFiles, repoPaths } from '../services/git.js';
 import { PROVIDERS, resolveModel, runModel, recordRunUsage, publishModels } from '../models/index.js';
 import { heuristicPlan, topicTitle } from './heuristics.js';
-import { planPrompt, taskPrompt, commitPrompt, parseJson, topicContext, inflightContext } from './prompts.js';
+import { planPrompt, taskPrompt, commitPrompt, triagePrompt, parseJson, topicContext, inflightContext } from './prompts.js';
 import { learn, analyzeMission } from './evolution.js';
 
 // Missions run in per-topic lanes: one at a time per topic (FIFO), different topics in parallel up to
@@ -872,8 +872,18 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
       `INSERT INTO tasks(project_id, mission_id, key, title, description, role, status, origin, agent_id) VALUES ($1,$2,$3,$4,$5,$6,'proposed','proposal',$7) RETURNING *`,
       [project.id, mission.id, `P-${task.key}`, String(prop.title).slice(0, 200), String(prop.description || '').slice(0, 2000), normalizeRole(prop.role || agent.role), agent.id],
     );
-    await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: agent.id, kind: 'proposal', content: `${prop.title}${prop.description ? `\n\n${prop.description}` : ''}`, meta: { task_id: row.id, role: row.role } });
-    if (settings.orchestrator.autoApproveProposals) await approveProposal(row.id);
+    const msg = await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: agent.id, kind: 'proposal', content: `${prop.title}${prop.description ? `\n\n${prop.description}` : ''}`, meta: { task_id: row.id, role: row.role } });
+    if (settings.orchestrator.autoApproveProposals) {
+      // Approved without review, as before, within the loop guard.
+      await withAgentLock('proposals', mission.id, async () => {
+        const limit = await proposalLimit(mission);
+        if (limit) await decideProposal({ row, msg, decider: gm, project, mission, verdict: 'reject', reason: limit });
+        else await approveProposal(row.id);
+      }).catch((e) => console.error('[proposal]', e.message));
+    } else if (settings.orchestrator.proposalTriage !== false) {
+      await triageProposal({ row, msg, proposer: agent, report, project, gm, mission, signal })
+        .catch((e) => console.error('[triage]', e.message));
+    }
   }
 
   if (!ok && attempt === 1 && settings.orchestrator.retryFailed && !errorText?.includes('limit reached')) {
@@ -996,17 +1006,109 @@ function syncReport(log) {
 
 // ---- proposals, meetings, sync ------------------------------------------
 
-export async function approveProposal(taskId) {
-  const t = await one(`SELECT t.*, m.topic_id FROM tasks t LEFT JOIN missions m ON m.id = t.mission_id WHERE t.id = $1 AND t.status = 'proposed'`, [taskId]);
-  if (!t) throw new Error('proposal not found');
-  await query(`UPDATE tasks SET status='cancelled', result='Approved → new mission' WHERE id=$1`, [taskId]);
-  await publishTask(taskId);
-  return submitCommand(t.project_id, { content: `${t.title}\n\n${t.description || ''}`.trim(), topicId: t.topic_id });
+// A worker's proposal goes to its live line supervisor, else the GM, who approves, rejects or escalates it to the user.
+// Loop guard: a mission launches at most MAX_PROPOSAL_MISSIONS approved proposals, and a mission launched by a
+// proposal chain MAX_PROPOSAL_DEPTH deep launches none. The depth is the last line of the launched mission's order.
+const MAX_PROPOSAL_MISSIONS = 2;
+const MAX_PROPOSAL_DEPTH = 2;
+const TRIAGE_TIMEOUT = 5 * 60000;
+const CHAIN = /\(proposal chain depth (\d+)\)\s*$/;
+const chainDepth = (command) => Number(String(command || '').match(CHAIN)?.[1]) || 0;
+
+/** 'proposal limit reached' when the mission may not launch another proposal, else null. */
+async function proposalLimit(mission) {
+  if (chainDepth(mission.command) >= MAX_PROPOSAL_DEPTH) return 'proposal limit reached';
+  const { n } = await one(`SELECT count(*)::int AS n FROM tasks WHERE mission_id = $1 AND origin = 'proposal' AND result LIKE 'Approved%'`, [mission.id]);
+  return n >= MAX_PROPOSAL_MISSIONS ? 'proposal limit reached' : null;
 }
 
-export async function rejectProposal(taskId) {
-  await query(`UPDATE tasks SET status='cancelled', result='Rejected' WHERE id=$1 AND status='proposed'`, [taskId]);
+/** Closes a still-proposed proposal as approved; null when it was decided elsewhere meanwhile. */
+async function claimProposal(taskId, by = null) {
+  const t = await one(`SELECT t.*, m.topic_id, m.command AS order_text FROM tasks t LEFT JOIN missions m ON m.id = t.mission_id WHERE t.id = $1 AND t.status = 'proposed'`, [taskId]);
+  if (!t || !(await one(`UPDATE tasks SET status='cancelled', result=$2 WHERE id=$1 AND status='proposed' RETURNING id`, [taskId, by ? `Approved by ${by} → new mission` : 'Approved → new mission']))) return null;
+  await publishTask(taskId);
+  return t;
+}
+
+/** The approved proposal as a new order in the same topic, one level deeper in the proposal chain. */
+function launchProposal(t) {
+  const content = `${`${t.title}\n\n${t.description || ''}`.trim()}\n\n(proposal chain depth ${chainDepth(t.order_text) + 1})`;
+  return submitCommand(t.project_id, { content, topicId: t.topic_id });
+}
+
+export async function approveProposal(taskId) {
+  const t = await claimProposal(taskId);
+  if (!t) throw new Error('proposal not found');
+  return launchProposal(t);
+}
+
+export async function rejectProposal(taskId, { by = null, reason = '' } = {}) {
+  await query(`UPDATE tasks SET status='cancelled', result=$2 WHERE id=$1 AND status='proposed'`, [taskId, by ? `Rejected by ${by}: ${reason}` : 'Rejected']);
   return publishTask(taskId);
+}
+
+async function deciderFor(proposer, gm) {
+  const sup = proposer.supervisor_id ? await getAgent(proposer.supervisor_id).catch(() => null) : null;
+  return sup && !sup.archived ? sup : gm;
+}
+
+/** Asks the decider; a model error, unusable answer or abort escalates to the user, never approves. */
+async function triageProposal({ row, msg, proposer, report, project, gm, mission, signal }) {
+  const decider = await deciderFor(proposer, gm);
+  let verdict = 'escalate';
+  let reason = await proposalLimit(mission);
+  if (reason) verdict = 'reject';
+  else if (signal.aborted) reason = 'the mission was stopped before the proposal could be reviewed';
+  else {
+    try {
+      const model = await resolveModel(decider.model_id);
+      const inflight = inflightContext(await inflightMissions(project.id, mission.id));
+      const { system, prompt } = triagePrompt({
+        project, decider, proposer, relation: decider.id === gm.id ? 'General Manager' : 'line supervisor', command: mission.command,
+        summary: report.summary, proposal: row, inflight,
+      });
+      const out = await executeRun({ kind: 'triage', agent: decider, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'triage', task_id: row.id, title: row.title }, timeoutMs: TRIAGE_TIMEOUT });
+      const parsed = parseJson(out.text);
+      const said = String(parsed?.decision || '').trim().toLowerCase();
+      const why = String(parsed?.reason || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+      if (signal.aborted) reason = 'the mission was stopped during the review';
+      else if (!['approve', 'reject', 'escalate'].includes(said)) reason = 'no valid decision came back from the review';
+      else [verdict, reason] = [said, why || 'no reason given'];
+    } catch (err) {
+      reason = signal.aborted ? 'the mission was stopped during the review' : `the review failed (${String(err.message).slice(0, 200)})`;
+    }
+  }
+  if (verdict !== 'approve') return decideProposal({ row, msg, decider, project, mission, verdict, reason });
+  // Approvals of one mission are counted and launched one at a time.
+  return withAgentLock('proposals', mission.id, async () => {
+    const limit = await proposalLimit(mission);
+    return decideProposal({ row, msg, decider, project, mission, verdict: limit ? 'reject' : 'approve', reason: limit || reason });
+  });
+}
+
+/** Applies a verdict, records it on the proposal message and says it in the chat. A proposal decided meanwhile is left alone. */
+async function decideProposal({ row, msg, decider, project, mission, verdict, reason }) {
+  let approved = null;
+  if (verdict === 'approve') {
+    approved = await claimProposal(row.id, decider.name);
+    if (!approved) return null;
+  } else {
+    const result = verdict === 'reject' ? `Rejected by ${decider.name}: ${reason}` : `Escalated by ${decider.name}: ${reason}`;
+    const done = await one(`UPDATE tasks SET status = CASE WHEN $3 THEN 'cancelled' ELSE status END, result=$2 WHERE id=$1 AND status='proposed' RETURNING id`, [row.id, result, verdict === 'reject']);
+    if (!done) return null;
+    await publishTask(row.id);
+  }
+  const decision = { by: decider.name, by_id: decider.id, verdict, reason };
+  const updated = await one(`UPDATE messages SET meta = meta || $2 WHERE id = $1 RETURNING id`, [msg.id, { decision }]);
+  if (updated) emit('message:update', await one(`SELECT m.*, a.name AS agent_name, a.role AS agent_role, a.title AS agent_title FROM messages m LEFT JOIN agents a ON a.id = m.agent_id WHERE m.id = $1`, [msg.id]));
+  const what = `${msg.agent_name ? `${msg.agent_name}'s` : 'the'} proposal "${row.title}"`;
+  const why = /[.!?…]$/.test(reason) ? reason : `${reason}.`;
+  const content = verdict === 'approve' ? `Approved ${what}: ${why} Starting it as a new mission.`
+    : verdict === 'reject' ? `Rejected ${what}: ${why}`
+      : `Escalated ${what} to you: ${why} Approve or reject it above.`;
+  await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: decider.id, kind: 'status', content, meta: { task_id: row.id, decision } });
+  if (approved) await launchProposal(approved);
+  return verdict;
 }
 
 export async function standup(projectId, topicId = null) {

@@ -71,18 +71,55 @@ function PlanBody({ m }) {
   );
 }
 
+/** A superior's verdict on a proposal: messages.meta.decision, else read back from the task result. */
+function proposalDecision(m, t) {
+  if (m.meta?.decision?.verdict) return m.meta.decision;
+  const r = /^(Approved|Rejected|Escalated) by (.+?)(?: → new mission|: ([\s\S]*))$/.exec(t?.result || '');
+  return r ? { verdict: { Approved: 'approve', Rejected: 'reject', Escalated: 'escalate' }[r[1]], by: r[2], reason: r[3] || '' } : null;
+}
+
+const VERDICT = {
+  approve: { tone: 'ok', icon: ThumbsUp, label: (by) => `Approved by ${by} → new mission` },
+  reject: { tone: 'neutral', icon: ThumbsDown, label: (by) => `Rejected by ${by}` },
+  escalate: { tone: 'warn', icon: TriangleAlert, label: (by) => `Escalated by ${by} — needs your call` },
+};
+
 function ProposalBody({ m, tasks }) {
   const t = tasks?.find((x) => x.id === m.meta?.task_id);
+  const triage = useStore((s) => s.settings?.orchestrator?.proposalTriage !== false && !s.settings?.orchestrator?.autoApproveProposals);
+  // Triage runs inside the proposing mission, so an undecided proposal of a finished mission is a legacy row.
+  const live = useStore((s) => {
+    const x = s.missionsByTopic[m.topic_id];
+    if (x) return x.id === m.mission_id && ['planning', 'running'].includes(x.status);
+    return !!s.loadedRuns[m.topic_id] && s.messages[m.topic_id]?.findLast((y) => y.mission_id)?.mission_id === m.mission_id;
+  });
   const pending = !t || t.status === 'proposed';
+  const d = proposalDecision(m, t);
+  const v = d && VERDICT[d.verdict];
+  const awaiting = pending && !d && triage && live;
+  const decider = useStore((s) => {
+    const a = s.agents.find((x) => x.id === m.agent_id);
+    return (a?.supervisor_id && s.agents.find((x) => x.id === a.supervisor_id && !x.archived)?.name) || null;
+  });
+  // A user decision after an escalation replaces the result; the escalation badge stays and the outcome follows it.
+  const outcome = !pending && (!v || d.verdict === 'escalate') ? (t.result || t.status) : null;
   return (
     <div className="flex flex-col gap-2.5">
       <Markdown>{m.content}</Markdown>
-      {pending ? (
+      {v && (
+        <div className="flex flex-col items-start gap-1">
+          <Badge tone={v.tone} icon={v.icon}>{d.verdict === 'escalate' && !pending ? `Escalated by ${d.by}` : v.label(d.by)}</Badge>
+          {d.reason && <span className="text-xs text-muted">{d.reason}</span>}
+        </div>
+      )}
+      {pending && !awaiting && (
         <div className="flex gap-2">
           <Button size="sm" variant="primary" icon={ThumbsUp} onClick={() => api.post(`/api/tasks/${m.meta.task_id}/approve`)}>Approve → new mission</Button>
           <Button size="sm" variant="ghost" icon={ThumbsDown} onClick={() => api.post(`/api/tasks/${m.meta.task_id}/reject`)}>Reject</Button>
         </div>
-      ) : <Badge tone={t.result?.startsWith('Approved') ? 'ok' : 'neutral'}>{t.result || t.status}</Badge>}
+      )}
+      {awaiting && <div className="flex items-center gap-1.5 text-xs text-subtle"><Loader2 size={12} className="animate-spin motion-reduce:animate-none" />Awaiting {decider ? `${decider}'s` : "the GM's"} decision</div>}
+      {outcome && <Badge tone={outcome.startsWith('Approved') ? 'ok' : 'neutral'}>{outcome}</Badge>}
     </div>
   );
 }

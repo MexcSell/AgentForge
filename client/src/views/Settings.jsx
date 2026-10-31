@@ -102,6 +102,7 @@ export default function Settings() {
             <div className="grid gap-4 md:grid-cols-2 mt-4">
               <Toggle checked={orc.verification} onChange={(v) => setOrc({ ...orc, verification: v })} label="Independent verification after code changes" />
               <Toggle checked={orc.retryFailed} onChange={(v) => setOrc({ ...orc, retryFailed: v })} label="Retry a failed task once with the failure context" />
+              <Toggle checked={orc.proposalTriage !== false} onChange={(v) => setOrc({ ...orc, proposalTriage: v })} label="Superiors decide agent proposals — only escalations reach you" />
               <Toggle checked={orc.autoApproveProposals} onChange={(v) => setOrc({ ...orc, autoApproveProposals: v })} label="Auto-approve agent proposals (agents start their own work)" />
             </div>
             <Button className="mt-4" variant="primary" onClick={() => {
