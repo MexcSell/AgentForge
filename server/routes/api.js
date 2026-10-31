@@ -8,7 +8,7 @@ import { config } from '../config.js';
 import { emit } from '../events.js';
 import { getSettings, sanitizeMonitor } from '../db/seed.js';
 import { ROLES, TIERS } from '../roles.js';
-import { listAgents, getAgent, createAgent, cloneAgent, mergeAgent, publishAgent, withAgentLock, liveAncestor } from '../services/agents.js';
+import { listAgents, getAgent, createAgent, cloneAgent, mergeAgent, publishAgent, publishCloneTargets, withAgentLock, liveAncestor } from '../services/agents.js';
 import { listProjects, getProject, createProjectRecord, publishProject } from '../services/projects.js';
 import { listTopics, getTopic, createTopic, updateTopic, deleteTopic, isUuid } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
@@ -27,6 +27,10 @@ const retireAgent = (id, supervisorId, ready = () => true) => withAgentLock('cla
   await query(`UPDATE agents SET supervisor_id = $2 WHERE supervisor_id = $1`, [id, supervisorId]);
   await query(`UPDATE agents SET archived = true, status = 'offline' WHERE id = $1`, [id]);
   return true;
+}).then(async (done) => {
+  // Outside the lane, so a clone's republish never waits behind it. Clones that merged into it now resolve further up.
+  if (done) await publishCloneTargets(id);
+  return done;
 });
 
 // The projects a delete covers, with their GMs. The hand-over preview reads them the same way, so it goes in the same order.

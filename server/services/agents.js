@@ -5,17 +5,33 @@ import { CODENAMES, roleInfo, normalizeRole } from '../roles.js';
 import { notify, audit } from './notify.js';
 import { combineLearning, mergePlaybooks, event as evolutionEvent } from '../orchestrator/evolution.js';
 
+/**
+ * Walk up a clone's chain in SQL: from start, step past each archived agent to its merged_into (else cloned_from),
+ * never revisiting an id (seen starts as [self]). One row per agent visited, the last one live when the walk found one.
+ * where (on the first step) limits which rows walk at all. liveAncestor() and merge_target_* both use it.
+ */
+const ancestorWalk = (self, start, where = 'true') => `WITH RECURSIVE walk(id, seen) AS (
+    SELECT ${start}, ARRAY[${self}] WHERE ${where}
+    UNION ALL
+    SELECT COALESCE(x.merged_into, x.cloned_from), w.seen || w.id FROM walk w JOIN agents x ON x.id = w.id
+    WHERE x.archived AND w.id <> ALL(w.seen))
+  SELECT x.* FROM walk w JOIN agents x ON x.id = w.id WHERE NOT x.archived AND w.id <> ALL(w.seen) LIMIT 1`;
+
 // active_tasks: the agent's running tasks across all projects (at most 1: claim() in the engine keeps agents exclusive).
+// merge_target_*: the agent a live clone would merge into, as liveAncestor() resolves it; null for others.
 const AGENT_COLS = `a.*, s.name AS supervisor_name,
   (SELECT count(*)::int FROM agents c WHERE c.supervisor_id = a.id AND NOT c.archived) AS reports,
-  (SELECT count(*)::int FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running') AS active_tasks`;
+  (SELECT count(*)::int FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running') AS active_tasks,
+  mt.id AS merge_target_id, mt.name AS merge_target_name`;
+const AGENT_FROM = `agents a LEFT JOIN agents s ON s.id = a.supervisor_id
+  LEFT JOIN LATERAL (${ancestorWalk('a.id', 'a.cloned_from', `a.origin = 'cloned' AND NOT a.archived`)}) mt ON true`;
 
 export async function listAgents() {
-  return many(`SELECT ${AGENT_COLS} FROM agents a LEFT JOIN agents s ON s.id = a.supervisor_id WHERE NOT a.archived ORDER BY a.tier, a.created_at`);
+  return many(`SELECT ${AGENT_COLS} FROM ${AGENT_FROM} WHERE NOT a.archived ORDER BY a.tier, a.created_at`);
 }
 
 export async function getAgent(id) {
-  return one(`SELECT ${AGENT_COLS} FROM agents a LEFT JOIN agents s ON s.id = a.supervisor_id WHERE a.id = $1`, [id]);
+  return one(`SELECT ${AGENT_COLS} FROM ${AGENT_FROM} WHERE a.id = $1`, [id]);
 }
 
 const lanes = new Map(); // `${lane}:${agentId}` -> tail of its chain
@@ -38,6 +54,21 @@ export function publishAgent(id) {
     if (a && !a.archived) emit('agent:update', a);
     return a;
   });
+}
+
+/**
+ * After agent id was archived, republish the live clones whose chain walk passes it: their merge target moved on
+ * (to its own resolution, or to none). Call once the archive is committed.
+ */
+export async function publishCloneTargets(id) {
+  const rows = await many(
+    `WITH RECURSIVE walk(root, id, seen) AS (
+       SELECT a.id, a.cloned_from, ARRAY[a.id] FROM agents a WHERE a.origin = 'cloned' AND NOT a.archived AND a.cloned_from IS NOT NULL
+       UNION ALL
+       SELECT w.root, COALESCE(x.merged_into, x.cloned_from), w.seen || w.id FROM walk w JOIN agents x ON x.id = w.id
+       WHERE x.archived AND w.id <> ALL(w.seen))
+     SELECT DISTINCT root FROM walk WHERE id = $1 AND id <> ALL(seen)`, [id]);
+  for (const r of rows) await publishAgent(r.root);
 }
 
 /**
@@ -164,15 +195,7 @@ const httpError = (status, message) => Object.assign(new Error(message), { statu
 
 // First live agent up the clone's chain: its source, or wherever an archived source was merged into (or cloned from).
 export async function liveAncestor(clone) {
-  const seen = new Set([clone.id]);
-  for (let id = clone.cloned_from; id && !seen.has(id);) {
-    seen.add(id);
-    const a = await one(`SELECT id, archived, merged_into, cloned_from FROM agents WHERE id = $1`, [id]);
-    if (!a) return null;
-    if (!a.archived) return a;
-    id = a.merged_into || a.cloned_from;
-  }
-  return null;
+  return one(ancestorWalk('$1::uuid', '$2::uuid'), [clone.id, clone.cloned_from]);
 }
 
 /**
@@ -201,6 +224,7 @@ export async function mergeAgent(cloneId) {
     body: `+${merged.xp} XP · ${merged.skills} skills · ${merged.lessons} lessons${merged.playbookVersion ? ` · playbook v${merged.playbookVersion}` : ''}` });
   await audit('user', 'agent.merge', clone.name, { into: target.name, intoId: target.id, ...merged });
   emit('agent:delete', { id: clone.id });
+  await publishCloneTargets(clone.id);
   // projects: those the clone managed, now managed by the original (the caller publishes them).
   return { agent: await publishAgent(target.id), merged, projects };
 }
