@@ -12,6 +12,7 @@ import { openContextMenu } from '../../components/ContextMenu.jsx';
 import { cx, Button, IconButton, Input, Field, Textarea, Empty, StatusDot } from '../../components/ui.jsx';
 import { CommandWindow } from './CommandWindow.jsx';
 import { AgentRail } from './AgentRail.jsx';
+import { HandOverPreview } from '../agents/HandOverPreview.jsx';
 
 export function CreateProjectDialog() {
   const open = useStore((s) => s.createProject);
@@ -87,7 +88,8 @@ function ProjectList() {
     if (!deletable.length) return toast.warn('The AgentForge core project is protected and cannot be deleted');
     setConfirm({
       title: `Delete ${deletable.length} project${deletable.length > 1 ? 's' : ''}?`,
-      body: <>Removes {deletable.map((p) => <b key={p.id} className="text-fg">{p.name} </b>)} from AgentForge with its chat history and tasks. Files on disk are kept.{targets.some((p) => p.protected) && <div className="mt-2 text-warn">Protected projects are skipped.</div>}</>,
+      body: <>Removes {deletable.map((p) => <b key={p.id} className="text-fg">{p.name} </b>)} from AgentForge with its chat history and tasks. Files on disk are kept.{targets.some((p) => p.protected) && <div className="mt-2 text-warn">Protected projects are skipped.</div>}
+        <HandOverPreview url={`/api/projects/handover?ids=${deletable.map((p) => p.id).join(',')}`} /></>,
       onConfirm: async () => { await api.post('/api/projects/delete', { ids: deletable.map((p) => p.id) }); setSel(new Set()); },
     });
   };

@@ -8,14 +8,14 @@ import { config } from '../config.js';
 import { emit } from '../events.js';
 import { getSettings, sanitizeMonitor } from '../db/seed.js';
 import { ROLES, TIERS } from '../roles.js';
-import { listAgents, getAgent, createAgent, cloneAgent, mergeAgent, publishAgent, withAgentLock } from '../services/agents.js';
+import { listAgents, getAgent, createAgent, cloneAgent, mergeAgent, publishAgent, withAgentLock, liveAncestor } from '../services/agents.js';
 import { listProjects, getProject, createProjectRecord, publishProject } from '../services/projects.js';
 import { listTopics, getTopic, createTopic, updateTopic, deleteTopic, isUuid } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
 import { gitInfo } from '../services/git.js';
 import { disposePreview } from '../services/runner.js';
 import { listModels, publishModels, PROVIDERS, runModel, recordRunUsage } from '../models/index.js';
-import { submitCommand, cancelMission, standup, syncNow, approveProposal, rejectProposal, handOver } from '../orchestrator/engine.js';
+import { submitCommand, cancelMission, standup, syncNow, approveProposal, rejectProposal, handOver, previewHandOver } from '../orchestrator/engine.js';
 import { evolutionOverview, analyzeMission } from '../orchestrator/evolution.js';
 
 const err = (reply, code, message) => reply.code(code).send({ error: message });
@@ -29,10 +29,22 @@ const retireAgent = (id, supervisorId, ready = () => true) => withAgentLock('cla
   return true;
 });
 
+// The projects a delete covers, with their GMs. The hand-over preview reads them the same way, so it goes in the same order.
+const deleteRows = (ids) => many(`SELECT p.id, p.name, p.protected, p.manager_id, m.supervisor_id AS manager_supervisor_id FROM projects p LEFT JOIN agents m ON m.id = p.manager_id WHERE p.id = ANY($1)`, [ids]);
+
 // opts.onSettingsChange(key, value) lets the server react to a saved setting without a restart.
 export default async function apiRoutes(app, opts = {}) {
   // ---- projects ----------------------------------------------------------
   app.get('/api/projects', () => listProjects());
+
+  // Read-only preview of POST /api/projects/delete: where the pending work its GMs have in other projects' missions
+  // would go. ?ids=<uuid>,<uuid>; protected and unknown projects are skipped, as the delete refuses or ignores them.
+  app.get('/api/projects/handover', async (req, reply) => {
+    const ids = String(req.query.ids ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (!ids.every((id) => isUuid(id))) return err(reply, 400, 'Invalid project id');
+    const doomed = (await deleteRows(ids)).filter((p) => !p.protected);
+    return { moves: await previewHandOver(doomed.map((p) => p.manager_id).filter(Boolean), { excludeProjects: doomed.map((p) => p.id) }) };
+  });
 
   app.post('/api/projects', async (req, reply) => {
     const { name, path: dir, github_url, description } = req.body || {};
@@ -62,7 +74,7 @@ export default async function apiRoutes(app, opts = {}) {
 
   app.post('/api/projects/delete', async (req, reply) => {
     const ids = req.body?.ids || [];
-    const rows = await many(`SELECT p.id, p.name, p.protected, p.manager_id, m.supervisor_id AS manager_supervisor_id FROM projects p LEFT JOIN agents m ON m.id = p.manager_id WHERE p.id = ANY($1)`, [ids]);
+    const rows = await deleteRows(ids);
     const deleted = [];
     const refused = [];
     for (const p of rows) {
@@ -201,6 +213,20 @@ export default async function apiRoutes(app, opts = {}) {
   });
 
   app.post('/api/agents/:id/clone', async (req) => cloneAgent(req.params.id, 'manual clone'));
+
+  // Read-only preview of a merge (?as=merge) or delete (?as=remove): { into, moves }, see previewHandOver().
+  app.get('/api/agents/:id/handover', async (req, reply) => {
+    const a = isUuid(req.params.id) && (await getAgent(req.params.id));
+    if (!a) return err(reply, 404, 'Not found');
+    const as = req.query.as;
+    if (as !== 'merge' && as !== 'remove') return err(reply, 400, "as must be 'merge' or 'remove'");
+    if (as === 'remove') return { into: null, moves: await previewHandOver([a.id]) };
+    // Where mergeAgent() would refuse, nothing moves; the POST says why.
+    const up = a.origin === 'cloned' && !a.archived && (await liveAncestor(a));
+    const into = up && (await getAgent(up.id));
+    if (!into) return { into: null, moves: [] };
+    return { into: { id: into.id, name: into.name }, moves: await previewHandOver([a.id], { mergeInto: into }) };
+  });
 
   // Merge (return) an idle clone into its original, combining what it learned. Its pending work goes to the original.
   app.post('/api/agents/:id/merge', async (req, reply) => {

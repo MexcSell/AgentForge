@@ -5,6 +5,7 @@ import { useStore } from '../../lib/store.js';
 import { toast } from '../../lib/toast.js';
 import { Confirm } from '../../components/Modal.jsx';
 import { Button, IconButton } from '../../components/ui.jsx';
+import { HandOverPreview } from './HandOverPreview.jsx';
 
 export const MERGE_BUSY = 'Busy — merge when it is idle';
 
@@ -39,7 +40,8 @@ export function MergeConfirm({ clone, original, onClose }) {
   const into = original?.name || 'its original';
   return (
     <Confirm open={!!clone} title={`Merge ${clone?.name} into ${into}?`} confirmLabel="Merge" onClose={onClose}
-      body={<>The skills, XP, lessons and playbook {clone?.name} gained are combined into {into}, and {clone?.name} is retired. Its task history stays.</>}
+      body={<>The skills, XP, lessons and playbook {clone?.name} gained are combined into {into}, and {clone?.name} is retired. Its task history stays.
+        <HandOverPreview url={clone && `/api/agents/${clone.id}/handover?as=merge`} /></>}
       onConfirm={async () => {
         let agent;
         try {

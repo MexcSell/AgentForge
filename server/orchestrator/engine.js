@@ -4,7 +4,7 @@ import { config } from '../config.js';
 import { emit } from '../events.js';
 import { getSettings } from '../db/seed.js';
 import { normalizeRole, roleInfo } from '../roles.js';
-import { getAgent, listAgents, createAgent, cloneAgent, publishAgent, refreshAgentStatus, withAgentLock, replacementFor } from '../services/agents.js';
+import { getAgent, listAgents, createAgent, cloneAgent, publishAgent, refreshAgentStatus, withAgentLock, replacementFor, pickReplacement, mergeTarget } from '../services/agents.js';
 import { getProject, publishProject, setProjectStatus } from '../services/projects.js';
 import { getTopic, createTopic, updateTopic, touchTopic, ensureTopic, publishTopic } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
@@ -692,6 +692,11 @@ async function liveAgent({ task, project, gm, mission }) {
   }
 }
 
+// The agent's pending tasks in planning or running missions: the work handOver() moves once it is gone.
+const pendingOf = (agentId) => many(
+  `SELECT t.id, t.key, t.title, t.role, t.skills, t.mission_id, t.project_id FROM tasks t JOIN missions m ON m.id = t.mission_id
+   WHERE t.agent_id = $1 AND t.status = 'pending' AND m.status IN ('planning', 'running') ORDER BY t.created_at`, [agentId]);
+
 /**
  * An agent is gone (merged or removed): every pending task it had in a planning or running mission moves to a similar
  * live agent (replacementFor), and each affected mission's chat says who took over. Started tasks are left to runTask.
@@ -699,9 +704,7 @@ async function liveAgent({ task, project, gm, mission }) {
 export async function handOver(agentId) {
   const gone = await getAgent(agentId);
   if (!gone) return [];
-  const pending = await many(
-    `SELECT t.id, t.key, t.role, t.skills, t.mission_id, t.project_id FROM tasks t JOIN missions m ON m.id = t.mission_id
-     WHERE t.agent_id = $1 AND t.status = 'pending' AND m.status IN ('planning', 'running') ORDER BY t.created_at`, [agentId]);
+  const pending = await pendingOf(agentId);
   const byMission = new Map(); // missionId -> [{ agent, merged, recruited, key, task }]
   for (const t of pending) {
     const pick = await replacementFor(gone, t);
@@ -720,6 +723,47 @@ export async function handOver(agentId) {
   }
   for (const id of projects) await publishProject(id).catch(() => {});
   return [...byMission.values()].flat().map((m) => ({ task_id: m.task.id, key: m.key, agent_id: m.agent.id }));
+}
+
+/**
+ * Read-only: what handOver() would do if the goneIds agents went now, one after the other (as a bulk project delete
+ * retires its GMs). Returns the final owner of each pending task they hold; a task picked onto a later agent of the list
+ * moves on with it. mergeInto (the merge target) takes all of it. Tasks of excludeProjects (being deleted) are left out.
+ * Where nobody of the role is left, recruit is who would be recruited ({ role, title }), and later picks reuse it.
+ */
+export async function previewHandOver(goneIds, { mergeInto = null, excludeProjects = [] } = {}) {
+  const gone = [];
+  for (const id of new Set(goneIds)) {
+    const a = await getAgent(id);
+    if (a) gone.push(a);
+  }
+  const skip = new Set(excludeProjects);
+  const tasks = [];
+  for (const g of gone) for (const t of await pendingOf(g.id)) if (!skip.has(t.project_id)) tasks.push({ ...t, from: g });
+  if (!tasks.length) return [];
+  const agents = mergeInto ? [] : await listAgents();
+  const names = new Map((await many(`SELECT id, name FROM projects WHERE id = ANY($1)`, [[...new Set(tasks.map((t) => t.project_id))]])).map((p) => [p.id, p.name]));
+  const holder = new Map(tasks.map((t) => [t.id, t.from.id])); // taskId -> who has it at this step
+  const picks = new Map(); // taskId -> { agent, merged, recruit }, the last one being final
+  const recruits = new Map(); // role -> { role, title }
+  const out = [];
+  for (const g of gone) {
+    out.push(g.id);
+    const into = mergeInto || (g.merged_into ? await mergeTarget(g) : null);
+    for (const t of tasks.filter((x) => holder.get(x.id) === g.id)) {
+      const agent = into || pickReplacement(g, t, agents, { exclude: out });
+      const role = normalizeRole(g.role);
+      const recruit = agent ? null : recruits.get(role) || { role, title: g.title || roleInfo(role).title };
+      if (recruit) recruits.set(role, recruit);
+      picks.set(t.id, { agent, merged: !!into, recruit });
+      holder.set(t.id, agent?.id ?? null);
+    }
+  }
+  return tasks.map((t) => {
+    const { agent, merged, recruit } = picks.get(t.id);
+    return { task_id: t.id, key: t.key, title: t.title, mission_id: t.mission_id, project_id: t.project_id, project_name: names.get(t.project_id) ?? null,
+      from: { id: t.from.id, name: t.from.name }, agent: agent && { id: agent.id, name: agent.name, role: agent.role, title: agent.title }, merged, recruit };
+  });
 }
 
 async function runTask({ task, state, project, gm, mission, settings, signal, attempt = 1 }) {

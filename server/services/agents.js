@@ -118,25 +118,42 @@ export async function cloneAgent(sourceId, reason = 'parallel work') {
   return agent;
 }
 
-/**
- * A live agent to take over a task from one that is gone (a merged clone, a removed agent, or null when the task has
- * none). A merged clone's merge target comes first. Otherwise the best non-archived agent of the same role by overlap
- * with the gone agent's and the task's skills, idle agents ahead by the staffing bonus; with nobody of that role left,
- * an agent is recruited with the gone one's role, title and skills. One pick per role at a time, so picks made at the
- * same moment reuse a recruit instead of recruiting twice. Returns { agent, merged, recruited }.
- */
-export async function replacementFor(gone, task = {}) {
+// First live agent down a merged clone's merged_into chain; null when it was never merged or the chain ends archived.
+export async function mergeTarget(gone) {
   for (let id = gone?.merged_into, seen = new Set(); id && !seen.has(id);) {
     seen.add(id);
     const a = await getAgent(id);
-    if (a && !a.archived) return { agent: a, merged: true, recruited: false };
+    if (a && !a.archived) return a;
     id = a?.merged_into;
   }
+  return null;
+}
+
+/**
+ * Of agents (rows like listAgents()), the best non-archived one of the gone agent's role (the task's when none is gone)
+ * by overlap with the gone agent's and the task's skills, idle agents ahead by the staffing bonus. The gone agent and
+ * the ids in exclude never qualify. Null when nobody of that role is left, i.e. replacementFor() would recruit. Pure.
+ */
+export function pickReplacement(gone, task = {}, agents = [], { exclude = [] } = {}) {
+  const role = gone?.role || task.role;
+  const skip = new Set([gone?.id, ...exclude]);
+  const want = new Set([...(gone?.skills || []).map((s) => s.name), ...(task.skills || [])]);
+  const score = (a) => a.skills.reduce((n, s) => n + (want.has(s.name) ? s.level : 0), 0) + (a.status === 'idle' ? 15 : 0);
+  return agents.filter((a) => a.role === role && !a.archived && !skip.has(a.id)).sort((a, b) => score(b) - score(a))[0] || null;
+}
+
+/**
+ * A live agent to take over a task from one that is gone (a merged clone, a removed agent, or null when the task has
+ * none). A merged clone's merge target comes first. Otherwise pickReplacement() over the live agents; with nobody of
+ * that role left, an agent is recruited with the gone one's role, title and skills. One pick per role at a time, so
+ * picks made at the same moment reuse a recruit instead of recruiting twice. Returns { agent, merged, recruited }.
+ */
+export async function replacementFor(gone, task = {}) {
+  const into = gone?.merged_into ? await mergeTarget(gone) : null;
+  if (into) return { agent: into, merged: true, recruited: false };
   const role = gone?.role || task.role;
   return withAgentLock('replace', role, async () => {
-    const want = new Set([...(gone?.skills || []).map((s) => s.name), ...(task.skills || [])]);
-    const score = (a) => a.skills.reduce((n, s) => n + (want.has(s.name) ? s.level : 0), 0) + (a.status === 'idle' ? 15 : 0);
-    const best = (await listAgents()).filter((a) => a.role === role && a.id !== gone?.id).sort((a, b) => score(b) - score(a))[0];
+    const best = pickReplacement(gone, task, await listAgents());
     if (best) return { agent: best, merged: false, recruited: false };
     const skills = gone?.skills?.length ? gone.skills.map((s) => s.name) : task.skills;
     return { agent: await createAgent({ role, title: gone?.title, skills }), merged: false, recruited: true };
@@ -146,7 +163,7 @@ export async function replacementFor(gone, task = {}) {
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 
 // First live agent up the clone's chain: its source, or wherever an archived source was merged into (or cloned from).
-async function liveAncestor(clone) {
+export async function liveAncestor(clone) {
   const seen = new Set([clone.id]);
   for (let id = clone.cloned_from; id && !seen.has(id);) {
     seen.add(id);

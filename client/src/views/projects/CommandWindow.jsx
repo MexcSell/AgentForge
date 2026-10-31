@@ -15,6 +15,7 @@ import { Modal, Confirm } from '../../components/Modal.jsx';
 import { cx, Badge, Button, IconButton, Input, Field, Textarea, Toggle, Kbd, AgentAvatar, Progress, STATUS_TONE } from '../../components/ui.jsx';
 import { TopicBar, TagChip, TagEditor, RenameInput } from './TopicBar.jsx';
 import { PreviewWindow } from './PreviewWindow.jsx';
+import { HandOverPreview } from '../agents/HandOverPreview.jsx';
 
 const EMPTY = [];
 const SLASH = [
@@ -528,7 +529,7 @@ export function CommandWindow({ project }) {
           onOpenSettings={() => { setPreviewWin(false); setSettings('preview'); }} />
       )}
       <Confirm open={confirmDel} title={`Delete "${project.name}"?`} danger confirmLabel="Delete project" onClose={() => setConfirmDel(false)}
-        body="Removes the project, its chat history and tasks from AgentForge. Files on disk are kept."
+        body={<>Removes the project, its chat history and tasks from AgentForge. Files on disk are kept.<HandOverPreview url={`/api/projects/handover?ids=${project.id}`} /></>}
         onConfirm={() => api.post('/api/projects/delete', { ids: [project.id] })} />
     </div>
   );
