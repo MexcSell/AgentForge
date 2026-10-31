@@ -144,7 +144,7 @@ function ProjectList() {
           const active = p.id === st.activeProjectId;
           const selected = sel.has(p.id);
           return (
-            <div key={p.id} onClick={(e) => click(e, p, i)} onDoubleClick={() => setRenaming(p.id)} onContextMenu={(e) => menu(e, p)}
+            <div key={p.id} onClick={(e) => click(e, p, i)} onContextMenu={(e) => menu(e, p)}
               className={cx('group relative flex items-center gap-2.5 px-2 py-2 rounded-lg cursor-pointer select-none mb-0.5 transition-colors',
                 selected ? 'bg-accent-soft ring-1 ring-accent/40' : active ? 'bg-hover' : 'hover:bg-hover')}>
               {active && <span className="absolute left-0 top-2 bottom-2 w-[3px] rounded-full grad-accent" />}
