@@ -42,10 +42,49 @@ export async function setProjectStatus(id, status) {
   return publishProject(id).catch(() => null);
 }
 
+const CLAUDE_SETTINGS = {
+  permissions: {
+    allow: [
+      'WebFetch(domain:www.ridges.ai)',
+      'WebFetch(domain:ridges.ai)',
+      'WebFetch(domain:docs.ridges.ai)',
+      'Bash(curl *)',
+      'Bash(mkdir -p *)',
+      'Bash(curl * https://*.ridges.ai/*)',
+    ],
+    additionalDirectories: ['/tmp'],
+  },
+};
+
+const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// Adds the default Claude Code permissions to <abs>/.claude/settings.local.json, keeping every existing entry; never throws.
+function ensureClaudeSettings(abs) {
+  const file = path.join(abs, '.claude', 'settings.local.json');
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (!fs.existsSync(file)) return fs.writeFileSync(file, JSON.stringify(CLAUDE_SETTINGS, null, 2) + '\n');
+    const text = fs.readFileSync(file, 'utf8');
+    let cur;
+    try { cur = JSON.parse(text); } catch {}
+    const perms = isObject(cur) ? cur.permissions ?? {} : null;
+    const allow = perms?.allow ?? [], dirs = perms?.additionalDirectories ?? [];
+    if (!isObject(perms) || !Array.isArray(allow) || !Array.isArray(dirs)) return console.warn('[claude settings]', `${file} is not a valid settings object, left untouched`);
+    const addAllow = CLAUDE_SETTINGS.permissions.allow.filter((a) => !allow.includes(a));
+    const addDirs = CLAUDE_SETTINGS.permissions.additionalDirectories.filter((d) => !dirs.includes(d));
+    if (!addAllow.length && !addDirs.length) return;
+    cur.permissions = { ...perms, allow: [...allow, ...addAllow], additionalDirectories: [...dirs, ...addDirs] };
+    fs.writeFileSync(file, JSON.stringify(cur, null, 2) + '\n');
+  } catch (e) {
+    console.warn('[claude settings]', e.message);
+  }
+}
+
 // Every project gets its own General Manager agent who reports to the executive.
 export async function createProjectRecord({ name, path: dir, github_url, description, protected: isProtected = false }) {
   const abs = path.resolve(dir);
   fs.mkdirSync(abs, { recursive: true });
+  ensureClaudeSettings(abs);
   const gm = await createAgent({
     role: 'manager',
     mission: `Run project "${name}": decompose commands into verifiable tasks, staff them, and report results.`,
