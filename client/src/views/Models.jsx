@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Cpu, Plus, Star, Trash2, FlaskConical, Pencil, Timer, CalendarClock, Coins, Hash, CircleCheck, CircleX, Gauge, KeyRound, Info } from 'lucide-react';
+import { Cpu, Plus, Star, Trash2, FlaskConical, Pencil, Timer, CalendarClock, Coins, Hash, CircleCheck, CircleX, Gauge, KeyRound, Info, SquareTerminal, Sparkles } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { useStore } from '../lib/store.js';
 import { toast } from '../lib/toast.js';
@@ -10,13 +10,25 @@ import { cx, Badge, Button, IconButton, Input, Field, Select, Toggle, Meter, use
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
+const MARK_ICON = { codex: SquareTerminal, gpt: Sparkles, openai: Cpu };
+/** Model id / base URL pre-filled when a provider tile is picked. */
+const PRESETS = {
+  'claude-code': { model: 'claude-sonnet-5-5', base_url: '' },
+  codex: { model: 'gpt-6-luna', base_url: '' },
+  anthropic: { model: 'claude-sonnet-5-5', base_url: '' },
+  gpt: { model: 'gpt-6-luna', base_url: '' },
+  openai: { model: 'gpt-4o', base_url: 'http://localhost:11434/v1' },
+  simulator: { model: 'sim-1', base_url: '' },
+};
+
 function ProviderMark({ provider, size = 40 }) {
   const s = PROVIDER_STYLE[provider] || PROVIDER_STYLE.simulator;
+  const Icon = MARK_ICON[provider] || FlaskConical;
   return (
     <span className="relative inline-flex items-center justify-center rounded-xl text-white shrink-0 shadow-sm" style={{ width: size, height: size, backgroundImage: `linear-gradient(135deg, ${s.from}, ${s.to})` }}>
       {provider === 'claude-code' || provider === 'anthropic' ? (
         <svg viewBox="0 0 24 24" width={size * 0.5} height={size * 0.5} fill="currentColor" aria-hidden="true"><path d="M12 2.5l1.6 6.1 6.1-3.3-3.3 6.1 6.1 1.6-6.1 1.6 3.3 6.1-6.1-3.3L12 23.1l-1.6-6.1-6.1 3.3 3.3-6.1-6.1-1.6 6.1-1.6-3.3-6.1 6.1 3.3z" /></svg>
-      ) : provider === 'openai' ? <Cpu size={size * 0.5} /> : <FlaskConical size={size * 0.5} />}
+      ) : <Icon size={size * 0.5} />}
     </span>
   );
 }
@@ -68,13 +80,15 @@ function RateLimit({ info }) {
 
 function ModelDialog({ open, model, onClose }) {
   const providers = PROVIDER_STYLE;
-  const blank = { name: '', provider: 'claude-code', model: 'claude-sonnet-5-5', base_url: '', api_key: '', limits: { dailyTokens: 2000000, weeklyTokens: 10000000, dailyPrompts: 400, weeklyPrompts: 2000, resetHour: 0, weeklyResetDay: 1 }, config: { effort: '' } };
+  const blank = { name: '', provider: 'claude-code', ...PRESETS['claude-code'], api_key: '', limits: { dailyTokens: 2000000, weeklyTokens: 10000000, dailyPrompts: 400, weeklyPrompts: 2000, resetHour: 0, weeklyResetDay: 1 }, config: { effort: '' } };
   const [f, setF] = useState(blank);
   const [busy, setBusy] = useState(false);
   const [last, setLast] = useState(null);
   if (open && last !== (model?.id || 'new')) { setLast(model?.id || 'new'); setF(model ? { ...blank, ...model, api_key: '', limits: { ...blank.limits, ...model.limits }, config: { ...blank.config, ...model.config } } : blank); }
   if (!open && last) setLast(null);
   const L = (k, v) => setF({ ...f, limits: { ...f.limits, [k]: v === '' ? 0 : Number(v) } });
+  const viaHttp = ['anthropic', 'openai', 'gpt'].includes(f.provider);
+  const agentCli = f.provider === 'claude-code' || f.provider === 'codex';
   const save = async () => {
     setBusy(true);
     try {
@@ -90,9 +104,9 @@ function ModelDialog({ open, model, onClose }) {
       <div className="flex flex-col gap-5">
         {!model && (
           <Field label="Provider">
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
               {Object.entries(providers).map(([k, p]) => (
-                <button key={k} type="button" onClick={() => setF({ ...f, provider: k, model: k === 'claude-code' ? 'claude-sonnet-5-5' : k === 'anthropic' ? 'claude-sonnet-5-5' : k === 'openai' ? 'gpt-4o' : 'sim-1', base_url: k === 'openai' ? 'http://localhost:11434/v1' : '' })}
+                <button key={k} type="button" aria-pressed={f.provider === k} onClick={() => setF({ ...f, provider: k, ...PRESETS[k] })}
                   className={cx('flex items-center gap-2 p-2 rounded-lg border text-left', f.provider === k ? 'border-accent bg-accent-soft' : 'border-line hover:bg-hover')}>
                   <ProviderMark provider={k} size={24} /><span className="text-xs font-medium">{p.label}</span>
                 </button>
@@ -103,9 +117,9 @@ function ModelDialog({ open, model, onClose }) {
         <div className="grid md:grid-cols-2 gap-4">
           <Field label="Display name"><Input value={f.name} placeholder="Claude Code · Sonnet" onChange={(e) => setF({ ...f, name: e.target.value })} /></Field>
           <Field label="Model id"><Input className="mono" value={f.model || ''} onChange={(e) => setF({ ...f, model: e.target.value })} /></Field>
-          {(f.provider === 'openai' || f.provider === 'anthropic') && <Field label="Base URL"><Input className="mono" value={f.base_url || ''} placeholder={f.provider === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'} onChange={(e) => setF({ ...f, base_url: e.target.value })} /></Field>}
-          {(f.provider === 'openai' || f.provider === 'anthropic') && <Field label="API key" hint={model?.has_api_key ? 'A key is stored. Leave blank to keep it.' : 'Stored server-side; never sent to the browser.'}><Input icon={KeyRound} type="password" value={f.api_key} onChange={(e) => setF({ ...f, api_key: e.target.value })} /></Field>}
-          {f.provider === 'claude-code' && (
+          {viaHttp && <Field label="Base URL"><Input className="mono" value={f.base_url || ''} placeholder={f.provider === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'} onChange={(e) => setF({ ...f, base_url: e.target.value })} /></Field>}
+          {viaHttp && <Field label="API key" hint={model?.has_api_key ? 'A key is stored. Leave blank to keep it.' : f.provider === 'gpt' ? 'Stored server-side; never sent to the browser. Without a stored key, OPENAI_API_KEY is used.' : 'Stored server-side; never sent to the browser.'}><Input icon={KeyRound} type="password" value={f.api_key} onChange={(e) => setF({ ...f, api_key: e.target.value })} /></Field>}
+          {agentCli && (
             <>
               <div className="flex flex-col gap-1.5">
                 <span className="text-[0.72rem] font-medium uppercase tracking-wider text-subtle">Permissions</span>
@@ -145,7 +159,7 @@ function ModelCard({ m, onEdit, onDelete }) {
       <div className="flex items-center gap-3 p-4 border-b border-line">
         <ProviderMark provider={m.provider} />
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2"><span className="font-semibold truncate">{m.name}</span>{m.is_default && <Badge tone="accent" icon={Star}>Default</Badge>}{m.provider === 'claude-code' && !m.is_default && <Badge>Recommended</Badge>}</div>
+          <div className="flex items-center gap-2"><span className="font-semibold truncate">{m.name}</span>{m.is_default && <Badge tone="accent" icon={Star}>Default</Badge>}{m.can_edit && !m.is_default && <Badge>Recommended</Badge>}{m.provider === 'gpt' && !m.has_api_key && <Badge tone="warn" icon={KeyRound}>API key required</Badge>}</div>
           <div className="text-xs text-subtle mono truncate">{m.provider_label} · {m.model}{m.can_edit ? ' · can edit files' : ' · text only'}</div>
         </div>
         <Toggle checked={m.enabled} onChange={(v) => api.patch(`/api/models/${m.id}`, { enabled: v })} />
@@ -199,13 +213,13 @@ export default function Models({ layout }) {
           <Cpu size={18} className="text-subtle" />
           <div>
             <div className="font-semibold text-[0.95rem]">Model Manager</div>
-            <div className="text-xs text-muted">Claude Code is the recommended standard: agents get real file and tool access. Other providers answer in text.</div>
+            <div className="text-xs text-muted">Claude Code and Codex CLI are the recommended standard: their agents get real file and tool access. Other providers answer in text.</div>
           </div>
           <Button variant="primary" icon={Plus} className="ml-auto" onClick={() => setDialog({})}>Add model</Button>
         </div>
         <div className="flex items-start gap-2 text-xs text-muted p-3 rounded-lg border border-line bg-panel">
           <Info size={13} className="mt-0.5 shrink-0 text-info" />
-          <span>Budgets are enforced by AgentForge before each run (tokens = input + output; cache reads shown separately). Provider-side limits reported by Claude Code appear on each card after its first run.</span>
+          <span>Budgets are enforced by AgentForge before each run (tokens = input + output; cache reads shown separately). Provider plan limits reported by Claude Code or Codex appear on each card after its first run.</span>
         </div>
         <div className="grid gap-4 xl:grid-cols-2">
           {models.map((m) => <ModelCard key={m.id} m={m} onEdit={() => setDialog({ model: m })} onDelete={() => setDel(m)} />)}

@@ -25,6 +25,9 @@ const MODELS = [
   { id: 'claude-code-opus', name: 'Claude Code · Opus 5.5', provider: 'claude-code', model: 'claude-opus-5-5', is_default: true },
   { id: 'claude-code-sonnet', name: 'Claude Code · Sonnet 5.5', provider: 'claude-code', model: 'claude-sonnet-5-5' },
   { id: 'claude-code-haiku', name: 'Claude Code · Haiku 5.5', provider: 'claude-code', model: 'claude-haiku-5-5' },
+  { id: 'codex-gpt-6-luna', name: 'Codex · GPT-6 Luna', provider: 'codex', model: 'gpt-6-luna' },
+  // Enabled only if OPENAI_API_KEY is set on first seed; otherwise add a key and enable it in Model Manager.
+  { id: 'gpt-6-luna', name: 'GPT · GPT-6 Luna', provider: 'gpt', model: 'gpt-6-luna', enabled: !!process.env.OPENAI_API_KEY },
   { id: 'simulator', name: 'Simulator (offline)', provider: 'simulator', model: 'sim-1', limits: { ...DEFAULT_LIMITS, dailyTokens: 0, weeklyTokens: 0 } },
 ];
 
@@ -54,9 +57,10 @@ export async function seed() {
 
   for (const m of MODELS) {
     await query(
-      `INSERT INTO models(id, name, provider, model, is_default, limits, config)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO NOTHING`,
-      [m.id, m.name, m.provider, m.model, !!m.is_default, m.limits || DEFAULT_LIMITS, m.provider === 'claude-code' ? { effort: '' } : {}],
+      `INSERT INTO models(id, name, provider, model, is_default, enabled, limits, config)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO NOTHING`,
+      [m.id, m.name, m.provider, m.model, !!m.is_default, m.enabled ?? true, m.limits || DEFAULT_LIMITS,
+        m.provider === 'claude-code' || m.provider === 'codex' ? { effort: '' } : {}],
     );
   }
 

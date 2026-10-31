@@ -8,7 +8,7 @@ import { getProject, publishProject, setProjectStatus } from '../services/projec
 import { getTopic, createTopic, updateTopic, touchTopic, ensureTopic, publishTopic } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
 import { syncProject } from '../services/git.js';
-import { resolveModel, runModel, recordRunUsage, publishModels } from '../models/index.js';
+import { PROVIDERS, resolveModel, runModel, recordRunUsage, publishModels } from '../models/index.js';
 import { heuristicPlan, topicTitle } from './heuristics.js';
 import { planPrompt, taskPrompt, commitPrompt, parseJson, topicContext } from './prompts.js';
 import { learn, analyzeMission } from './evolution.js';
@@ -343,11 +343,13 @@ async function runMission(mission, signal) {
     const status = signal.aborted ? 'cancelled' : done === final.length ? 'done' : 'failed';
     const lines = final.map((t) => `- ${t.status === 'done' ? '✓' : t.status === 'cancelled' ? '⊘' : '✗'} **${t.key} ${t.title}** — ${t.agent_name || '—'}: ${(t.report?.summary || t.result || t.status).split('\n')[0].slice(0, 220)}`);
 
-    // GitHub: upload the result when files may have changed. Any claude-code agent can edit files,
-    // and syncProject is a no-op on a clean tree, so role access is not checked here.
+    // GitHub: upload the result when files may have changed. Any agent on an edit-capable provider
+    // (canEdit: Claude Code, Codex CLI) can edit files, and syncProject is a no-op on a clean tree,
+    // so role access is not checked here.
+    const editProviders = Object.keys(PROVIDERS).filter((k) => PROVIDERS[k].canEdit);
     const wrote = !!(await one(
       `SELECT 1 FROM runs r JOIN models m ON m.id = r.model_id JOIN tasks t ON t.id = r.task_id
-       WHERE r.mission_id = $1 AND r.status = 'done' AND m.provider = 'claude-code' AND t.status = 'done' LIMIT 1`, [mission.id]));
+       WHERE r.mission_id = $1 AND r.status = 'done' AND m.provider = ANY($2::text[]) AND t.status = 'done' LIMIT 1`, [mission.id, editProviders]));
     project = await getProject(project.id);
     let github = '';
     if (wrote && project.auto_sync && settings.github.autoSync && !signal.aborted) {

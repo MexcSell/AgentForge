@@ -41,6 +41,13 @@ export async function runAnthropic({ model, prompt, system, images, signal, onEv
   };
 }
 
+/** OpenAI's own API for GPT models: the OpenAI-compatible call, with the key falling back to OPENAI_API_KEY. */
+export async function runGpt(opts) {
+  const key = opts.model.api_key || process.env.OPENAI_API_KEY;
+  if (!key) throw new Error('No API key configured for this model (set it in Model Manager or OPENAI_API_KEY).');
+  return runOpenAI({ ...opts, model: { ...opts.model, api_key: key } });
+}
+
 /** Any OpenAI-compatible /chat/completions endpoint (OpenAI, Ollama, llama.cpp, vLLM, OpenRouter...). */
 export async function runOpenAI({ model, prompt, system, images, signal, onEvent }) {
   const started = Date.now();

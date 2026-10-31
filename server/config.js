@@ -37,6 +37,7 @@ export const config = {
     userEmail: 'sellmexc9@gmail.com',
   },
   claudeBin: env.CLAUDE_BIN || 'claude',
+  codexBin: env.CODEX_BIN || 'codex',
 };
 
 fs.mkdirSync(config.uploadsDir, { recursive: true });

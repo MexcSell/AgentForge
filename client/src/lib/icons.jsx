@@ -84,7 +84,9 @@ export function GithubMark({ size = 16, className = '' }) {
 
 export const PROVIDER_STYLE = {
   'claude-code': { from: '#d97757', to: '#b4552d', label: 'Claude Code' },
+  codex: { from: '#3b82f6', to: '#1d4ed8', label: 'Codex CLI' },
   anthropic: { from: '#c96442', to: '#8f3f22', label: 'Anthropic API' },
+  gpt: { from: '#a855f7', to: '#a21caf', label: 'OpenAI GPT' },
   openai: { from: '#10a37f', to: '#0b6e56', label: 'OpenAI-compatible' },
   simulator: { from: '#71717a', to: '#3f3f46', label: 'Simulator' },
 };

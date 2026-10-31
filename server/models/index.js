@@ -1,12 +1,15 @@
 import { one, many, query } from '../db/pool.js';
 import { emit } from '../events.js';
 import { runClaudeCode } from './claudeCode.js';
-import { runAnthropic, runOpenAI } from './http.js';
+import { runCodex } from './codex.js';
+import { runAnthropic, runGpt, runOpenAI } from './http.js';
 import { runSimulator } from './simulator.js';
 
 export const PROVIDERS = {
   'claude-code': { label: 'Claude Code', canEdit: true, run: runClaudeCode },
+  codex: { label: 'Codex CLI', canEdit: true, run: runCodex },
   anthropic: { label: 'Anthropic API', canEdit: false, run: runAnthropic },
+  gpt: { label: 'OpenAI GPT', canEdit: false, run: runGpt },
   openai: { label: 'OpenAI-compatible', canEdit: false, run: runOpenAI },
   simulator: { label: 'Simulator', canEdit: false, run: runSimulator },
 };
