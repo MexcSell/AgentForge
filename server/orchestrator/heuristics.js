@@ -15,8 +15,27 @@ const RULES = [
 
 const CONVERSATIONAL = /^(hi|hello|hey|thanks|thank you|status|what('?s| is) (the )?status|who are you|help)\b/i;
 
-/** Topic title fallback: the first 6 words, without trailing punctuation. */
-export const topicTitle = (text) => String(text || '').replace(/\s+/g, ' ').trim().split(' ').slice(0, 6).join(' ').replace(/[\s.,;:!?…-]+$/, '');
+// Filler words a keyword title drops. schema.sql's topic-keywords backfill uses the same list.
+const STOPWORDS = new Set(('a an the and or but nor so of to in on at by for from with without into onto over under about as is are was were be been '
+  + 'being am do does did has have had it its this that these those there here what which who whom whose when where why how i me my we our '
+  + 'you your he she they them their please can could should would will shall may might must just also only very too then than not no '
+  + 'all any some more most each every make let lets get show add use new now up out off via vs').split(' '));
+
+/** Topic title fallback: at most 3 key words and 28 chars, stopwords and edge punctuation dropped. */
+export function topicTitle(text) {
+  const words = String(text || '').split(/\s+/).map((w) => w.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '')).filter(Boolean);
+  const keys = words.filter((w) => !STOPWORDS.has(w.toLowerCase()));
+  const picked = (keys.length ? keys : words).slice(0, 3);
+  while (picked.length > 1 && picked.join(' ').length > 28) picked.pop();
+  return picked.join(' ').slice(0, 28).trim();
+}
+
+/** Topic summary fallback: the order's first 240 chars, cut at a word. */
+export function topicSummary(text) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim();
+  if (t.length <= 240) return t;
+  return `${t.slice(0, 239).replace(/\s+\S*$/, '')}…`;
+}
 
 export function heuristicPlan(command) {
   const text = String(command || '').trim();

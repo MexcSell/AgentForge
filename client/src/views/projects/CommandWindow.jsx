@@ -154,6 +154,30 @@ function MovedNotice({ m }) {
   );
 }
 
+/**
+ * Top of the topic feed: the GM's running summary of what the topic covers (the title is only its key words), plus the
+ * title it had before a live retitle. Collapsed, it is one clipped line; the full text stays in the DOM for screen readers.
+ */
+function TopicSummary({ topic, earlier, open, onToggle }) {
+  const summary = topic.summary?.trim();
+  const prev = earlier && earlier !== topic.title && !summary?.includes(earlier) ? earlier : null;
+  if (!summary && !prev) return null;
+  const id = `topic-summary-${topic.id}`;
+  return (
+    <section aria-label="Topic summary" className="mx-4 mb-2 rounded-lg border border-line bg-sunken/50 text-xs">
+      <button type="button" aria-expanded={open} aria-controls={id} onClick={onToggle}
+        className="w-full flex items-start gap-1.5 px-2.5 py-1.5 text-left rounded-lg hover:bg-hover transition-colors focus-visible:outline-accent!">
+        <ChevronRight size={12} aria-hidden className={cx('mt-[3px] shrink-0 text-subtle transition-transform motion-reduce:transition-none', open && 'rotate-90')} />
+        <span className="shrink-0 font-medium text-muted">About</span>
+        <span id={id} className={cx('min-w-0 flex-1 text-fg leading-relaxed [overflow-wrap:anywhere]', open ? 'whitespace-pre-line' : 'line-clamp-1')}>
+          {summary || <span className="text-muted">Earlier title: {prev}</span>}
+          {summary && prev && <span className={cx('text-muted', open ? 'block mt-1' : 'sr-only')}>Earlier title: {prev}</span>}
+        </span>
+      </button>
+    </section>
+  );
+}
+
 /** Empty state of a fresh topic in a project that already has history elsewhere (§5.1). */
 function TopicEmpty({ project, topic, topics, tasks, onPick }) {
   const [renaming, setRenaming] = useState(false);
@@ -406,6 +430,7 @@ export function CommandWindow({ project }) {
   const [hideHint, setHideHint] = useState(false);
   const [preview, setPreview] = useState(null);
   const [previewWin, setPreviewWin] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const scroller = useRef(null);
   const stick = useRef(true);
   const fileInput = useRef(null);
@@ -578,6 +603,7 @@ export function CommandWindow({ project }) {
         )}
         {grouped.length > 0 && (
           <div key={topicId} className="animate-af-fade motion-reduce:animate-none">
+            {topic && <TopicSummary topic={topic} earlier={st.retitled[topic.id]} open={aboutOpen} onToggle={() => setAboutOpen(!aboutOpen)} />}
             {origin && (
               <div className="flex items-center justify-center gap-1 px-4 py-1.5 text-[0.68rem] text-muted">
                 <CornerDownRight size={11} />Continued from an order in <button className="font-medium text-fg hover:underline" onClick={() => st.setActiveTopic(project.id, origin.id)}>{origin.title}</button>

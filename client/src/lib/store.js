@@ -84,6 +84,7 @@ export const useStore = create((set, get) => ({
   unread: {}, // { [topicId]: count } — messages that arrived while another topic was active
   failedTopics: {}, // { [topicId]: true } — last mission failed while the topic was not active
   movedFrom: {}, // { [topicId]: originTopicId } — topics the GM split off (this session only)
+  retitled: {}, // { [topicId]: earlierTitle } — the title before a live keyword retitle (this session only)
   announce: '', // polite live-region text for topic changes
   tasks: {},
   missionsByTopic: {}, // { [topicId]: Mission } — from mission:update; see pickMission
@@ -237,7 +238,13 @@ export const useStore = create((set, get) => ({
         const list = st.topics[t.project_id];
         if (!list) break; // not loaded yet: loadTopics brings it in
         const patch = { topics: { ...st.topics, [t.project_id]: upsert(list, t) } };
-        if (type === 'topic:update') { set(patch); break; }
+        if (type === 'topic:update') {
+          // Keyword titles evolve with the topic; keep the one it replaced for the summary block (not the first naming).
+          const prev = list.find((x) => x.id === t.id)?.title;
+          if (t.title && prev && prev !== t.title && prev !== 'New topic') patch.retitled = { ...st.retitled, [t.id]: prev };
+          set(patch);
+          break;
+        }
         // A brand-new topic starts empty, unless the GM moved an order into it (topic:moved brings those messages).
         if (!movedFrom && !t.message_count && !st.messages[t.id]) patch.messages = { ...st.messages, [t.id]: [] };
         if (movedFrom) patch.movedFrom = { ...st.movedFrom, [t.id]: movedFrom };

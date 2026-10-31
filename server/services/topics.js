@@ -2,7 +2,7 @@ import { one, many, query } from '../db/pool.js';
 import { emit } from '../events.js';
 
 // A project's chat is a set of topic threads. WebSocket contract:
-// topic:new (full row) · topic:update (full row) · topic:delete { id, project_id } · topic:moved (emitted by the engine).
+// Rows carry title (key words) and summary. topic:new (full row) · topic:update (full row) · topic:delete { id, project_id } · topic:moved (emitted by the engine).
 
 // running = the topic has a planning or running mission.
 const TOPIC_COLS = `t.*,
@@ -12,6 +12,8 @@ const TOPIC_COLS = `t.*,
 export const isUuid = (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 
 const cleanTitle = (title) => String(title ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
+// The title holds key words; the summary says what the topic covers so far.
+export const cleanSummary = (summary) => String(summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 1000);
 
 // At most 5 unique, lowercase tags of 24 chars or fewer. Accepts an array or a comma-separated string.
 export function normalizeTags(tags) {
@@ -42,22 +44,23 @@ export async function publishTopic(id) {
 }
 
 // Does not emit: callers send topic:new themselves (the engine adds moved_from / mission_id).
-export async function createTopic({ project_id, title, tags, title_locked = false }) {
+export async function createTopic({ project_id, title, tags, summary = '', title_locked = false }) {
   const row = await one(
-    `INSERT INTO topics(project_id, title, tags, title_locked) VALUES ($1,$2,$3,$4) RETURNING id`,
-    [project_id, cleanTitle(title) || 'New topic', JSON.stringify(normalizeTags(tags)), !!title_locked],
+    `INSERT INTO topics(project_id, title, tags, title_locked, summary) VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+    [project_id, cleanTitle(title) || 'New topic', JSON.stringify(normalizeTags(tags)), !!title_locked, cleanSummary(summary)],
   );
   return getTopic(row.id);
 }
 
 // Only the given fields change; emits topic:update with the full row.
-export async function updateTopic(id, { title, tags, archived, title_locked } = {}) {
+export async function updateTopic(id, { title, tags, archived, title_locked, summary } = {}) {
   const t = await getTopic(id);
   if (!t) return null;
   await query(
-    `UPDATE topics SET title=$2, tags=$3, archived=$4, title_locked=$5, updated_at=now() WHERE id=$1`,
+    `UPDATE topics SET title=$2, tags=$3, archived=$4, title_locked=$5, summary=$6, updated_at=now() WHERE id=$1`,
     [t.id, (title !== undefined && cleanTitle(title)) || t.title, JSON.stringify(tags === undefined ? t.tags : normalizeTags(tags)),
-      archived === undefined ? t.archived : !!archived, title_locked === undefined ? t.title_locked : !!title_locked],
+      archived === undefined ? t.archived : !!archived, title_locked === undefined ? t.title_locked : !!title_locked,
+      summary === undefined ? t.summary : cleanSummary(summary)],
   );
   return publishTopic(t.id);
 }

@@ -207,14 +207,17 @@ function at(e, el) {
 }
 const isMenuKey = (e) => e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10');
 
+/** The GM's running summary of the topic; the title itself is only its key words. */
+const summaryOf = (t) => t?.summary?.trim() || '';
 function tooltip(t) {
   const ago = timeAgo(t.last_activity_at);
   const tags = t.tags?.length ? ` — ${t.tags.map((g) => `#${g}`).join(' ')}` : '';
-  return `${t.title}${tags} — ${t.message_count || 0} message${t.message_count === 1 ? '' : 's'} · active ${ago === 'now' ? 'now' : `${ago} ago`}`;
+  const summary = summaryOf(t);
+  return `${t.title}${tags} — ${t.message_count || 0} message${t.message_count === 1 ? '' : 's'} · active ${ago === 'now' ? 'now' : `${ago} ago`}${summary ? `\n${summary}` : ''}`;
 }
 function describe(t, state, unread) {
-  return [STATE_LABEL[state], unread ? `${unread} unread` : '', `${t.message_count || 0} messages`, t.tags?.length ? `Tags: ${t.tags.join(', ')}` : '']
-    .filter(Boolean).join('. ') + '.';
+  return [STATE_LABEL[state], unread ? `${unread} unread` : '', `${t.message_count || 0} messages`, t.tags?.length ? `Tags: ${t.tags.join(', ')}` : '', summaryOf(t)]
+    .filter(Boolean).map((x) => x.replace(/[.\s]+$/, '')).join('. ') + '.';
 }
 function highlight(text, needle) {
   const i = needle ? text.toLowerCase().indexOf(needle) : -1;
@@ -274,6 +277,7 @@ function TopicList({ topics, activeId, runs, busy, failed, unread, tier, allTags
           </div>
         ) : (
           <button type="button" data-row={t.id} onClick={() => onOpen(t)} aria-current={isActive ? 'true' : undefined}
+            title={summaryOf(t) || undefined} aria-describedby={summaryOf(t) ? `topic-row-${t.id}-d` : undefined}
             onContextMenu={(e) => openContextMenu(at(e, e.currentTarget), items(t, e.currentTarget.closest('li'), 'row'))}
             onKeyDown={(e) => {
               if (e.key === 'F2') { e.preventDefault(); setRenaming(t.id); }
@@ -288,13 +292,14 @@ function TopicList({ topics, activeId, runs, busy, failed, unread, tier, allTags
                 <span className="ml-auto text-[0.68rem] text-muted tabular shrink-0" title={dateTime(t.last_activity_at)}>{timeAgo(t.last_activity_at)}</span>
               </span>
               <span className="flex items-center gap-1 min-w-0">
-                {tags.slice(0, 3).map((g) => <TagChip key={g} tag={g} fluid />)}
-                {tags.length > 3 && <MoreChip tags={tags.slice(3)} />}
+                {tags.slice(0, 2).map((g) => <TagChip key={g} tag={g} fluid />)}
+                {tags.length > 2 && <MoreChip tags={tags.slice(2)} />}
                 <span className="ml-auto text-[0.68rem] text-muted tabular shrink-0">{metaLine(t, state)}</span>
               </span>
             </span>
           </button>
         )}
+        {summaryOf(t) && renaming !== t.id && <span id={`topic-row-${t.id}-d`} className="sr-only">{summaryOf(t)}</span>}
         <IconButton icon={Ellipsis} size="sm" label={`Actions for ${t.title}`} aria-haspopup="menu"
           className="mr-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100 focus-visible:outline-accent!"
           onClick={(e) => openContextMenu(at(e, e.currentTarget), items(t, e.currentTarget.closest('li'), 'row'))} />
@@ -512,7 +517,8 @@ export function TopicBar({ project, runs, onCompose }) {
     const state = topicState(t, runs, failed, busy);
     const n = isActive ? 0 : unread[t.id] || 0;
     const tags = t.tags || EMPTY;
-    const max = tier === 'full' ? 2 : isActive ? 1 : 0;
+    // The title is only key words now; a single chip (full tier) keeps them from being squeezed. The rest is in the tooltip.
+    const max = tier === 'full' ? 1 : 0;
     const shown = tags.slice(0, max);
     const rest = max ? tags.slice(max) : EMPTY;
     const editing = renaming === t.id;
@@ -532,7 +538,7 @@ export function TopicBar({ project, runs, onCompose }) {
         {editing
           ? <RenameInput topic={t} onDone={(kb) => { setRenaming(null); if (kb) focusTab(t.id); }}
             className="h-5 w-[9rem] px-1.5 -mx-1.5 rounded bg-sunken border border-accent outline-none text-[0.78rem] text-fg" />
-          : <span className={cx('truncate max-w-[9rem]', t.archived ? 'text-muted' : (n > 0 || isActive) && 'text-fg')}>{t.title || 'New topic'}</span>}
+          : <span className={cx('truncate max-w-[12rem]', t.archived ? 'text-muted' : (n > 0 || isActive) && 'text-fg')}>{t.title || 'New topic'}</span>}
         {(shown.length > 0 || rest.length > 0) && (
           <span aria-hidden className="flex items-center gap-1 min-w-0">
             {shown.map((g) => <TagChip key={g} tag={g} fluid />)}
@@ -554,16 +560,19 @@ export function TopicBar({ project, runs, onCompose }) {
   const tagTopic = tagsFor && topics.find((t) => t.id === tagsFor.id);
 
   return (
-    <div ref={stripRef} className="relative flex items-stretch h-10 shrink-0 border-b border-line bg-sunken/60">
+    <div ref={stripRef} className="@container relative flex items-stretch h-10 shrink-0 border-b border-line bg-sunken/60">
       {tier === 'collapsed' ? (
         <button ref={triggerRef} type="button" aria-haspopup="dialog" aria-expanded={listOpen} onClick={() => setListOpen(!listOpen)}
           aria-label={`Topic: ${active?.title || 'none'}. ${otherUnread} other topic${otherUnread === 1 ? '' : 's'} unread. Show all topics`}
+          title={active ? tooltip(active) : undefined} aria-describedby={summaryOf(active) ? 'topic-switcher-d' : undefined}
           className="flex-1 min-w-0 mx-2 self-center h-7 inline-flex items-center gap-1.5 px-2 rounded-md bg-raised border border-line shadow-sm text-[0.78rem] font-medium text-fg hover:border-line-strong aria-expanded:border-line-strong transition-colors focus-visible:outline-accent!">
           {active ? (
             <>
               <TopicLead state={topicState(active, runs, failed, busy)} active />
               <span className="truncate">{active.title || 'New topic'}</span>
-              <span className="tabular text-[0.68rem] text-muted shrink-0">{compact(active.message_count)}</span>
+              {/* Below 20rem (a 25% chat pane at 1024px) the count gives its room to the keyword title; it stays in the tooltip. */}
+              <span className="tabular text-[0.68rem] text-muted shrink-0 @max-[20rem]:hidden">{compact(active.message_count)}</span>
+              {summaryOf(active) && <span id="topic-switcher-d" className="sr-only">{summaryOf(active)}</span>}
             </>
           ) : <span className="truncate text-muted">{raw ? 'No topic yet' : 'Loading topics…'}</span>}
           {otherUnread > 0 && <span className="ml-auto inline-flex items-center gap-1 text-[0.68rem] text-muted tabular shrink-0"><span className="size-1.5 rounded-full bg-accent" />{otherUnread}</span>}
