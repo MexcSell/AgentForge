@@ -11,6 +11,7 @@ import { roleStyle, ROLE_STYLE } from '../../lib/icons.jsx';
 import { Modal } from '../../components/Modal.jsx';
 import { cx, AgentAvatar, Badge, Button, IconButton, Input, Field, Select, Textarea, Tabs, Empty, StatusDot, Spinner } from '../../components/ui.jsx';
 import { canMerge, mergeOriginal, MergeButton, MergeConfirm } from './merge.jsx';
+import { ConsolidateMenu, ConsolidateConfirm } from './consolidate.jsx';
 
 const TIERS = { 1: 'Executive Intelligence', 2: 'Management & Orchestration', 3: 'Specialist Teams', 4: 'Independent Verification', 5: 'Self-Evolution' };
 
@@ -51,14 +52,16 @@ function Registry() {
   const [q, setQ] = useState('');
   const [role, setRole] = useState('');
   const [merge, setMerge] = useState(null); // clone whose merge is being confirmed
+  const [consolidate, setConsolidate] = useState(null); // role whose consolidation is being confirmed
   const list = agents.filter((a) => (!role || a.role === role) && `${a.name} ${a.title} ${a.role} ${(a.skills || []).map((s) => s.name).join(' ')}`.toLowerCase().includes(q.toLowerCase()));
   const roles = [...new Set(agents.map((a) => a.role))].sort();
   return (
     <div className="h-full flex flex-col">
       <div className="flex items-center gap-2 px-4 py-2.5 border-b border-line">
-        <Input icon={Search} className="w-72" placeholder="Search name, role or skill…" value={q} onChange={(e) => setQ(e.target.value)} />
-        <Select value={role} onChange={(e) => setRole(e.target.value)} className="w-44"><option value="">All roles</option>{roles.map((r) => <option key={r} value={r}>{r}</option>)}</Select>
-        <span className="text-xs text-subtle ml-auto">{list.length} agents</span>
+        <Input icon={Search} className="w-72 min-w-0 shrink" placeholder="Search name, role or skill…" value={q} onChange={(e) => setQ(e.target.value)} />
+        <Select value={role} onChange={(e) => setRole(e.target.value)} className="w-44 min-w-0"><option value="">All roles</option>{roles.map((r) => <option key={r} value={r}>{r}</option>)}</Select>
+        <span className="text-xs text-subtle ml-auto whitespace-nowrap">{list.length} agents</span>
+        <ConsolidateMenu onPick={setConsolidate} />
       </div>
       <div className="flex-1 min-h-0 overflow-auto p-4 flex flex-col gap-6">
         {[1, 2, 3, 4, 5].map((tier) => {
@@ -74,6 +77,7 @@ function Registry() {
         {!list.length && <Empty icon={Bot} title="No agents match" />}
       </div>
       <MergeConfirm clone={merge} original={merge && mergeOriginal(merge, agents)} onClose={() => setMerge(null)} />
+      <ConsolidateConfirm role={consolidate} onClose={() => setConsolidate(null)} />
     </div>
   );
 }

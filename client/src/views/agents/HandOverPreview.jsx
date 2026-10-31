@@ -23,22 +23,27 @@ export function HandOverPreview({ url }) {
     return () => { live = false; };
   }, [url]);
   const moves = res?.url === url ? res.moves : null;
-  const byFrom = new Set(moves?.map((m) => m.from?.name)).size > 1;
-  const rest = moves?.slice(MAX) || [];
   return (
     <div aria-live="polite">
-      {!url ? null : !moves ? <div className="mt-3 text-[0.75rem] text-subtle">Checking pending work…</div>
-        : moves.length > 0 && (
-          <ul aria-label="Pending work handed over" className="mt-3 pt-3 border-t border-line space-y-1.5 text-[0.8rem] leading-snug">
-            {moves.slice(0, MAX).map((m) => (
-              <li key={m.task_id} className="break-words">
-                <div>{byFrom && m.from?.name && <><span className="text-fg">{m.from.name}</span>: </>}<span className="font-medium text-fg">{m.key}</span>{m.project_name && ` in ${m.project_name}`} will {target(m)}</div>
-                {m.title && <div className="truncate text-[0.72rem] text-subtle" title={m.title}>{m.title}</div>}
-              </li>
-            ))}
-            {rest.length > 0 && <li className="text-subtle" title={rest.map((m) => `${m.key}${m.project_name ? ` in ${m.project_name}` : ''}`).join('\n')}>+{rest.length} more</li>}
-          </ul>
-        )}
+      {!url ? null : !moves ? <div className="mt-3 text-[0.75rem] text-subtle">Checking pending work…</div> : <HandOverList moves={moves} />}
     </div>
+  );
+}
+
+/** The list part of HandOverPreview, for callers that already hold the moves (the consolidate preview returns them). */
+export function HandOverList({ moves }) {
+  const byFrom = new Set(moves.map((m) => m.from?.name)).size > 1;
+  const rest = moves.slice(MAX);
+  if (!moves.length) return null;
+  return (
+    <ul aria-label="Pending work handed over" className="mt-3 pt-3 border-t border-line space-y-1.5 text-[0.8rem] leading-snug">
+      {moves.slice(0, MAX).map((m) => (
+        <li key={m.task_id} className="break-words">
+          <div>{byFrom && m.from?.name && <><span className="text-fg">{m.from.name}</span>: </>}<span className="font-medium text-fg">{m.key}</span>{m.project_name && ` in ${m.project_name}`} will {target(m)}</div>
+          {m.title && <div className="truncate text-[0.72rem] text-subtle" title={m.title}>{m.title}</div>}
+        </li>
+      ))}
+      {rest.length > 0 && <li className="text-subtle" title={rest.map((m) => `${m.key}${m.project_name ? ` in ${m.project_name}` : ''}`).join('\n')}>+{rest.length} more</li>}
+    </ul>
   );
 }

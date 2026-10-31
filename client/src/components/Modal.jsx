@@ -61,14 +61,16 @@ export function Modal({ open, onClose, title, icon: Icon, subtitle, size = 'md',
   );
 }
 
-export function Confirm({ open, title, body, confirmLabel = 'Confirm', danger, onConfirm, onClose }) {
+/** `confirmDisabled` keeps the confirm button off (e.g. until an async preview says there is something to do). */
+export function Confirm({ open, title, body, confirmLabel = 'Confirm', danger, confirmDisabled, onConfirm, onClose }) {
   const [busy, setBusy] = useState(false);
+  const running = useRef(false); // a second click in the same tick, before busy re-renders, must not confirm twice
   return (
     <Modal open={open} onClose={onClose} title={title} size="sm"
       footer={<>
         <button className="h-8 px-3 rounded-lg text-[0.82rem] text-muted hover:bg-hover" onClick={onClose}>Cancel</button>
-        <button autoFocus disabled={busy} className={cx('h-8 px-3 rounded-lg text-[0.82rem] font-medium', danger ? 'bg-bad text-white hover:brightness-110' : 'grad-accent text-accent-fg')}
-          onClick={async () => { setBusy(true); try { await onConfirm(); onClose(); } finally { setBusy(false); } }}>{confirmLabel}</button>
+        <button autoFocus disabled={busy || confirmDisabled} className={cx('h-8 px-3 rounded-lg text-[0.82rem] font-medium disabled:opacity-45', danger ? 'bg-bad text-white hover:brightness-110' : 'grad-accent text-accent-fg')}
+          onClick={async () => { if (running.current) return; running.current = true; setBusy(true); try { await onConfirm(); onClose(); } finally { running.current = false; setBusy(false); } }}>{confirmLabel}</button>
       </>}>
       <div className="text-[0.85rem] text-muted leading-relaxed">{body}</div>
     </Modal>
