@@ -8,6 +8,7 @@ import { AgentWorkDialog, agentTasks, currentWork, TIER } from './AgentWorkDialo
 const STATE_OF = { running: 'working', done: 'completed', failed: 'failed', cancelled: 'cancelled', pending: 'queued' };
 const STATES = {
   working: { label: 'Working', text: 'text-accent', dot: 'bg-accent' },
+  orchestrating: { label: 'Orchestrating', text: 'text-accent', dot: 'bg-accent' }, // the GM without a task of its own during a mission
   completed: { label: 'Completed', text: 'text-ok', dot: 'bg-ok' },
   failed: { label: 'Failed', text: 'text-bad', dot: 'bg-bad' },
   cancelled: { label: 'Cancelled', text: 'text-subtle', dot: 'bg-subtle' },
@@ -17,6 +18,7 @@ const STATES = {
 const ALWAYS = ['working', 'completed', 'idle']; // the other states are only counted when present
 const LINE = { working: 'af-flow', completed: 'bg-ok' };
 const EMPTY = [];
+const IN_FLIGHT = ['planning', 'running'];
 
 // Connector geometry (calc() so it follows the font scale): a child's elbow leaves its parent's trunk, which hangs from the
 // parent's avatar centre (card border + p-2 + half the avatar), and enters the child's card at its avatar centre (li pt-1.5 on top).
@@ -65,19 +67,20 @@ export function orgTree(team, agents, managerId) {
 const stateOf = (task) => (task ? STATE_OF[task.status] || 'idle' : 'idle');
 const stateLabel = (task) => (task?.status === 'running' ? `Working ${Math.round(task.progress || 0)}%` : STATES[stateOf(task)].label);
 
-function OrgCard({ agent, gm, task, onOpen }) {
+function OrgCard({ agent, gm, task, orchestrating, onOpen }) {
   const level = agent.level || 1;
   const xp = agent.xp || 0;
   const xpPrev = 40 * (level - 1) ** 2;
   const xpNext = 40 * level ** 2;
   const xpPct = Math.max(0, Math.min(100, ((xp - xpPrev) / Math.max(1, xpNext - xpPrev)) * 100));
   const tier = TIER[agent.tier];
-  const state = stateOf(task);
-  const label = stateLabel(task);
+  const coordinating = gm && !task && orchestrating;
+  const state = coordinating ? 'orchestrating' : stateOf(task);
+  const label = coordinating ? STATES.orchestrating.label : stateLabel(task);
   const name = [agent.name, gm && 'General Manager', `L${level}${tier ? ` ${tier}` : ''}`, label, task && `${task.key} ${task.title}`].filter(Boolean).join(', ');
   return (
     <button type="button" onClick={onOpen} aria-label={name} data-agent={agent.id}
-      className={cx('block w-full min-w-0 text-left p-2 rounded-xl border transition-colors hover:border-accent/50', state === 'working' ? 'border-accent/40 bg-accent-soft/40' : 'border-line bg-raised')}>
+      className={cx('block w-full min-w-0 text-left p-2 rounded-xl border transition-colors hover:border-accent/50', state === 'working' || coordinating ? 'border-accent/40 bg-accent-soft/40' : 'border-line bg-raised')}>
       <span className="flex items-start gap-2 min-w-0">
         <AgentAvatar agent={agent} size={AVATAR} />
         <span className="min-w-0 flex-1">
@@ -102,7 +105,12 @@ function OrgCard({ agent, gm, task, onOpen }) {
             <Progress value={task.status === 'done' ? 100 : task.progress || 0} tone={task.status === 'done' ? 'ok' : task.status === 'failed' ? 'bad' : 'accent'} striped={state === 'working'} className="flex-1 min-w-0" />
             <span data-state={state} className={cx('shrink-0 text-[0.66rem] font-medium tabular', STATES[state].text)}>{label}</span>
           </span>
-        </> : (
+        </> : coordinating ? (
+          <span className="flex items-center gap-2 min-w-0">
+            <span className="flex-1 min-w-0 truncate text-[0.72rem] text-subtle">Coordinating the mission</span>
+            <span data-state="orchestrating" className={cx('shrink-0 text-[0.66rem] font-medium', STATES.orchestrating.text)}>{label}</span>
+          </span>
+        ) : (
           <span className="flex items-center gap-2 min-w-0">
             <span className="flex-1 min-w-0 truncate text-[0.72rem] text-subtle">No tasks in this project</span>
             <span data-state="idle" className="shrink-0 text-[0.66rem] font-medium text-subtle">Idle</span>
@@ -113,7 +121,7 @@ function OrgCard({ agent, gm, task, onOpen }) {
   );
 }
 
-function OrgNode({ node, depth, last, work, managerId, onOpen }) {
+function OrgNode({ node, depth, last, work, managerId, orchestrating, onOpen }) {
   const { agent } = node;
   const task = work.get(agent.id);
   const state = stateOf(task);
@@ -123,10 +131,10 @@ function OrgNode({ node, depth, last, work, managerId, onOpen }) {
         <span aria-hidden="true" className="absolute top-0 w-px bg-line-strong" style={{ left: TRUNK_X, ...(last ? { height: ELBOW_END } : { bottom: 0 }) }} />
         <span aria-hidden="true" data-line={state} className={cx('absolute h-px', LINE[state] || 'bg-line-strong')} style={{ left: TRUNK_X, top: ELBOW_Y, width: ELBOW_W }} />
       </>}
-      <OrgCard agent={agent} gm={agent.id === managerId} task={task} onOpen={(e) => onOpen(agent.id, e)} />
+      <OrgCard agent={agent} gm={agent.id === managerId} task={task} orchestrating={orchestrating} onOpen={(e) => onOpen(agent.id, e)} />
       {node.children.length > 0 && (
         <ul className="min-w-0">
-          {node.children.map((c, i) => <OrgNode key={c.agent.id} node={c} depth={depth + 1} last={i === node.children.length - 1} work={work} managerId={managerId} onOpen={onOpen} />)}
+          {node.children.map((c, i) => <OrgNode key={c.agent.id} node={c} depth={depth + 1} last={i === node.children.length - 1} work={work} managerId={managerId} orchestrating={orchestrating} onOpen={onOpen} />)}
         </ul>
       )}
     </li>
@@ -146,15 +154,23 @@ function Chip({ children, label }) {
 export function AgentOrg({ project, team }) {
   const agents = useStore((s) => s.agents);
   const tasks = useStore((s) => s.tasks[project.id]) || EMPTY;
+  const topics = useStore((s) => s.topics[project.id]) || EMPTY;
+  const missionsByTopic = useStore((s) => s.missionsByTopic);
   const [selected, setSelected] = useState(null);
   const opener = useRef(null);
   const roots = useMemo(() => orgTree(team, agents, project.manager_id), [team, agents, project.manager_id]);
   const work = useMemo(() => new Map(team.map((a) => [a.id, currentWork(agentTasks(tasks, a.id))])), [team, tasks]);
+  // The GM never holds mission tasks, so while the project is orchestrating it counts as orchestrating rather than idle.
+  const orchestrating = useMemo(() => topics.some((t) => t.running)
+    || Object.values(missionsByTopic).some((m) => m?.project_id === project.id && IN_FLIGHT.includes(m.status)), [topics, missionsByTopic, project.id]);
   const states = useMemo(() => {
     const n = Object.fromEntries(Object.keys(STATES).map((k) => [k, 0]));
-    for (const a of team) n[stateOf(work.get(a.id))]++;
+    for (const a of team) {
+      const task = work.get(a.id);
+      n[a.id === project.manager_id && !task && orchestrating ? 'orchestrating' : stateOf(task)]++;
+    }
     return Object.keys(STATES).filter((k) => ALWAYS.includes(k) || n[k]).map((k) => [k, n[k]]);
-  }, [team, work]);
+  }, [team, work, project.manager_id, orchestrating]);
   const open = (id, e) => { opener.current = e.currentTarget; setSelected(id); };
   const close = () => { setSelected(null); opener.current?.focus(); };
 
@@ -172,7 +188,7 @@ export function AgentOrg({ project, team }) {
         </div>
       </div>
       <ul aria-label="Team hierarchy" className="min-w-0 flex flex-col gap-1.5">
-        {roots.map((n) => <OrgNode key={n.agent.id} node={n} depth={0} work={work} managerId={project.manager_id} onOpen={open} />)}
+        {roots.map((n) => <OrgNode key={n.agent.id} node={n} depth={0} work={work} managerId={project.manager_id} orchestrating={orchestrating} onOpen={open} />)}
       </ul>
       <AgentWorkDialog project={project} agentId={selected} onClose={close} />
     </div>
