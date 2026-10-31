@@ -4,18 +4,18 @@ import { config } from '../config.js';
 import { emit } from '../events.js';
 import { getSettings } from '../db/seed.js';
 import { normalizeRole, roleInfo } from '../roles.js';
-import { getAgent, listAgents, createAgent, cloneAgent, publishAgent, refreshAgentStatus, withAgentLock, replacementFor, pickReplacement, mergeTarget } from '../services/agents.js';
+import { getAgent, listAgents, createAgent, cloneAgent, publishAgent, refreshAgentStatus, withAgentLock, replacementFor, pickReplacement, mergeTarget, originalOf, mergeMissionClones } from '../services/agents.js';
 import { getProject, publishProject, setProjectStatus } from '../services/projects.js';
 import { getTopic, createTopic, updateTopic, touchTopic, ensureTopic, publishTopic } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
 import { syncProject, touchedFiles, repoPaths } from '../services/git.js';
 import { PROVIDERS, resolveModel, runModel, recordRunUsage, publishModels } from '../models/index.js';
-import { heuristicPlan, topicTitle } from './heuristics.js';
-import { planPrompt, taskPrompt, commitPrompt, triagePrompt, parseJson, topicContext, inflightContext } from './prompts.js';
+import { heuristicPlan, topicTitle, topicSummary } from './heuristics.js';
+import { planPrompt, taskPrompt, commitPrompt, digestPrompt, triagePrompt, parseJson, topicContext, inflightContext } from './prompts.js';
 import { learn, analyzeMission } from './evolution.js';
 
-// Missions run in per-topic lanes: one at a time per topic (FIFO), different topics in parallel up to
-// settings.orchestrator.maxMissions per project. The lane is the mission's topic at submit time.
+// Missions run in per-topic lanes: one at a time per topic (FIFO), different topics in parallel with no project-wide
+// cap. The lane is the mission's topic at submit time.
 const active = new Map(); // missionId -> { projectId, topicId (lane), mission, controller, tasks (planned), phase ('done' once it will commit nothing more) }
 const queues = new Map(); // projectId -> [mission], oldest first
 const liveRuns = new Map(); // runId -> { agentId, taskId }
@@ -197,24 +197,15 @@ export async function submitCommand(projectId, { content, attachments = [], topi
   const mission = await one(`INSERT INTO missions(project_id, command, topic_id) VALUES ($1,$2,$3) RETURNING *`, [projectId, text, topic.id]);
   await query(`UPDATE messages SET mission_id = $2 WHERE id = $1`, [userMsg.id, mission.id]);
   mission.attachments = attachments;
-  const cap = await missionCap();
   queues.set(projectId, [...(queues.get(projectId) || []), mission]);
-  pump(projectId, cap);
-  // Started right away (in parallel with other topics): nothing to say.
+  pump(projectId);
+  // Started right away (in parallel with other topics): nothing to say. Only a busy topic makes an order wait.
   const waiting = queues.get(projectId) || [];
   if (waiting.includes(mission)) {
-    const mine = activeIn(projectId);
-    const content = mine.some((a) => inTopic(a, topic.id))
-      ? `Queued. I will start this after the current mission in this topic (${waiting.filter((m) => m.topic_id === topic.id).length} waiting here).`
-      : `Queued. ${mine.length} mission${mine.length === 1 ? ' is' : 's are'} already running in this project (limit ${cap}); this starts when one finishes.`;
+    const content = `Queued. I will start this after the current mission in this topic (${waiting.filter((m) => m.topic_id === topic.id).length} waiting here).`;
     await postMessage({ project_id: projectId, mission_id: mission.id, author_type: 'agent', agent_id: project.manager_id, kind: 'status', content });
   }
   return userMsg;
-}
-
-async function missionCap() {
-  const settings = await getSettings().catch(() => null);
-  return Math.max(1, Math.floor(Number(settings?.orchestrator.maxMissions)) || 3);
 }
 
 const activeIn = (projectId) => [...active.values()].filter((a) => a.projectId === projectId);
@@ -223,16 +214,13 @@ const activeIn = (projectId) => [...active.values()].filter((a) => a.projectId =
 // original topic still wait for it. Orders typed in the topic it moved to wait for it too, so a topic never runs two.
 const inTopic = (a, topicId) => a.topicId === topicId || a.mission.topic_id === topicId;
 
-/** Start every queued order that may run now: oldest first, never two in one topic, at most `cap` in the project. */
-function pump(projectId, cap) {
-  const mine = activeIn(projectId);
-  const busy = new Set(mine.flatMap((a) => [a.topicId, a.mission.topic_id]));
-  let running = mine.length;
+/** Start every queued order that may run now: oldest first, never two in one topic. */
+function pump(projectId) {
+  const busy = new Set(activeIn(projectId).flatMap((a) => [a.topicId, a.mission.topic_id]));
   const waiting = [];
   for (const m of queues.get(projectId) || []) {
-    if (running >= cap || busy.has(m.topic_id)) { waiting.push(m); continue; }
+    if (busy.has(m.topic_id)) { waiting.push(m); continue; }
     busy.add(m.topic_id);
-    running++;
     start(projectId, m);
   }
   if (waiting.length) queues.set(projectId, waiting);
@@ -246,7 +234,7 @@ function start(projectId, mission) {
     .catch((err) => console.error('[mission]', err))
     .finally(async () => {
       active.delete(mission.id);
-      pump(projectId, await missionCap());
+      pump(projectId);
       await settleProject(projectId).catch(() => {});
     });
 }
@@ -343,16 +331,25 @@ async function inflightMissions(projectId, missionId) {
   });
 }
 
-/** Name an untitled topic after its first order, or move a clearly unrelated order (and its mission) into a new topic. */
+/**
+ * Keep the topic's key-word title and summary current, or move a clearly unrelated order (and its mission) into a new
+ * topic. Every mission refreshes the summary; the title follows the planner's key words unless a human locked it.
+ */
 async function assignTopic({ project, gm, mission, topic, history, p, settings }) {
   const t = p.topic && typeof p.topic === 'object' ? p.topic : {};
-  const title = topicTitle(t.title) || topicTitle(mission.command);
+  const proposed = topicTitle(t.title);
+  const title = proposed || topicTitle(mission.command);
   const tags = Array.isArray(t.tags) ? t.tags.slice(0, 3) : undefined;
+  const summary = typeof t.summary === 'string' && t.summary.trim() ? t.summary : null;
   if (!history.length || t.new !== true || settings.orchestrator.autoTopics === false) {
-    if (!topic.title_locked && (!history.length || topic.title === 'New topic')) await updateTopic(topic.id, { title, tags });
+    const cur = (await getTopic(topic.id)) || topic; // a human may have renamed (locked) it while this order was planned
+    const untitled = !history.length || cur.title === 'New topic';
+    const patch = { summary: summary || cur.summary || topicSummary(mission.command) };
+    if (!cur.title_locked && (untitled || (proposed && proposed !== cur.title))) Object.assign(patch, { title: untitled ? title : proposed, tags });
+    await updateTopic(cur.id, patch);
     return;
   }
-  const fresh = await createTopic({ project_id: project.id, title, tags });
+  const fresh = await createTopic({ project_id: project.id, title, tags, summary: summary || topicSummary(mission.command) });
   await query(`UPDATE missions SET topic_id = $2 WHERE id = $1`, [mission.id, fresh.id]);
   const moved = await many(`UPDATE messages SET topic_id = $2 WHERE mission_id = $1 RETURNING id`, [mission.id, fresh.id]);
   mission.topic_id = fresh.id; // it keeps its original lane (the topic it was submitted in) until it finishes; see inTopic()
@@ -419,30 +416,81 @@ function skillScore(agent, task) {
   return task.skills.reduce((sum, s) => sum + (map[s] || 0), 0) + agent.level * 3 + (agent.status === 'idle' ? 15 : 0);
 }
 
-/** Pick, clone or recruit an agent for every task. Returns staffing notes for the chat. */
-async function staff(tasks, project) {
+// missionId -> ids of the clones leased to it, so they still merge when a project delete nulls lease_mission_id first.
+const leasedClones = new Map();
+
+/**
+ * A clone leased to mission for task t: of the original (the best live non-clone of the role, else the original behind
+ * from), or of a newly recruited original that stays in reserve when the role has none. Returns { agent, src, recruited }.
+ */
+async function leaseClone(t, project, mission, from = null) {
+  const best = (await listAgents()).filter((a) => a.role === t.role && a.origin !== 'cloned').sort((a, b) => skillScore(b, t) - skillScore(a, t))[0];
+  let src = (from && (await originalOf(from))) || best || null;
+  const recruited = !src;
+  if (recruited) src = await createAgent({ role: t.role, skills: t.skills?.length ? t.skills : undefined, mission: `Specialist recruited for ${project.name}: ${t.title}` });
+  const agent = await cloneAgent(src.id, `${t.role} work in ${project.name} (leased to this mission)`, { leaseMissionId: mission.id });
+  leasedClones.set(mission.id, (leasedClones.get(mission.id) || new Set()).add(agent.id));
+  return { agent, src, recruited };
+}
+
+// The staffing note for a leased clone: which case it was (the role's originals busy, or none of the role at all).
+const leaseNote = ({ agent, src, recruited }, t) => (recruited
+  ? `Recruited ${src.name} as a new ${roleInfo(t.role).title} (kept in reserve) and cloned ${agent.name} for ${t.key}; the clone merges back when the mission ends`
+  : `Cloned ${src.name} → ${agent.name} for ${t.key}: every ${roleInfo(t.role).title} is busy; the clone merges back into ${src.name} when the mission ends`);
+
+async function notifyLease(lease, t, project, mission) {
+  const { agent, src, recruited } = lease;
+  await notify(recruited
+    ? { source_type: 'manager', source_name: project.manager_name, project_id: project.id, agent_id: agent.id, level: 'success', title: `New agent ${src.name} · ${src.title} + clone ${agent.name}`, body: `No ${src.title} existed for "${t.title}": ${src.name} stays in reserve, ${agent.name} does the work and merges back when the mission ends` }
+    : { source_type: 'manager', source_name: project.manager_name, project_id: project.id, agent_id: agent.id, title: `${agent.name} cloned from ${src.name}`, body: `Every ${src.title} is busy — for "${t.title}"; merges back into ${src.name} when the mission ends` });
+}
+
+/**
+ * Pick, clone or recruit an agent for every task. (1) A live, idle original of the role (or a clone already leased to
+ * this mission) that holds no unrelated task of this plan. (2) Else a clone of the role's best original, leased to the
+ * mission. (3) With nobody of the role, a new original plus a leased clone of it. The executive is never cloned or
+ * recruited here: its task waits for it. Returns staffing notes for the chat.
+ */
+async function staff(tasks, project, mission) {
   const notes = [];
   const owned = new Map(); // agentId -> [taskKeys]
   const related = ancestors(tasks);
   for (const t of tasks) {
     const pool = (await listAgents()).filter((a) => a.role === t.role).sort((a, b) => skillScore(b, t) - skillScore(a, t));
-    let chosen = pool.find((a) => (owned.get(a.id) || []).every((k) => related(k, t.key)) && a.status !== 'working');
-    if (!chosen && pool.length) {
-      const src = pool[0];
-      chosen = await cloneAgent(src.id, `parallel ${t.role} work in ${project.name}`);
-      notes.push(`Cloned ${src.name} → ${chosen.name} for parallel ${roleInfo(t.role).title} work`);
-      await notify({ source_type: 'manager', source_name: project.manager_name, project_id: project.id, agent_id: chosen.id, title: `${chosen.name} cloned from ${src.name}`, body: `For "${t.title}"` });
-    }
-    if (!chosen) {
+    let chosen = pool.find((a) => (a.origin !== 'cloned' || a.lease_mission_id === mission.id)
+      && (owned.get(a.id) || []).every((k) => related(k, t.key)) && a.status !== 'working');
+    if (!chosen && t.role === 'executive') chosen = pool.find((a) => a.origin !== 'cloned') || pool[0];
+    if (!chosen && t.role === 'executive') {
       chosen = await createAgent({ role: t.role, skills: t.skills.length ? t.skills : undefined, mission: `Specialist recruited for ${project.name}: ${t.title}` });
       notes.push(`Recruited new agent ${chosen.name} (${chosen.title})`);
-      await notify({ source_type: 'manager', source_name: project.manager_name, project_id: project.id, agent_id: chosen.id, level: 'success', title: `New agent ${chosen.name} · ${chosen.title}`, body: `Created for "${t.title}"` });
+    }
+    if (!chosen) {
+      const lease = await leaseClone(t, project, mission);
+      chosen = lease.agent;
+      notes.push(leaseNote(lease, t));
+      await notifyLease(lease, t, project, mission);
     }
     owned.set(chosen.id, [...(owned.get(chosen.id) || []), t.key]);
     t.agent_id = chosen.id;
     t.agent_name = chosen.name;
   }
   return notes;
+}
+
+/**
+ * Mission over (done, failed, cancelled, or found finished on boot): merge its leased clones into their originals. A
+ * merged clone's pending work elsewhere is handed over and the projects it managed are republished.
+ */
+function mergeLeases(missionId) {
+  const ids = [...(leasedClones.get(missionId) || [])];
+  leasedClones.delete(missionId);
+  return mergeMissionClones(missionId, {
+    ids,
+    onMerged: async (cloneId, out) => {
+      for (const id of out.projects) await publishProject(id).catch(() => {});
+      await handOver(cloneId).catch((e) => console.error('[handover]', e.message));
+    },
+  }).catch((e) => console.error('[lease-merge]', e.message));
 }
 
 // ---- mission -------------------------------------------------------------
@@ -482,7 +530,7 @@ async function runMission(mission, signal) {
       return;
     }
 
-    const notes = await staff(tasks, project);
+    const notes = await staff(tasks, project, mission);
     const rows = [];
     for (const t of tasks) {
       const row = await one(
@@ -521,7 +569,9 @@ async function runMission(mission, signal) {
     const final = await many(`SELECT t.*, a.name AS agent_name FROM tasks t LEFT JOIN agents a ON a.id = t.agent_id WHERE t.mission_id = $1 AND t.origin <> 'proposal' ORDER BY t.created_at`, [mission.id]);
     const done = final.filter((t) => t.status === 'done').length;
     const status = signal.aborted ? 'cancelled' : done === final.length ? 'done' : 'failed';
-    const lines = final.map((t) => `- ${t.status === 'done' ? '✓' : t.status === 'cancelled' ? '⊘' : '✗'} **${t.key} ${t.title}** — ${t.agent_name || '—'}: ${(t.report?.summary || t.result || t.status).split('\n')[0].slice(0, 220)}`);
+    // Per-task lines: kept in the summary's meta for the client, and the summary body when the GM digest fails.
+    const taskLines = final.map((t) => ({ key: t.key, title: t.title, agent: t.agent_name || null, status: t.status, summary: (t.report?.summary || t.result || t.status).split('\n')[0].slice(0, 220) }));
+    const lines = taskLines.map((t) => `- ${t.status === 'done' ? '✓' : t.status === 'cancelled' ? '⊘' : '✗'} **${t.key} ${t.title}** — ${t.agent || '—'}: ${t.summary}`);
 
     // GitHub: upload the result when files may have changed. Any agent on an edit-capable provider
     // (canEdit: Claude Code, Codex CLI) can edit files, and syncProject is a no-op on a clean tree,
@@ -538,14 +588,16 @@ async function runMission(mission, signal) {
       if (log) github = `\n\n${syncReport(log)}${deferredNote(log)}`;
     } else if (self) self.phase = 'done';
 
-    // Measured after the sync so the GM's commit-message run is counted too.
+    const digest = await missionDigest({ project, gm, mission, final, signal });
+
+    // Measured after the sync and the digest so the GM's commit-message and digest runs are counted too.
     const usage = await one(`SELECT coalesce(sum(input_tokens + output_tokens),0) AS tokens, coalesce(sum(cost_usd),0) AS cost FROM runs WHERE mission_id = $1`, [mission.id]);
     const secs = Math.round((Date.now() - started) / 1000);
-    const summary = `**Mission ${status}** · ${done}/${final.length} tasks · ${fmtDuration(secs)} · ${Number(usage.tokens).toLocaleString()} tokens\n\n${lines.join('\n')}${github}`;
+    const summary = `**Mission ${status}** · ${done}/${final.length} tasks · ${fmtDuration(secs)} · ${Number(usage.tokens).toLocaleString()} tokens\n\n${digest || lines.join('\n')}${github}`;
 
     await query(`UPDATE missions SET status=$2, summary=$3, finished_at=now() WHERE id=$1`, [mission.id, status, summary]);
     await publishMission(mission.id);
-    await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'summary', content: summary, meta: { status, done, total: final.length } });
+    await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'summary', content: summary, meta: { status, done, total: final.length, digest: !!digest, tasks: taskLines } });
     await notify({
       source_type: 'manager', source_name: gm.name, agent_id: gm.id, project_id: project.id,
       level: status === 'done' ? 'success' : status === 'cancelled' ? 'warning' : 'error',
@@ -565,6 +617,7 @@ async function runMission(mission, signal) {
   } finally {
     // Stays 'working' while another mission of a project it manages is still planning or running.
     await refreshAgentStatus(gm.id);
+    await mergeLeases(mission.id);
     await publishProject(project.id).catch(() => {});
     await publishTopic(mission.topic_id).catch(() => {});
   }
@@ -635,7 +688,7 @@ async function schedule({ rows, project, gm, mission, settings, signal }) {
         wake ||= nextFinish(project.id); // taken with the check, so a finish during the post below still wakes it
         if (!announced.has(t.key)) {
           announced.add(t.key);
-          await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: await waitText(t, found) });
+          await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: await waitText(t, found), meta: { detail: true } });
         }
         continue;
       }
@@ -706,7 +759,7 @@ async function liveAgent({ task, project, gm, mission, signal }) {
     if (!(await one(`UPDATE tasks SET agent_id = $2 WHERE id = $1 AND agent_id IS NOT DISTINCT FROM $3::uuid RETURNING id`, [task.id, pick.agent.id, id]))) continue;
     task.agent_id = pick.agent.id;
     const content = handOverText(assigned || null, [{ ...pick, key: task.key }]);
-    await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content });
+    await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content, meta: { detail: true } });
     await notify({ source_type: 'manager', source_name: gm.name, project_id: project.id, agent_id: pick.agent.id, title: `${project.name}: ${pick.agent.name} takes over ${task.key}`, body: content });
     return pick.agent;
   }
@@ -736,7 +789,7 @@ export async function handOver(agentId) {
   for (const [missionId, moves] of byMission) {
     const project = await getProject(moves[0].task.project_id);
     const content = handOverText(gone, moves);
-    await postMessage({ project_id: project.id, mission_id: missionId, author_type: 'agent', agent_id: project.manager_id, kind: 'status', content });
+    await postMessage({ project_id: project.id, mission_id: missionId, author_type: 'agent', agent_id: project.manager_id, kind: 'status', content, meta: { detail: true } });
     await notify({ source_type: 'manager', source_name: project.manager_name, project_id: project.id, agent_id: moves[0].agent.id, title: `${project.name}: ${gone.name} ${gone.merged_into ? 'merged' : 'removed'} — work handed over`, body: content });
     for (const m of moves) await publishTask(m.task.id);
     projects.add(project.id);
@@ -799,12 +852,34 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
       return 'cancelled';
     }
     claimed = await claim(task, agent.id); // null: archived since it was read, look again
+    if (claimed === false && agent.role === 'executive') {
+      // Never cloned: wait for it to finish its other task.
+      await new Promise((r) => setTimeout(r, 2000));
+      continue;
+    }
     if (claimed === false) {
-      // The assigned agent is busy elsewhere: duplicate it rather than wait.
+      // The assigned agent is busy elsewhere: an idle original of the role takes the task, else a clone leased to this
+      // mission (of the busy agent's original, or of a new original when the role has none left).
       const busy = agent;
-      do agent = await cloneAgent(busy.id, 'busy in another mission');
-      while (!(await claim(task, agent.id)));
-      await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: `${busy.name} is busy — cloned ${agent.name} for ${task.key}.` });
+      let content = null;
+      for (const a of (await listAgents()).filter((x) => x.role === busy.role && x.origin !== 'cloned' && x.id !== busy.id && x.status !== 'working' && !x.active_tasks)) {
+        if (!(await claim(task, a.id))) continue;
+        agent = a;
+        content = `${busy.name} is busy — ${a.name} (idle ${roleInfo(a.role).title}) takes ${task.key}.`;
+        break;
+      }
+      if (!content) {
+        let lease;
+        do {
+          lease = await leaseClone(task, project, mission, busy);
+          agent = lease.agent;
+        } while (!(await claim(task, agent.id)));
+        content = lease.recruited
+          ? `${busy.name} is busy and no ${roleInfo(busy.role).title} original is left — recruited ${lease.src.name} (kept in reserve) and cloned ${agent.name} for ${task.key}; the clone merges back when the mission ends.`
+          : `${busy.name} is busy — cloned ${agent.name} from ${lease.src.name} for ${task.key}; it merges back into ${lease.src.name} when the mission ends.`;
+        await notifyLease(lease, task, project, mission);
+      }
+      await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content, meta: { detail: true } });
       claimed = true;
     }
   }
@@ -887,7 +962,7 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
   }
 
   if (!ok && attempt === 1 && settings.orchestrator.retryFailed && !errorText?.includes('limit reached')) {
-    await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: `${task.key} failed — asking ${agent.name} to retry once with the failure context.` });
+    await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: `${task.key} failed — asking ${agent.name} to retry once with the failure context.`, meta: { detail: true } });
     task.description = `${task.description}\n\nPREVIOUS ATTEMPT FAILED:\n${String(report.summary || errorText).slice(0, 1500)}\nFix the cause and complete the task.`;
     // 'running' again only on a live agent: one merged or removed since the first attempt is replaced as the retry starts.
     await query(`UPDATE tasks t SET description=$2, status = CASE WHEN EXISTS (SELECT 1 FROM agents a WHERE a.id = t.agent_id AND NOT a.archived) THEN 'running' ELSE t.status END WHERE t.id=$1`, [task.id, task.description]);
@@ -994,6 +1069,26 @@ export function commitMessageBuilder({ project, gm, mission, tasks = [], signal,
   };
 }
 
+/**
+ * The GM's digest of a finished mission: 3-8 short markdown lines with the main content only. Null when the mission
+ * was aborted or the run fails, times out or returns nothing; the caller then posts the per-task lines instead.
+ */
+async function missionDigest({ project, gm, mission, final, signal }) {
+  if (!gm || signal?.aborted) return null;
+  try {
+    const model = await resolveModel(gm.model_id);
+    const tasks = final.map((t) => ({ key: t.key, title: t.title, agent: t.agent_name, status: t.status, summary: t.report?.summary || t.result || '' }));
+    const { system, prompt } = digestPrompt({ project, gm, mission, tasks });
+    const out = await executeRun({ kind: 'digest', agent: gm, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'digest' }, timeoutMs: COMMIT_TIMEOUT });
+    const text = String(out.text || '').replace(/^\s*```[\w-]*\s*\n?|\n?\s*```\s*$/g, '').trim();
+    if (!text || signal?.aborted) return null;
+    return text.replace(/\n{3,}/g, '\n\n').slice(0, 4000);
+  } catch (err) {
+    console.error('[digest]', err.message);
+    return null;
+  }
+}
+
 /** "GitHub: …" status line, then the commit message (minus the AgentForge trailer) as a short quote. */
 function syncReport(log) {
   const lines = String(log.commit_message || '').split('\n');
@@ -1006,7 +1101,7 @@ function syncReport(log) {
 
 // ---- proposals, meetings, sync ------------------------------------------
 
-// A worker's proposal goes to its live line supervisor, else the GM, who approves, rejects or escalates it to the user.
+// A worker's proposal goes to its live line supervisor, else the GM; a supervisor may escalate it to the GM, who approves or rejects it.
 // Loop guard: a mission launches at most MAX_PROPOSAL_MISSIONS approved proposals, and a mission launched by a
 // proposal chain MAX_PROPOSAL_DEPTH deep launches none. The depth is the last line of the launched mission's order.
 const MAX_PROPOSAL_MISSIONS = 2;
@@ -1052,61 +1147,81 @@ async function deciderFor(proposer, gm) {
   return sup && !sup.archived ? sup : gm;
 }
 
-/** Asks the decider; a model error, unusable answer or abort escalates to the user, never approves. */
-async function triageProposal({ row, msg, proposer, report, project, gm, mission, signal }) {
-  const decider = await deciderFor(proposer, gm);
-  let verdict = 'escalate';
-  let reason = await proposalLimit(mission);
-  if (reason) verdict = 'reject';
-  else if (signal.aborted) reason = 'the mission was stopped before the proposal could be reviewed';
-  else {
-    try {
-      const model = await resolveModel(decider.model_id);
-      const inflight = inflightContext(await inflightMissions(project.id, mission.id));
-      const { system, prompt } = triagePrompt({
-        project, decider, proposer, relation: decider.id === gm.id ? 'General Manager' : 'line supervisor', command: mission.command,
-        summary: report.summary, proposal: row, inflight,
-      });
-      const out = await executeRun({ kind: 'triage', agent: decider, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'triage', task_id: row.id, title: row.title }, timeoutMs: TRIAGE_TIMEOUT });
-      const parsed = parseJson(out.text);
-      const said = String(parsed?.decision || '').trim().toLowerCase();
-      const why = String(parsed?.reason || '').replace(/\s+/g, ' ').trim().slice(0, 500);
-      if (signal.aborted) reason = 'the mission was stopped during the review';
-      else if (!['approve', 'reject', 'escalate'].includes(said)) reason = 'no valid decision came back from the review';
-      else [verdict, reason] = [said, why || 'no reason given'];
-    } catch (err) {
-      reason = signal.aborted ? 'the mission was stopped during the review' : `the review failed (${String(err.message).slice(0, 200)})`;
-    }
+/** One triage run: { verdict, reason }, verdict null when the answer is unusable, the model fails or the run is aborted. */
+async function askTriage({ decider, gm, row, proposer, report, project, mission, signal, escalation = null }) {
+  if (signal.aborted) return { verdict: null, reason: 'the mission was stopped before the proposal could be reviewed', aborted: true };
+  try {
+    const model = await resolveModel(decider.model_id);
+    const inflight = inflightContext(await inflightMissions(project.id, mission.id));
+    const { system, prompt } = triagePrompt({
+      project, decider, proposer, relation: decider.id === gm.id ? 'General Manager' : 'line supervisor', command: mission.command,
+      summary: report.summary, proposal: row, inflight, escalation,
+    });
+    const out = await executeRun({ kind: 'triage', agent: decider, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'triage', task_id: row.id, title: row.title, escalated: !!escalation }, timeoutMs: TRIAGE_TIMEOUT });
+    const parsed = parseJson(out.text);
+    const said = String(parsed?.decision || '').trim().toLowerCase();
+    const why = String(parsed?.reason || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+    if (signal.aborted) return { verdict: null, reason: 'the mission was stopped during the review', aborted: true };
+    if (!['approve', 'reject', 'escalate'].includes(said)) return { verdict: null, reason: 'no valid decision came back from the review' };
+    return { verdict: said, reason: why || 'no reason given' };
+  } catch (err) {
+    return signal.aborted ? { verdict: null, reason: 'the mission was stopped during the review', aborted: true } : { verdict: null, reason: `the review failed (${String(err.message).slice(0, 200)})` };
   }
-  if (verdict !== 'approve') return decideProposal({ row, msg, decider, project, mission, verdict, reason });
+}
+
+const proposalName = (msg, row) => `${msg.agent_name ? `${msg.agent_name}'s` : 'the'} proposal "${row.title}"`;
+const sentence = (text) => (/[.!?…]$/.test(text) ? text : `${text}.`);
+
+/**
+ * Agents decide proposals themselves; none reaches the user. A line supervisor's escalation (or failed review) hands the
+ * proposal up to the GM, who only approves or rejects. Anything else from the GM, a model error or an abort rejects it.
+ */
+async function triageProposal({ row, msg, proposer, report, project, gm, mission, signal }) {
+  let decider = await deciderFor(proposer, gm);
+  const limit = await proposalLimit(mission);
+  if (limit) return decideProposal({ row, msg, decider, project, mission, verdict: 'reject', reason: limit });
+  let answer = await askTriage({ decider, gm, row, proposer, report, project, mission, signal });
+  let escalation = null;
+  if (decider.id !== gm.id && !answer.aborted && answer.verdict !== 'approve' && answer.verdict !== 'reject') {
+    // Decided elsewhere meanwhile (a manual approve/reject): nothing to hand up.
+    if (!(await one(`SELECT 1 FROM tasks WHERE id = $1 AND status = 'proposed'`, [row.id]))) return null;
+    escalation = { by: decider.name, by_id: decider.id, reason: answer.reason };
+    await postMessage({
+      project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: decider.id, kind: 'status',
+      content: `Escalated ${proposalName(msg, row)} to ${gm.name}: ${sentence(answer.reason)}`, meta: { task_id: row.id, escalation, detail: true },
+    });
+    decider = gm;
+    answer = await askTriage({ decider, gm, row, proposer, report, project, mission, signal, escalation });
+  }
+  let { verdict, reason } = answer;
+  if (verdict === 'escalate') [verdict, reason] = ['reject', `escalated instead of deciding (${reason.replace(/[.!?…]$/, '')}), so it is rejected to stay safe`];
+  else if (verdict !== 'approve' && verdict !== 'reject') [verdict, reason] = ['reject', answer.aborted ? reason : `${reason}, so it is rejected to stay safe`];
+  if (verdict !== 'approve') return decideProposal({ row, msg, decider, project, mission, verdict, reason, escalation });
   // Approvals of one mission are counted and launched one at a time.
   return withAgentLock('proposals', mission.id, async () => {
     const limit = await proposalLimit(mission);
-    return decideProposal({ row, msg, decider, project, mission, verdict: limit ? 'reject' : 'approve', reason: limit || reason });
+    return decideProposal({ row, msg, decider, project, mission, verdict: limit ? 'reject' : 'approve', reason: limit || reason, escalation });
   });
 }
 
-/** Applies a verdict, records it on the proposal message and says it in the chat. A proposal decided meanwhile is left alone. */
-async function decideProposal({ row, msg, decider, project, mission, verdict, reason }) {
+/** Applies an approve/reject verdict, records it on the proposal message and says it in the chat. A proposal decided meanwhile is left alone. */
+async function decideProposal({ row, msg, decider, project, mission, verdict, reason, escalation = null }) {
   let approved = null;
   if (verdict === 'approve') {
     approved = await claimProposal(row.id, decider.name);
     if (!approved) return null;
   } else {
-    const result = verdict === 'reject' ? `Rejected by ${decider.name}: ${reason}` : `Escalated by ${decider.name}: ${reason}`;
-    const done = await one(`UPDATE tasks SET status = CASE WHEN $3 THEN 'cancelled' ELSE status END, result=$2 WHERE id=$1 AND status='proposed' RETURNING id`, [row.id, result, verdict === 'reject']);
+    verdict = 'reject';
+    const done = await one(`UPDATE tasks SET status='cancelled', result=$2 WHERE id=$1 AND status='proposed' RETURNING id`, [row.id, `Rejected by ${decider.name}: ${reason}`]);
     if (!done) return null;
     await publishTask(row.id);
   }
-  const decision = { by: decider.name, by_id: decider.id, verdict, reason };
+  const decision = { by: decider.name, by_id: decider.id, verdict, reason, ...(escalation ? { escalation } : {}) };
   const updated = await one(`UPDATE messages SET meta = meta || $2 WHERE id = $1 RETURNING id`, [msg.id, { decision }]);
   if (updated) emit('message:update', await one(`SELECT m.*, a.name AS agent_name, a.role AS agent_role, a.title AS agent_title FROM messages m LEFT JOIN agents a ON a.id = m.agent_id WHERE m.id = $1`, [msg.id]));
-  const what = `${msg.agent_name ? `${msg.agent_name}'s` : 'the'} proposal "${row.title}"`;
-  const why = /[.!?…]$/.test(reason) ? reason : `${reason}.`;
-  const content = verdict === 'approve' ? `Approved ${what}: ${why} Starting it as a new mission.`
-    : verdict === 'reject' ? `Rejected ${what}: ${why}`
-      : `Escalated ${what} to you: ${why} Approve or reject it above.`;
-  await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: decider.id, kind: 'status', content, meta: { task_id: row.id, decision } });
+  const what = proposalName(msg, row);
+  const content = verdict === 'approve' ? `Approved ${what}: ${sentence(reason)} Starting it as a new mission.` : `Rejected ${what}: ${sentence(reason)}`;
+  await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: decider.id, kind: 'status', content, meta: { task_id: row.id, decision, detail: true } });
   if (approved) await launchProposal(approved);
   return verdict;
 }
@@ -1155,6 +1270,11 @@ export async function recoverInterrupted() {
   await query(`UPDATE runs SET status='failed', error='interrupted', finished_at=now() WHERE status='running'`);
   await query(`UPDATE agents SET status='idle', current_task_id=NULL WHERE status <> 'idle'`);
   await query(`UPDATE projects SET status='idle' WHERE status <> 'idle'`);
+  // Leased clones of missions that ended (now, or before a crash cut their merge short) go back into their originals.
+  const ended = await many(
+    `SELECT DISTINCT a.lease_mission_id AS id FROM agents a JOIN missions m ON m.id = a.lease_mission_id
+     WHERE NOT a.archived AND a.origin = 'cloned' AND m.status NOT IN ('planning', 'running')`);
+  for (const m of ended) await mergeLeases(m.id);
 }
 
 export { publishAgent };

@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import { ROLES } from '../roles.js';
 
 export const DEFAULT_SETTINGS = {
-  orchestrator: { maxParallel: 3, maxMissions: 3, taskTimeoutMin: 30, autoApproveProposals: false, proposalTriage: true, verification: true, retryFailed: true },
+  orchestrator: { maxParallel: 3, taskTimeoutMin: 30, autoApproveProposals: false, proposalTriage: true, verification: true, retryFailed: true },
   github: { autoSync: true, userName: config.github.userName, userEmail: config.github.userEmail, branch: 'main' },
   evolution: { enabled: true, playbookSize: 8, lessonsPerVersion: 4 },
   monitor: { enabled: true, intervalSec: 3 },
@@ -33,11 +33,11 @@ const MODELS = [
 
 // [name, role, supervisor, skills{name:level}, mission, model]
 const AGENTS = [
-  ['Atlas', 'executive', null, { strategy: 80, prioritization: 78, risk: 70 }, 'Sets objectives and priorities across every project.'],
-  ['Darwin', 'evolution', 'Atlas', { 'org-design': 75, evaluation: 72, experimentation: 70 }, 'Improves the agent organization: roles, playbooks and team structure.'],
-  ['Archer', 'architect', 'Atlas', { 'system-design': 85, 'api-design': 80, adr: 70 }, 'Owns architecture, standards and technical decisions.'],
-  ['Lens', 'reviewer', 'Atlas', { 'code-review': 82, standards: 78 }, 'Independently verifies work. Never reports to the authors it reviews.'],
-  ['Scout', 'research', 'Atlas', { research: 80, analysis: 75, comparison: 72 }, 'Researches technologies, options and prior art.'],
+  ['AgentForge Agent', 'executive', null, { strategy: 80, prioritization: 78, risk: 70 }, 'Sets objectives and priorities across every project.'],
+  ['Darwin', 'evolution', 'AgentForge Agent', { 'org-design': 75, evaluation: 72, experimentation: 70 }, 'Improves the agent organization: roles, playbooks and team structure.'],
+  ['Archer', 'architect', 'AgentForge Agent', { 'system-design': 85, 'api-design': 80, adr: 70 }, 'Owns architecture, standards and technical decisions.'],
+  ['Lens', 'reviewer', 'AgentForge Agent', { 'code-review': 82, standards: 78 }, 'Independently verifies work. Never reports to the authors it reviews.'],
+  ['Scout', 'research', 'AgentForge Agent', { research: 80, analysis: 75, comparison: 72 }, 'Researches technologies, options and prior art.'],
   ['Pixel', 'frontend', 'Archer', { react: 85, css: 82, typescript: 75, accessibility: 60 }, 'Builds fast, accessible, beautiful interfaces.'],
   ['Kernel', 'backend', 'Archer', { node: 86, fastify: 76, rest: 80, postgres: 70 }, 'Builds reliable APIs and services.'],
   ['Iris', 'designer', 'Archer', { ux: 85, ui: 86, 'design-systems': 76 }, 'Designs flows, layouts and visual systems.'],
@@ -79,7 +79,8 @@ export async function seed() {
     }
   }
 
-  // The AgentForge platform itself is a protected, undeletable project.
+  // The AgentForge platform itself is a protected, undeletable project, run by the executive as its GM.
+  const { executiveId } = await import('../services/agents.js');
   const core = await one(`SELECT id FROM projects WHERE protected = true LIMIT 1`);
   if (!core) {
     const { createProjectRecord } = await import('../services/projects.js');
@@ -89,8 +90,39 @@ export async function seed() {
       github_url: config.github.url,
       description: 'Develop the AgentForge platform itself. Every completed change is pushed to GitHub and the service restarts safely.',
       protected: true,
+      manager_id: await executiveId(),
     });
+  } else if (!config.candidate) {
+    await adoptCoreProject(core.id, await executiveId());
   }
+}
+
+/**
+ * Make the executive the GM of the protected project (id). The GM it replaces is retired like a deleted project's GM:
+ * archived with its history, reports moved to the executive, pending work handed over. Skipped on a health-check
+ * candidate boot, which runs beside the live server and its missions; a real boot runs after the old process is gone.
+ */
+async function adoptCoreProject(id, exec) {
+  const core = await one(`SELECT id, name, manager_id FROM projects WHERE id = $1`, [id]);
+  if (!exec || !core || core.manager_id === exec) return;
+  const { retireAgent, refreshAgentStatus } = await import('../services/agents.js');
+  const { publishProject } = await import('../services/projects.js');
+  const { handOver } = await import('../orchestrator/engine.js');
+  const { audit } = await import('../services/notify.js');
+  const { emit } = await import('../events.js');
+  await query(`UPDATE projects SET manager_id = $2, updated_at = now() WHERE id = $1`, [core.id, exec]);
+  const old = core.manager_id && (await one(`SELECT id, name FROM agents WHERE id = $1 AND NOT archived`, [core.manager_id]));
+  // retireAgent refuses an executive; a GM that still runs another project keeps working there.
+  const retired = old && !(await one(`SELECT 1 FROM projects WHERE manager_id = $1`, [old.id])) && (await retireAgent(old.id, exec));
+  if (retired) {
+    emit('agent:delete', { id: old.id });
+    await handOver(old.id).catch((e) => console.error('[handover]', e.message));
+  } else if (old) {
+    await refreshAgentStatus(old.id).catch(() => {});
+  }
+  await refreshAgentStatus(exec).catch(() => {});
+  await publishProject(core.id).catch(() => {});
+  await audit('system', 'project.manager', core.name, { from: old?.id || null, fromName: old?.name || null, to: exec, retired: !!retired });
 }
 
 export async function getSettings() {
