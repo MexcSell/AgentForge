@@ -68,7 +68,7 @@ function RateLimit({ info }) {
 
 function ModelDialog({ open, model, onClose }) {
   const providers = PROVIDER_STYLE;
-  const blank = { name: '', provider: 'claude-code', model: 'claude-sonnet-5-5', base_url: '', api_key: '', limits: { dailyTokens: 2000000, weeklyTokens: 10000000, dailyPrompts: 400, weeklyPrompts: 2000, resetHour: 0, weeklyResetDay: 1 }, config: { permissionMode: 'acceptEdits', effort: '' } };
+  const blank = { name: '', provider: 'claude-code', model: 'claude-sonnet-5-5', base_url: '', api_key: '', limits: { dailyTokens: 2000000, weeklyTokens: 10000000, dailyPrompts: 400, weeklyPrompts: 2000, resetHour: 0, weeklyResetDay: 1 }, config: { effort: '' } };
   const [f, setF] = useState(blank);
   const [busy, setBusy] = useState(false);
   const [last, setLast] = useState(null);
@@ -107,13 +107,10 @@ function ModelDialog({ open, model, onClose }) {
           {(f.provider === 'openai' || f.provider === 'anthropic') && <Field label="API key" hint={model?.has_api_key ? 'A key is stored. Leave blank to keep it.' : 'Stored server-side; never sent to the browser.'}><Input icon={KeyRound} type="password" value={f.api_key} onChange={(e) => setF({ ...f, api_key: e.target.value })} /></Field>}
           {f.provider === 'claude-code' && (
             <>
-              <Field label="Permission mode (write tasks)" hint="Read-only agents never get edit tools.">
-                <Select value={f.config.permissionMode} onChange={(e) => setF({ ...f, config: { ...f.config, permissionMode: e.target.value } })}>
-                  <option value="acceptEdits">acceptEdits — edit files, allow-listed commands</option>
-                  <option value="default">default — read-only unless allow-listed</option>
-                  <option value="bypassPermissions">bypassPermissions — sandboxes only</option>
-                </Select>
-              </Field>
+              <div className="flex flex-col gap-1.5">
+                <span className="text-[0.72rem] font-medium uppercase tracking-wider text-subtle">Permissions</span>
+                <span className="min-h-8 flex items-center text-xs text-subtle">Full authority — every agent runs with bypassPermissions; no tool needs approval.</span>
+              </div>
               <Field label="Effort"><Select value={f.config.effort || ''} onChange={(e) => setF({ ...f, config: { ...f.config, effort: e.target.value } })}><option value="">Model default</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option><option value="max">max</option></Select></Field>
             </>
           )}

@@ -343,11 +343,11 @@ async function runMission(mission, signal) {
     const status = signal.aborted ? 'cancelled' : done === final.length ? 'done' : 'failed';
     const lines = final.map((t) => `- ${t.status === 'done' ? '✓' : t.status === 'cancelled' ? '⊘' : '✗'} **${t.key} ${t.title}** — ${t.agent_name || '—'}: ${(t.report?.summary || t.result || t.status).split('\n')[0].slice(0, 220)}`);
 
-    // GitHub: upload the result when files may have changed.
+    // GitHub: upload the result when files may have changed. Any claude-code agent can edit files,
+    // and syncProject is a no-op on a clean tree, so role access is not checked here.
     const wrote = !!(await one(
       `SELECT 1 FROM runs r JOIN models m ON m.id = r.model_id JOIN tasks t ON t.id = r.task_id
-       WHERE r.mission_id = $1 AND r.status = 'done' AND m.provider = 'claude-code' AND t.status = 'done' LIMIT 1`, [mission.id]))
-      && final.some((t) => t.status === 'done' && roleInfo(t.role).access === 'write');
+       WHERE r.mission_id = $1 AND r.status = 'done' AND m.provider = 'claude-code' AND t.status = 'done' LIMIT 1`, [mission.id]));
     project = await getProject(project.id);
     let github = '';
     if (wrote && project.auto_sync && settings.github.autoSync && !signal.aborted) {

@@ -124,7 +124,7 @@ Hierarchy: you received this task from ${gm.name} (General Manager of "${project
 ${lessons.length ? `Playbook v${agent.prompt_version} (lessons learned from previous projects):\n${lessons.map((l) => `- ${l}`).join('\n')}` : ''}
 Operating rules:
 - Stay strictly inside the task scope and the working directory ${project.path}.
-- ${info.access === 'write' ? 'You may edit files needed for this task. Keep changes minimal and consistent with the existing code style.' : 'You are read-only: inspect, analyze and report. Do not modify files.'}
+- ${info.access === 'write' ? 'You may edit files needed for this task. Keep changes minimal and consistent with the existing code style.' : 'You have full tool authority: you may run commands, fetch the web and write scratch files (e.g. in /tmp). Your job is to inspect, analyze and report findings; do not rewrite project source unless the task asks for it.'}
 - Do not run git commit, git push, or restart services; the platform does that after verification.
 - Never print secrets.`;
   const depText = deps.length

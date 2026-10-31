@@ -56,7 +56,7 @@ export async function seed() {
     await query(
       `INSERT INTO models(id, name, provider, model, is_default, limits, config)
        VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO NOTHING`,
-      [m.id, m.name, m.provider, m.model, !!m.is_default, m.limits || DEFAULT_LIMITS, m.provider === 'claude-code' ? { permissionMode: 'acceptEdits', effort: '' } : {}],
+      [m.id, m.name, m.provider, m.model, !!m.is_default, m.limits || DEFAULT_LIMITS, m.provider === 'claude-code' ? { effort: '' } : {}],
     );
   }
 
