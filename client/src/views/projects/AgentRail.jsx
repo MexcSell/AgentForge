@@ -3,6 +3,7 @@ import { Bot, CircleCheck, CircleX, Ban, Wrench, Brain, MessageSquareText, Users
 import { useStore } from '../../lib/store.js';
 import { duration, timeAgo } from '../../lib/format.js';
 import { cx, AgentAvatar, Progress, Tabs, Empty, Badge } from '../../components/ui.jsx';
+import { AgentOrg } from './AgentOrg.jsx';
 
 function lastActivity(events) {
   const e = [...(events || [])].reverse().find((x) => ['tool_use', 'text', 'thinking', 'status'].includes(x.type));
@@ -40,6 +41,7 @@ export function AgentRail({ project }) {
           { id: 'running', label: 'Running', count: running.length },
           { id: 'done', label: 'Completed', count: finished.length },
           { id: 'team', label: 'Team', count: team.length },
+          { id: 'org', label: 'Org', count: team.length },
           ...(proposals.length ? [{ id: 'proposals', label: 'Ideas', count: proposals.length }] : []),
         ]} />
       </div>
@@ -81,6 +83,8 @@ export function AgentRail({ project }) {
             {a.id === project.manager_id && <Badge tone="accent">GM</Badge>}
           </button>
         )) : <Empty icon={Users} title="No team yet" />)}
+
+        {tab === 'org' && <AgentOrg project={project} team={team} />}
 
         {tab === 'proposals' && proposals.map((t) => (
           <div key={t.id} className="p-2.5 rounded-lg border border-warn/40 bg-warn-soft/40">
