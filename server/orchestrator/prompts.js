@@ -208,11 +208,11 @@ Do the work now. When finished, end your reply with a JSON report in a \`\`\`jso
 
 /**
  * A worker's proposal goes to its line supervisor (or the GM) instead of the user. A supervisor approves, rejects or
- * escalates to the GM; the GM (relation 'General Manager') only approves or rejects, so the agents decide it all.
+ * escalates to the GM; a final decider (the GM, relation 'General Manager', or an executive line supervisor) only
+ * approves or rejects, so the agents decide it all. `final` defaults to relation === 'General Manager'.
  */
-export function triagePrompt({ project, decider, proposer, relation, command, summary, proposal, inflight = '', escalation = null }) {
-  const gm = relation === 'General Manager';
-  const options = gm
+export function triagePrompt({ project, decider, proposer, relation, final = relation === 'General Manager', command, summary, proposal, inflight = '', escalation = null }) {
+  const options = final
     ? `- "approve": the work is useful, within the project's current direction and the spirit of the user's order, safe and proportionate. It starts as a new mission right away.
 - "reject": the work is unnecessary, duplicates what is done or in flight, is speculative or low value, or is out of scope.
 You are the final decider: nobody above you reviews this, and there is no escalation. Reject work that is destructive (deleting data, files or features, rewriting history), changes the scope or the product direction, or carries security or cost risk, unless the user's order clearly asks for exactly that. When in doubt, reject with a reason.`
@@ -247,6 +247,6 @@ ${String(proposal.description || '').slice(0, 2000)}
 """
 ${escalation ? `\nESCALATION FROM ${escalation.by.toUpperCase()} (line supervisor), reason:\n"""\n${String(escalation.reason || '(none)').slice(0, 600)}\n"""\n` : ''}${inflight ? `\nIN-FLIGHT MISSIONS IN OTHER TOPICS (same working tree, running now):\n${inflight}\n` : ''}
 Respond with ONLY one JSON object in a \`\`\`json block:
-{ "decision": ${gm ? '"approve" | "reject"' : '"approve" | "reject" | "escalate"'}, "reason": "one or two sentences" }`;
+{ "decision": ${final ? '"approve" | "reject"' : '"approve" | "reject" | "escalate"'}, "reason": "one or two sentences" }`;
   return { system, prompt };
 }

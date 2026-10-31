@@ -1102,6 +1102,7 @@ function syncReport(log) {
 // ---- proposals, meetings, sync ------------------------------------------
 
 // A worker's proposal goes to its live line supervisor, else the GM; a supervisor may escalate it to the GM, who approves or rejects it.
+// An executive line supervisor is final like the GM: it outranks every project GM, so it only approves or rejects.
 // Loop guard: a mission launches at most MAX_PROPOSAL_MISSIONS approved proposals, and a mission launched by a
 // proposal chain MAX_PROPOSAL_DEPTH deep launches none. The depth is the last line of the launched mission's order.
 const MAX_PROPOSAL_MISSIONS = 2;
@@ -1142,19 +1143,23 @@ export async function rejectProposal(taskId, { by = null, reason = '' } = {}) {
   return publishTask(taskId);
 }
 
+/** { decider, final }: the live line supervisor, else the GM. The GM and an executive decide finally (no escalation). */
 async function deciderFor(proposer, gm) {
   const sup = proposer.supervisor_id ? await getAgent(proposer.supervisor_id).catch(() => null) : null;
-  return sup && !sup.archived ? sup : gm;
+  const decider = sup && !sup.archived ? sup : gm;
+  return { decider, final: decider.id === gm.id || decider.role === 'executive' };
 }
 
+const triageRelation = (decider, gm) => (decider.id === gm.id ? 'General Manager' : decider.role === 'executive' ? 'executive (top-level manager)' : 'line supervisor');
+
 /** One triage run: { verdict, reason }, verdict null when the answer is unusable, the model fails or the run is aborted. */
-async function askTriage({ decider, gm, row, proposer, report, project, mission, signal, escalation = null }) {
+async function askTriage({ decider, final, gm, row, proposer, report, project, mission, signal, escalation = null }) {
   if (signal.aborted) return { verdict: null, reason: 'the mission was stopped before the proposal could be reviewed', aborted: true };
   try {
     const model = await resolveModel(decider.model_id);
     const inflight = inflightContext(await inflightMissions(project.id, mission.id));
     const { system, prompt } = triagePrompt({
-      project, decider, proposer, relation: decider.id === gm.id ? 'General Manager' : 'line supervisor', command: mission.command,
+      project, decider, proposer, relation: triageRelation(decider, gm), final, command: mission.command,
       summary: report.summary, proposal: row, inflight, escalation,
     });
     const out = await executeRun({ kind: 'triage', agent: decider, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'triage', task_id: row.id, title: row.title, escalated: !!escalation }, timeoutMs: TRIAGE_TIMEOUT });
@@ -1174,15 +1179,16 @@ const sentence = (text) => (/[.!?…]$/.test(text) ? text : `${text}.`);
 
 /**
  * Agents decide proposals themselves; none reaches the user. A line supervisor's escalation (or failed review) hands the
- * proposal up to the GM, who only approves or rejects. Anything else from the GM, a model error or an abort rejects it.
+ * proposal up to the GM, who only approves or rejects. An executive line supervisor is final like the GM. Anything else
+ * from a final decider, a model error or an abort rejects it.
  */
 async function triageProposal({ row, msg, proposer, report, project, gm, mission, signal }) {
-  let decider = await deciderFor(proposer, gm);
+  let { decider, final } = await deciderFor(proposer, gm);
   const limit = await proposalLimit(mission);
   if (limit) return decideProposal({ row, msg, decider, project, mission, verdict: 'reject', reason: limit });
-  let answer = await askTriage({ decider, gm, row, proposer, report, project, mission, signal });
+  let answer = await askTriage({ decider, final, gm, row, proposer, report, project, mission, signal });
   let escalation = null;
-  if (decider.id !== gm.id && !answer.aborted && answer.verdict !== 'approve' && answer.verdict !== 'reject') {
+  if (!final && !answer.aborted && answer.verdict !== 'approve' && answer.verdict !== 'reject') {
     // Decided elsewhere meanwhile (a manual approve/reject): nothing to hand up.
     if (!(await one(`SELECT 1 FROM tasks WHERE id = $1 AND status = 'proposed'`, [row.id]))) return null;
     escalation = { by: decider.name, by_id: decider.id, reason: answer.reason };
@@ -1190,8 +1196,8 @@ async function triageProposal({ row, msg, proposer, report, project, gm, mission
       project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: decider.id, kind: 'status',
       content: `Escalated ${proposalName(msg, row)} to ${gm.name}: ${sentence(answer.reason)}`, meta: { task_id: row.id, escalation, detail: true },
     });
-    decider = gm;
-    answer = await askTriage({ decider, gm, row, proposer, report, project, mission, signal, escalation });
+    [decider, final] = [gm, true];
+    answer = await askTriage({ decider, final, gm, row, proposer, report, project, mission, signal, escalation });
   }
   let { verdict, reason } = answer;
   if (verdict === 'escalate') [verdict, reason] = ['reject', `escalated instead of deciding (${reason.replace(/[.!?…]$/, '')}), so it is rejected to stay safe`];
