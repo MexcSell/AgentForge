@@ -493,6 +493,20 @@ async function runMission(mission, signal) {
       if (t.files) row.files = t.files;
       rows.push(row);
     }
+    // An agent archived between staff() and the INSERT is handed over here (the mission is still 'planning', so
+    // pendingOf() sees these rows); one archived after this check is handed over by its route's own handOver(), which
+    // now sees them too. The plan names whoever holds each task afterwards, even when the route's handOver() moved it.
+    const gone = await many(`SELECT DISTINCT t.agent_id FROM tasks t JOIN agents a ON a.id = t.agent_id WHERE t.mission_id = $1 AND a.archived`, [mission.id]);
+    if (gone.length) {
+      for (const { agent_id } of gone) await handOver(agent_id).catch((e) => console.error('[handover]', e.message));
+      const now = new Map((await many(`SELECT t.id, t.agent_id, a.name AS agent_name FROM tasks t LEFT JOIN agents a ON a.id = t.agent_id WHERE t.mission_id = $1`, [mission.id])).map((r) => [r.id, r]));
+      rows.forEach((row, i) => {
+        const cur = now.get(row.id);
+        if (!cur) return;
+        row.agent_id = tasks[i].agent_id = cur.agent_id;
+        tasks[i].agent_name = cur.agent_name;
+      });
+    }
     await query(`UPDATE missions SET status='running', plan=$2 WHERE id=$1`, [mission.id, { analysis: p.analysis, tasks }]);
     await publishMission(mission.id);
     await postMessage({
