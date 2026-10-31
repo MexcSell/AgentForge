@@ -53,16 +53,17 @@ export function MergeConfirm({ clone, original, onClose }) {
       body={<>The skills, XP, lessons and playbook {clone?.name} gained are combined into {into}, and {clone?.name} is retired. Its task history stays.
         <HandOverPreview url={clone && `/api/agents/${clone.id}/handover?as=merge`} /></>}
       onConfirm={async () => {
-        let agent;
+        let agent, merged;
         try {
-          ({ agent } = await api.post(`/api/agents/${clone.id}/merge`, {}, { quiet: true }));
+          ({ agent, merged } = await api.post(`/api/agents/${clone.id}/merge`, {}, { quiet: true }));
         } catch (e) {
           return toast.error(`Could not merge ${clone.name}`, e.message); // 400/409: the server says why
         }
         const st = useStore.getState();
         st.applyEvent('agent:delete', { id: clone.id });
         st.applyEvent('agent:update', agent);
-        toast.success(`Merged ${clone.name} into ${agent.name}`);
+        // Same gains line as the server's merge notification
+        toast.success(`Merged ${clone.name} into ${agent.name}`, merged && `+${merged.xp} XP · ${merged.skills} skills · ${merged.lessons} lessons${merged.playbookVersion ? ` · playbook v${merged.playbookVersion}` : ''}`);
         if (st.agentModal === clone.id) st.set({ agentModal: agent.id });
       }} />
   );

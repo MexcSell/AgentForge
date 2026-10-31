@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Bot, Plus, Search, Network, LayoutGrid, Dna, GitFork, Eye, Stethoscope, Lightbulb, FlaskConical, Scale, Rocket, ChevronDown, ChevronRight,
+  Bot, Plus, Search, Network, LayoutGrid, Dna, GitFork, Eye, Stethoscope, Lightbulb, FlaskConical, Scale, Rocket, GitMerge, ChevronDown, ChevronRight,
   ZoomIn, ZoomOut, RefreshCw, Sparkles, CircleX, Lock, X,
 } from 'lucide-react';
 import { api } from '../../lib/api.js';
@@ -155,6 +155,7 @@ const STAGES = [
   ['experiment', 'Experiment', FlaskConical, 'Candidates run on real tasks'],
   ['evaluate', 'Evaluate', Scale, 'Candidate vs. baseline success rate'],
   ['promote', 'Promote', Rocket, 'Winner versioned; loser rolled back'],
+  ['merge', 'Merge', GitMerge, 'Clones return their skills, XP and lessons to the original'],
 ];
 
 function Evolution() {
@@ -174,9 +175,9 @@ function Evolution() {
           </div>
           <Button className="ml-auto" icon={RefreshCw} loading={busy} onClick={async () => { setBusy(true); try { setData(await api.post('/api/evolution/cycle')); toast.success('Evolution cycle complete'); } finally { setBusy(false); } }}>Run cycle now</Button>
         </div>
-        <div className="grid gap-2 grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid gap-2 grid-cols-2 md:grid-cols-4 xl:grid-cols-7">
           {STAGES.map(([k, label, Icon, desc], i) => (
-            <div key={k} className="relative p-3 rounded-[var(--af-radius)] border border-line bg-panel">
+            <div key={k} className="relative p-3 last:max-md:col-span-2 rounded-[var(--af-radius)] border border-line bg-panel">
               <div className="flex items-center gap-2"><span className="size-7 rounded-lg grad-accent text-accent-fg flex items-center justify-center"><Icon size={14} /></span><span className="text-[0.68rem] text-subtle tabular">0{i + 1}</span><span className="ml-auto text-lg font-semibold tabular">{counts[k]}</span></div>
               <div className="mt-2 text-[0.84rem] font-semibold">{label}</div>
               <div className="text-[0.7rem] text-subtle leading-snug mt-0.5">{desc}</div>
