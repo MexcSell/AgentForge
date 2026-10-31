@@ -20,6 +20,15 @@ import { evolutionOverview, analyzeMission } from '../orchestrator/evolution.js'
 
 const err = (reply, code, message) => reply.code(code).send({ error: message });
 
+// Archive an agent and move its reports up to its own supervisor. In the agent's 'claim' lane, so no task can start on
+// it in between. ready() is checked first in the lane: when it returns false nothing changes and the result is false.
+const retireAgent = (id, supervisorId, ready = () => true) => withAgentLock('claim', id, async () => {
+  if (!(await ready())) return false;
+  await query(`UPDATE agents SET supervisor_id = $2 WHERE supervisor_id = $1`, [id, supervisorId]);
+  await query(`UPDATE agents SET archived = true, status = 'offline' WHERE id = $1`, [id]);
+  return true;
+});
+
 // opts.onSettingsChange(key, value) lets the server react to a saved setting without a restart.
 export default async function apiRoutes(app, opts = {}) {
   // ---- projects ----------------------------------------------------------
@@ -53,7 +62,7 @@ export default async function apiRoutes(app, opts = {}) {
 
   app.post('/api/projects/delete', async (req, reply) => {
     const ids = req.body?.ids || [];
-    const rows = await many(`SELECT id, name, protected, manager_id FROM projects WHERE id = ANY($1)`, [ids]);
+    const rows = await many(`SELECT p.id, p.name, p.protected, p.manager_id, m.supervisor_id AS manager_supervisor_id FROM projects p LEFT JOIN agents m ON m.id = p.manager_id WHERE p.id = ANY($1)`, [ids]);
     const deleted = [];
     const refused = [];
     for (const p of rows) {
@@ -61,11 +70,14 @@ export default async function apiRoutes(app, opts = {}) {
       await cancelMission(p.id).catch(() => {});
       await disposePreview(p.id).catch(() => {});
       await query(`DELETE FROM projects WHERE id = $1`, [p.id]);
-      if (p.manager_id) await query(`UPDATE agents SET archived = true WHERE id = $1`, [p.manager_id]);
+      // Retired like a deleted agent, but with no busy check: its missions were just cancelled.
+      if (p.manager_id) await retireAgent(p.manager_id, p.manager_supervisor_id);
       emit('project:delete', { id: p.id });
       if (p.manager_id) emit('agent:delete', { id: p.manager_id });
       deleted.push(p.name);
       await audit('user', 'project.delete', p.name);
+      // This project's missions are gone with it; pending work the GM had in other projects' missions moves on.
+      if (p.manager_id) await handOver(p.manager_id).catch((e) => console.error('[handover]', e.message));
     }
     return { deleted, refused };
   });
@@ -212,14 +224,9 @@ export default async function apiRoutes(app, opts = {}) {
     if (!a) return err(reply, 404, 'Not found');
     if (a.role === 'executive') return err(reply, 400, 'The executive agent cannot be removed');
     if (await one(`SELECT 1 FROM projects WHERE manager_id = $1`, [a.id])) return err(reply, 400, 'This agent manages a project');
-    // In the agent's 'claim' lane, so no task can start on it between this check and the archive.
-    const removed = await withAgentLock('claim', a.id, async () => {
-      const busy = await one(`SELECT 1 FROM agents b WHERE b.id = $1 AND (b.status = 'working' OR EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = b.id AND t.status = 'running'))`, [a.id]);
-      if (busy) return false;
-      await query(`UPDATE agents SET supervisor_id = $2 WHERE supervisor_id = $1`, [a.id, a.supervisor_id]);
-      await query(`UPDATE agents SET archived = true, status = 'offline' WHERE id = $1`, [a.id]);
-      return true;
-    });
+    // Checked in the agent's 'claim' lane, so no task can start on it between this check and the archive.
+    const removed = await retireAgent(a.id, a.supervisor_id, async () =>
+      !(await one(`SELECT 1 FROM agents b WHERE b.id = $1 AND (b.status = 'working' OR EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = b.id AND t.status = 'running'))`, [a.id])));
     if (!removed) return err(reply, 409, 'Agent is working');
     emit('agent:delete', { id: a.id });
     await audit('user', 'agent.archive', a.name);

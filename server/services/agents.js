@@ -31,24 +31,27 @@ export function withAgentLock(lane, id, fn) {
 }
 
 // Serialized per agent, so a stale read from a parallel task can never be the last update.
+// Archived agents are not pushed: their agent:delete went out already, and clients would upsert them back.
 export function publishAgent(id) {
   return withAgentLock('publish', id, async () => {
     const a = await getAgent(id);
-    if (a) emit('agent:update', a);
+    if (a && !a.archived) emit('agent:update', a);
     return a;
   });
 }
 
 /**
- * Derive status from the DB in one statement: 'working' while the agent has a running task or manages a running
- * project with a planning/running mission, else 'idle'. current_task_id is its most recently started running task.
- * Serialized per agent: each recompute starts after the previous one committed, so the last one sees every task change.
+ * Derive status from the DB in one statement: 'offline' once archived, else 'working' while the agent has a running
+ * task or manages a running project with a planning/running mission, else 'idle'. current_task_id is its most recently
+ * started running task. Serialized per agent: each recompute starts after the previous one committed, so the last one
+ * sees every task change.
  */
 export async function refreshAgentStatus(id) {
   await withAgentLock('status', id, () => query(
     `UPDATE agents a SET
        current_task_id = (SELECT t.id FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running' ORDER BY t.started_at DESC NULLS LAST, t.created_at DESC LIMIT 1),
-       status = CASE WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running')
+       status = CASE WHEN a.archived THEN 'offline'
+         WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running')
          OR EXISTS (SELECT 1 FROM projects p JOIN missions s ON s.project_id = p.id WHERE p.manager_id = a.id AND p.status = 'running' AND s.status IN ('planning', 'running'))
          THEN 'working' ELSE 'idle' END,
        updated_at = now()
