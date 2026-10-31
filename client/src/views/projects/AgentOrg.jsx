@@ -150,11 +150,6 @@ export function AgentOrg({ project, team }) {
   const opener = useRef(null);
   const roots = useMemo(() => orgTree(team, agents, project.manager_id), [team, agents, project.manager_id]);
   const work = useMemo(() => new Map(team.map((a) => [a.id, currentWork(agentTasks(tasks, a.id))])), [team, tasks]);
-  const levels = useMemo(() => {
-    const n = new Map();
-    for (const a of team) n.set(a.level || 1, (n.get(a.level || 1) || 0) + 1);
-    return [...n].sort((x, y) => x[0] - y[0]);
-  }, [team]);
   const states = useMemo(() => {
     const n = Object.fromEntries(Object.keys(STATES).map((k) => [k, 0]));
     for (const a of team) n[stateOf(work.get(a.id))]++;
@@ -166,15 +161,7 @@ export function AgentOrg({ project, team }) {
   if (!team.length) return <Empty icon={Network} title="No team yet">The hierarchy appears once the General Manager staffs this project.</Empty>;
   return (
     <div className="min-w-0 flex flex-col gap-2">
-      <div className="p-2 rounded-xl border border-line bg-raised flex flex-col gap-1.5 min-w-0">
-        <div className="flex items-start gap-2 min-w-0">
-          <span className="w-10 shrink-0 pt-1 text-[0.62rem] uppercase tracking-wider text-subtle">Levels</span>
-          <ul aria-label="Team by level" className="flex flex-wrap gap-1 min-w-0">
-            {levels.map(([level, n]) => (
-              <Chip key={level} label={`${n} agent${n === 1 ? '' : 's'} at L${level}`}><span className="font-semibold text-fg">L{level}</span><span className="tabular">{n}</span></Chip>
-            ))}
-          </ul>
-        </div>
+      <div className="p-2 rounded-xl border border-line bg-raised min-w-0">
         <div className="flex items-start gap-2 min-w-0">
           <span className="w-10 shrink-0 pt-1 text-[0.62rem] uppercase tracking-wider text-subtle">Work</span>
           <ul aria-label="Team by work state" className="flex flex-wrap gap-1 min-w-0">
