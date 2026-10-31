@@ -146,17 +146,28 @@ export default async function apiRoutes(app, opts = {}) {
       many(`SELECT version, reason, created_at FROM agent_versions WHERE agent_id = $1 ORDER BY version DESC LIMIT 20`, [a.id]),
       many(`SELECT id, kind, status, model_id, input_tokens, output_tokens, cost_usd, tool_calls, duration_ms, created_at, finished_at FROM runs WHERE agent_id = $1 ORDER BY created_at DESC LIMIT 30`, [a.id]),
     ]);
-    const current = a.current_task_id ? await one(`SELECT t.*, p.name AS project_name FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = $1`, [a.current_task_id]) : null;
+    // A shared agent runs tasks of several missions at once; `current` stays the most recently started one.
+    const running = await many(`SELECT t.*, p.name AS project_name FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.agent_id = $1 AND t.status = 'running' ORDER BY t.started_at DESC NULLS LAST, t.created_at DESC`, [a.id]);
+    const currentTasks = running.map((t) => ({ id: t.id, key: t.key, title: t.title, progress: t.progress, started_at: t.started_at, project_id: t.project_id, project_name: t.project_name, mission_id: t.mission_id }));
     const reports = await many(`SELECT id, name, role, title, status, level FROM agents WHERE supervisor_id = $1 AND NOT archived`, [a.id]);
-    return { ...a, tasks, experiences, versions, runs, current, reportsList: reports };
+    return { ...a, tasks, experiences, versions, runs, current: running[0] || null, currentTasks, reportsList: reports };
   });
 
-  // Latest run + its event stream, for the live "thinking" pane.
-  app.get('/api/agents/:id/live', async (req) => {
-    const run = await one(`SELECT r.*, t.title AS task_title, t.key AS task_key FROM runs r LEFT JOIN tasks t ON t.id = r.task_id WHERE r.agent_id = $1 ORDER BY r.created_at DESC LIMIT 1`, [req.params.id]);
-    if (!run) return { run: null, events: [] };
+  // Latest run (or ?run=<id> of this agent) + its event stream, for the live "thinking" pane.
+  // activeRuns lists every run the agent has in flight, one per task it is working on.
+  app.get('/api/agents/:id/live', async (req, reply) => {
+    const pick = req.query.run || null;
+    if (pick && !isUuid(pick)) return err(reply, 400, 'Invalid run id');
+    const [run, activeRuns] = await Promise.all([
+      one(`SELECT r.*, t.title AS task_title, t.key AS task_key FROM runs r LEFT JOIN tasks t ON t.id = r.task_id WHERE r.agent_id = $1${pick ? ' AND r.id = $2' : ''} ORDER BY r.created_at DESC LIMIT 1`, [req.params.id, ...(pick ? [pick] : [])]),
+      many(`SELECT r.id, r.kind, r.task_id, t.key AS task_key, t.title AS task_title, r.project_id, p.name AS project_name, r.created_at
+            FROM runs r LEFT JOIN tasks t ON t.id = r.task_id LEFT JOIN projects p ON p.id = r.project_id
+            WHERE r.agent_id = $1 AND r.status = 'running' ORDER BY r.created_at DESC`, [req.params.id]),
+    ]);
+    if (pick && !run) return err(reply, 404, 'Run not found for this agent');
+    if (!run) return { run: null, events: [], activeRuns };
     const events = await many(`SELECT * FROM (SELECT id, ts, type, data FROM run_events WHERE run_id = $1 ORDER BY id DESC LIMIT 400) x ORDER BY id`, [run.id]);
-    return { run, events };
+    return { run, events, activeRuns };
   });
 
   app.post('/api/agents', async (req, reply) => {

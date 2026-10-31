@@ -45,7 +45,7 @@ export default function Settings() {
   const [evo, setEvo] = useState(null);
   const [mon, setMon] = useState(null);
   useEffect(() => {
-    if (st.settings) { setOrc(st.settings.orchestrator); setEvo(st.settings.evolution); setMon({ enabled: true, intervalSec: 3, ...st.settings.monitor }); }
+    if (st.settings) { setOrc({ maxTasksPerAgent: 3, ...st.settings.orchestrator }); setEvo(st.settings.evolution); setMon({ enabled: true, intervalSec: 3, ...st.settings.monitor }); }
   }, [st.settings]);
   const sys = st.system;
   const save = async (key, value) => { await api.put(`/api/settings/${key}`, value); toast.success('Settings saved'); };
@@ -95,11 +95,19 @@ export default function Settings() {
             <div className="grid gap-4 md:grid-cols-2">
               <Field label="Max parallel agents per mission"><Input type="number" min="1" max="12" value={orc.maxParallel} onChange={(e) => setOrc({ ...orc, maxParallel: Number(e.target.value) })} /></Field>
               <Field label="Task timeout (minutes)"><Input type="number" min="1" max="240" value={orc.taskTimeoutMin} onChange={(e) => setOrc({ ...orc, taskTimeoutMin: Number(e.target.value) })} /></Field>
-              <Toggle checked={orc.verification} onChange={(v) => setOrc({ ...orc, verification: v })} label="Independent verification after code changes" />
+              <Field label="Max parallel tasks per agent" hint="1 = one task at a time; extra work is cloned to a new agent">
+                <Input type="number" min="1" max="10" value={orc.maxTasksPerAgent} onChange={(e) => setOrc({ ...orc, maxTasksPerAgent: e.target.value === '' ? '' : Number(e.target.value) })} />
+              </Field>
+              <div className="md:col-start-1 flex"><Toggle checked={orc.verification} onChange={(v) => setOrc({ ...orc, verification: v })} label="Independent verification after code changes" /></div>
               <Toggle checked={orc.retryFailed} onChange={(v) => setOrc({ ...orc, retryFailed: v })} label="Retry a failed task once with the failure context" />
               <Toggle checked={orc.autoApproveProposals} onChange={(v) => setOrc({ ...orc, autoApproveProposals: v })} label="Auto-approve agent proposals (agents start their own work)" />
             </div>
-            <Button className="mt-4" variant="primary" onClick={() => save('orchestrator', orc)}>Save orchestrator settings</Button>
+            <Button className="mt-4" variant="primary" onClick={() => {
+              // Empty falls back to the default of 3; anything else is clamped to 1–10.
+              const v = { ...orc, maxTasksPerAgent: orc.maxTasksPerAgent === '' ? 3 : Math.min(10, Math.max(1, Math.round(orc.maxTasksPerAgent) || 1)) };
+              setOrc(v);
+              save('orchestrator', v);
+            }}>Save orchestrator settings</Button>
           </Section>
         )}
 

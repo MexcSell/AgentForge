@@ -3,7 +3,7 @@
 // instructions without passing an evaluation window first.
 import { one, many, query } from '../db/pool.js';
 import { emit } from '../events.js';
-import { publishAgent } from '../services/agents.js';
+import { publishAgent, withAgentLock } from '../services/agents.js';
 import { notify } from '../services/notify.js';
 
 const EVAL_WINDOW = 3;
@@ -27,8 +27,15 @@ async function recentOutcomes(agentId, n) {
 
 const rate = (arr) => (arr.length ? arr.filter(Boolean).length / arr.length : 1);
 
-/** Called after every task: experience, skills, XP, playbook versions, running experiments. */
-export async function learn({ agent, task, report, ok, out, settings, project }) {
+/**
+ * Called after every task: experience, skills, XP, playbook versions, running experiments.
+ * A shared agent can finish several tasks at once, so this read-modify-write runs one at a time per agent.
+ */
+export function learn(args) {
+  return withAgentLock('learn', args.agent.id, () => learnLocked(args));
+}
+
+async function learnLocked({ agent, task, report, ok, out, settings, project }) {
   const a = await one(`SELECT * FROM agents WHERE id = $1`, [agent.id]);
   if (!a) return;
   const conf = Math.max(0, Math.min(1, Number(report?.confidence ?? 0.6)));
@@ -43,7 +50,8 @@ export async function learn({ agent, task, report, ok, out, settings, project })
     else skills.push({ name, level: ok ? 22 : 12, learnedAt: new Date().toISOString() });
   }
 
-  const st = { ...a.stats };
+  // Only the keys owned here are written back: executeRun bumps the usage counters in stats at any time.
+  const st = { tasksDone: a.stats.tasksDone, tasksFailed: a.stats.tasksFailed, projects: a.stats.projects, experiment: a.stats.experiment };
   st.tasksDone = (st.tasksDone || 0) + (ok ? 1 : 0);
   st.tasksFailed = (st.tasksFailed || 0) + (ok ? 0 : 1);
   st.projects = [...new Set([...(st.projects || []), project.name])].slice(-50);
@@ -74,7 +82,8 @@ export async function learn({ agent, task, report, ok, out, settings, project })
     }
   }
 
-  await query(`UPDATE agents SET xp=$2, level=$3, skills=$4, stats=$5, updated_at=now() WHERE id=$1`, [a.id, xp, level, JSON.stringify(skills), st]);
+  if (!st.experiment) delete st.experiment;
+  await query(`UPDATE agents SET xp=$2, level=$3, skills=$4, stats=(stats - 'experiment') || $5, updated_at=now() WHERE id=$1`, [a.id, xp, level, JSON.stringify(skills), st]);
   if (level > a.level) {
     await notify({ source_type: 'agent', source_name: a.name, agent_id: a.id, level: 'success', title: `${a.name} reached level ${level}`, body: `${a.title} · ${xp} XP` });
   }
@@ -84,8 +93,7 @@ export async function learn({ agent, task, report, ok, out, settings, project })
 }
 
 async function promote(agent, playbook, reason) {
-  const version = agent.prompt_version + 1;
-  await query(`UPDATE agents SET playbook=$2, prompt_version=$3 WHERE id=$1`, [agent.id, JSON.stringify(playbook), version]);
+  const { version } = await one(`UPDATE agents SET playbook=$2, prompt_version=prompt_version + 1 WHERE id=$1 RETURNING prompt_version AS version`, [agent.id, JSON.stringify(playbook)]);
   await query(`INSERT INTO agent_versions(agent_id, version, playbook, reason) VALUES ($1,$2,$3,$4)`, [agent.id, version, JSON.stringify(playbook), reason]);
   await event('promote', agent.id, `${agent.name}: playbook v${version} promoted`, { reason, size: playbook.length });
 }
@@ -121,25 +129,29 @@ export async function analyzeMission(missionId) {
   if (!stats.total) return;
   await event('observe', null, `Gauge observed mission: ${stats.done}/${stats.total} tasks passed`, { missionId, ...stats });
 
-  const agents = await many(`SELECT DISTINCT a.* FROM agents a JOIN tasks t ON t.agent_id = a.id WHERE t.mission_id = $1`, [missionId]);
-  for (const a of agents) {
-    if (a.stats?.experiment) continue;
-    const outcomes = await recentOutcomes(a.id, 6);
-    if (outcomes.length < 3) continue;
-    const r = rate(outcomes);
-    if (r >= 0.67) continue;
-    await event('diagnose', a.id, `${a.name}: success rate ${Math.round(r * 100)}% over last ${outcomes.length} tasks`, { rate: r });
-    const failures = await many(`SELECT content FROM experiences WHERE agent_id = $1 AND kind = 'failure' ORDER BY created_at DESC LIMIT 4`, [a.id]);
-    const candidate = [
-      'Before editing, restate the acceptance criteria and check each one explicitly before reporting done.',
-      ...failures.map((f) => `Avoid repeating: ${f.content.slice(0, 160)}`),
-      ...(a.playbook || []),
-    ].slice(0, 10);
-    await event('generate', a.id, `Failure-aware playbook candidate for ${a.name}`, { size: candidate.length });
-    await query(`UPDATE agents SET stats = stats || $2 WHERE id = $1`, [a.id, { experiment: { playbook: candidate, baseline: r, outcomes: [], startedAt: new Date().toISOString() } }]);
-    await event('experiment', a.id, `${a.name} runs candidate playbook for the next ${EVAL_WINDOW} tasks`, {});
-    await publishAgent(a.id);
-  }
+  const agents = await many(`SELECT DISTINCT a.id FROM agents a JOIN tasks t ON t.agent_id = a.id WHERE t.mission_id = $1`, [missionId]);
+  // Same per-agent lock as learn(): the agent may be finishing tasks of other missions meanwhile.
+  for (const { id } of agents) await withAgentLock('learn', id, () => diagnose(id));
+}
+
+async function diagnose(agentId) {
+  const a = await one(`SELECT * FROM agents WHERE id = $1`, [agentId]);
+  if (!a || a.stats?.experiment) return;
+  const outcomes = await recentOutcomes(a.id, 6);
+  if (outcomes.length < 3) return;
+  const r = rate(outcomes);
+  if (r >= 0.67) return;
+  await event('diagnose', a.id, `${a.name}: success rate ${Math.round(r * 100)}% over last ${outcomes.length} tasks`, { rate: r });
+  const failures = await many(`SELECT content FROM experiences WHERE agent_id = $1 AND kind = 'failure' ORDER BY created_at DESC LIMIT 4`, [a.id]);
+  const candidate = [
+    'Before editing, restate the acceptance criteria and check each one explicitly before reporting done.',
+    ...failures.map((f) => `Avoid repeating: ${f.content.slice(0, 160)}`),
+    ...(a.playbook || []),
+  ].slice(0, 10);
+  await event('generate', a.id, `Failure-aware playbook candidate for ${a.name}`, { size: candidate.length });
+  await query(`UPDATE agents SET stats = stats || $2 WHERE id = $1`, [a.id, { experiment: { playbook: candidate, baseline: r, outcomes: [], startedAt: new Date().toISOString() } }]);
+  await event('experiment', a.id, `${a.name} runs candidate playbook for the next ${EVAL_WINDOW} tasks`, {});
+  await publishAgent(a.id);
 }
 
 export async function evolutionOverview() {

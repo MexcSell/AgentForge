@@ -2,8 +2,10 @@ import { one, many, query } from '../db/pool.js';
 import { emit } from '../events.js';
 import { CODENAMES, roleInfo, normalizeRole } from '../roles.js';
 
+// active_tasks: the agent's running tasks across all projects (its load against orchestrator.maxTasksPerAgent).
 const AGENT_COLS = `a.*, s.name AS supervisor_name,
-  (SELECT count(*)::int FROM agents c WHERE c.supervisor_id = a.id AND NOT c.archived) AS reports`;
+  (SELECT count(*)::int FROM agents c WHERE c.supervisor_id = a.id AND NOT c.archived) AS reports,
+  (SELECT count(*)::int FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running') AS active_tasks`;
 
 export async function listAgents() {
   return many(`SELECT ${AGENT_COLS} FROM agents a LEFT JOIN agents s ON s.id = a.supervisor_id WHERE NOT a.archived ORDER BY a.tier, a.created_at`);
@@ -13,14 +15,41 @@ export async function getAgent(id) {
   return one(`SELECT ${AGENT_COLS} FROM agents a LEFT JOIN agents s ON s.id = a.supervisor_id WHERE a.id = $1`, [id]);
 }
 
-export async function publishAgent(id) {
-  const a = await getAgent(id);
-  if (a) emit('agent:update', a);
-  return a;
+const lanes = new Map(); // `${lane}:${agentId}` -> tail of its chain
+
+/** Run fn for one agent at a time per lane, in call order. Different lanes never wait on each other. */
+export function withAgentLock(lane, id, fn) {
+  const key = `${lane}:${id}`;
+  const run = (lanes.get(key) || Promise.resolve()).then(fn);
+  const tail = run.catch(() => {});
+  lanes.set(key, tail);
+  tail.then(() => { if (lanes.get(key) === tail) lanes.delete(key); });
+  return run;
 }
 
-export async function setAgentStatus(id, status, currentTaskId = null) {
-  await query(`UPDATE agents SET status=$2, current_task_id=$3, updated_at=now() WHERE id=$1`, [id, status, currentTaskId]);
+// Serialized per agent, so a stale read from a parallel task can never be the last update.
+export function publishAgent(id) {
+  return withAgentLock('publish', id, async () => {
+    const a = await getAgent(id);
+    if (a) emit('agent:update', a);
+    return a;
+  });
+}
+
+/**
+ * Derive status from the DB in one statement: 'working' while the agent has a running task or manages a running
+ * project with a planning/running mission, else 'idle'. current_task_id is its most recently started running task.
+ * Serialized per agent: each recompute starts after the previous one committed, so the last one sees every task change.
+ */
+export async function refreshAgentStatus(id) {
+  await withAgentLock('status', id, () => query(
+    `UPDATE agents a SET
+       current_task_id = (SELECT t.id FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running' ORDER BY t.started_at DESC NULLS LAST, t.created_at DESC LIMIT 1),
+       status = CASE WHEN EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running')
+         OR EXISTS (SELECT 1 FROM projects p JOIN missions s ON s.project_id = p.id WHERE p.manager_id = a.id AND p.status = 'running' AND s.status IN ('planning', 'running'))
+         THEN 'working' ELSE 'idle' END,
+       updated_at = now()
+     WHERE a.id = $1`, [id]));
   return publishAgent(id);
 }
 

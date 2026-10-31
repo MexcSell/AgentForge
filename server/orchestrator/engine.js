@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import { emit } from '../events.js';
 import { getSettings } from '../db/seed.js';
 import { normalizeRole, roleInfo } from '../roles.js';
-import { getAgent, listAgents, createAgent, cloneAgent, setAgentStatus, publishAgent } from '../services/agents.js';
+import { getAgent, listAgents, createAgent, cloneAgent, publishAgent, refreshAgentStatus, withAgentLock } from '../services/agents.js';
 import { getProject, publishProject, setProjectStatus } from '../services/projects.js';
 import { getTopic, createTopic, updateTopic, touchTopic, ensureTopic, publishTopic } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
@@ -151,7 +151,12 @@ function pump(projectId) {
     .catch((err) => console.error('[mission]', err))
     .finally(async () => {
       active.delete(projectId);
-      if (!(queues.get(projectId) || []).length) await setProjectStatus(projectId, 'idle').catch(() => {});
+      if (!(queues.get(projectId) || []).length) {
+        await setProjectStatus(projectId, 'idle').catch(() => {});
+        // Queued orders dropped by /stop keep status 'planning'; with the project idle they no longer keep the GM working.
+        const p = await one(`SELECT manager_id FROM projects WHERE id = $1`, [projectId]).catch(() => null);
+        if (p?.manager_id) await refreshAgentStatus(p.manager_id).catch(() => {});
+      }
       pump(projectId);
     });
 }
@@ -252,19 +257,35 @@ function ancestors(tasks) {
   return (a, b) => walk(a).has(b) || walk(b).has(a);
 }
 
-function skillScore(agent, task) {
+/** Running tasks one agent may own at once (orchestrator.maxTasksPerAgent; stored settings may lack it). 1 = exclusive agents. */
+const taskCap = (settings) => Math.max(1, Math.floor(Number(settings.orchestrator.maxTasksPerAgent ?? 3)) || 3);
+
+// free: share of the idle bonus, 1 for an idle (or unloaded) agent down to 0 at the cap.
+function skillScore(agent, task, free = agent.status === 'idle' ? 1 : 0) {
   const map = Object.fromEntries(agent.skills.map((s) => [s.name, s.level]));
-  return task.skills.reduce((sum, s) => sum + (map[s] || 0), 0) + agent.level * 3 + (agent.status === 'idle' ? 15 : 0);
+  return task.skills.reduce((sum, s) => sum + (map[s] || 0), 0) + agent.level * 3 + Math.round(15 * free);
 }
 
 /** Pick, clone or recruit an agent for every task. Returns staffing notes for the chat. */
-async function staff(tasks, project) {
+async function staff(tasks, project, cap) {
   const notes = [];
   const owned = new Map(); // agentId -> [taskKeys]
   const related = ancestors(tasks);
   for (const t of tasks) {
-    const pool = (await listAgents()).filter((a) => a.role === t.role).sort((a, b) => skillScore(b, t) - skillScore(a, t));
-    let chosen = pool.find((a) => (owned.get(a.id) || []).every((k) => related(k, t.key)) && a.status !== 'working');
+    let pool = (await listAgents()).filter((a) => a.role === t.role);
+    let chosen;
+    if (cap === 1) {
+      // Exclusive agents: a busy agent is skipped, and one agent only gets tasks that run one after another.
+      pool.sort((a, b) => skillScore(b, t) - skillScore(a, t));
+      chosen = pool.find((a) => (owned.get(a.id) || []).every((k) => related(k, t.key)) && a.status !== 'working');
+    } else {
+      // Shared agents: load = running tasks + tasks handed out in this pass that may run alongside t
+      // (a task t depends on, or that depends on t, never overlaps it).
+      const load = (a) => a.active_tasks + (owned.get(a.id) || []).filter((k) => !related(k, t.key)).length;
+      const score = (a) => skillScore(a, t, Math.max(0, 1 - load(a) / cap));
+      pool = pool.map((a) => [score(a), a]).sort((a, b) => b[0] - a[0]).map(([, a]) => a);
+      chosen = pool.find((a) => load(a) < cap);
+    }
     if (!chosen && pool.length) {
       const src = pool[0];
       chosen = await cloneAgent(src.id, `parallel ${t.role} work in ${project.name}`);
@@ -290,7 +311,7 @@ async function runMission(mission, signal) {
   let project = await getProject(mission.project_id);
   const gm = await getAgent(project.manager_id);
   await setProjectStatus(project.id, 'running');
-  await setAgentStatus(gm.id, 'working');
+  await refreshAgentStatus(gm.id); // working: its project is running and this mission is planning
   refreshProject(project.id);
   const started = Date.now();
   try {
@@ -318,7 +339,7 @@ async function runMission(mission, signal) {
       return;
     }
 
-    const notes = await staff(tasks, project);
+    const notes = await staff(tasks, project, taskCap(settings));
     const rows = [];
     for (const t of tasks) {
       rows.push(await one(
@@ -380,7 +401,8 @@ async function runMission(mission, signal) {
     await publishMission(mission.id);
     await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: status === 'cancelled' ? 'status' : 'error', content: status === 'cancelled' ? 'Mission cancelled.' : `Mission failed: ${err.message}` });
   } finally {
-    await setAgentStatus(gm.id, 'idle');
+    // Stays 'working' while another mission of a project it manages is still planning or running.
+    await refreshAgentStatus(gm.id);
     await publishProject(project.id).catch(() => {});
     await publishTopic(mission.topic_id).catch(() => {});
   }
@@ -423,17 +445,45 @@ async function schedule({ rows, project, gm, mission, settings, signal }) {
   }
 }
 
-async function runTask({ task, state, project, gm, mission, settings, signal, attempt = 1 }) {
-  let agent = await getAgent(task.agent_id);
-  // The assigned agent is busy elsewhere: duplicate it rather than wait.
-  if (agent.status === 'working' && agent.current_task_id && agent.current_task_id !== task.id) {
+/**
+ * Mark the task running on agentId unless that agent already runs `cap` other tasks. The check and the update
+ * are serialized per agent, so tasks starting at the same moment in different missions can't overshoot the cap.
+ */
+function claim(task, agentId, cap = Infinity) {
+  return withAgentLock('claim', agentId, async () => {
+    const busy = await one(`SELECT count(*)::int AS n FROM tasks WHERE agent_id = $1 AND status = 'running' AND id <> $2`, [agentId, task.id]);
+    if (busy.n >= cap) return false;
+    await query(`UPDATE tasks SET status='running', started_at=now(), progress=5, agent_id=$2 WHERE id=$1`, [task.id, agentId]);
+    task.agent_id = agentId;
+    return true;
+  });
+}
+
+/** Start the task on its assigned agent, else on another agent of the role below the cap; clone only as a last resort. */
+async function acquireAgent({ task, agent, project, gm, mission, settings }) {
+  const cap = taskCap(settings);
+  if (await claim(task, agent.id, cap)) return agent;
+  const fallback = async () => {
+    // With cap 1 a busy agent is cloned right away, as with exclusive agents before.
+    if (cap > 1) {
+      const free = (a) => Math.max(0, 1 - a.active_tasks / cap);
+      const others = (await listAgents()).filter((a) => a.role === agent.role && a.id !== agent.id && a.active_tasks < cap)
+        .sort((a, b) => skillScore(b, task, free(b)) - skillScore(a, task, free(a)));
+      for (const a of others) if (await claim(task, a.id, cap)) return a;
+    }
     const clone = await cloneAgent(agent.id, 'busy in another mission');
     await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: `${agent.name} is busy — cloned ${clone.name} for ${task.key}.` });
-    agent = clone;
-    await query(`UPDATE tasks SET agent_id=$2 WHERE id=$1`, [task.id, agent.id]);
-  }
-  await query(`UPDATE tasks SET status='running', started_at=now(), progress=5 WHERE id=$1`, [task.id]);
-  await setAgentStatus(agent.id, 'working', task.id);
+    await claim(task, clone.id);
+    return clone;
+  };
+  // Shared agents: one fallback at a time per role, so a task starting at the same moment finds the clone just made
+  // for another (below the cap) instead of cloning again.
+  return cap > 1 ? withAgentLock('fallback', agent.role, fallback) : fallback();
+}
+
+async function runTask({ task, state, project, gm, mission, settings, signal, attempt = 1 }) {
+  const agent = await acquireAgent({ task, agent: await getAgent(task.agent_id), project, gm, mission, settings });
+  await refreshAgentStatus(agent.id);
   await publishTask(task.id);
   refreshProject(project.id);
 
@@ -466,7 +516,7 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
 
   if (signal.aborted) {
     await query(`UPDATE tasks SET status='cancelled', finished_at=now() WHERE id=$1`, [task.id]);
-    await setAgentStatus(agent.id, 'idle');
+    await refreshAgentStatus(agent.id);
     await publishTask(task.id);
     refreshProject(project.id);
     return 'cancelled';
@@ -475,7 +525,8 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
   const status = ok ? 'done' : 'failed';
   await query(`UPDATE tasks SET status=$2, progress=$3, result=$4, report=$5, finished_at=now() WHERE id=$1`,
     [task.id, status, ok ? 100 : 0, String(report.summary || out?.text || errorText || '').slice(0, 8000), report]);
-  await setAgentStatus(agent.id, 'idle');
+  // Idle only once its last running task has ended (shared agents run tasks from several missions at once).
+  await refreshAgentStatus(agent.id);
   await publishTask(task.id);
   refreshProject(project.id);
 

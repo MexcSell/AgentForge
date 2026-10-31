@@ -3,7 +3,8 @@ import { config } from '../config.js';
 import { ROLES } from '../roles.js';
 
 export const DEFAULT_SETTINGS = {
-  orchestrator: { maxParallel: 3, taskTimeoutMin: 30, autoApproveProposals: false, verification: true, retryFailed: true },
+  // maxTasksPerAgent: running tasks one agent may own at once, across all projects (1 = exclusive agents).
+  orchestrator: { maxParallel: 3, maxTasksPerAgent: 3, taskTimeoutMin: 30, autoApproveProposals: false, verification: true, retryFailed: true },
   github: { autoSync: true, userName: config.github.userName, userEmail: config.github.userEmail, branch: 'main' },
   evolution: { enabled: true, playbookSize: 8, lessonsPerVersion: 4 },
   monitor: { enabled: true, intervalSec: 3 },
