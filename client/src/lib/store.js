@@ -78,7 +78,6 @@ export const useStore = create((set, get) => ({
   tasks: {},
   missions: {},
   live: {},
-  runTicks: {}, // { [agentId]: n } — bumps whenever one of the agent's runs starts or ends
   previews: {}, // { [projectId]: { status, mode, command, port, url, startedAt, exitCode, error, log: string[] } }
   syncTick: 0,
   evolutionTick: 0,
@@ -274,12 +273,9 @@ export const useStore = create((set, get) => ({
         const ev = type === 'run:start' ? { type: 'run-start', run_id: p.id, data: { kind: p.kind, model: p.model_id }, ts: Date.now() } : p;
         const id = p.agent_id;
         const prev = st.live[id] || [];
-        const patch = { live: { ...st.live, [id]: [...prev.slice(-399), ev] } };
-        if (type === 'run:start') patch.runTicks = { ...st.runTicks, [id]: (st.runTicks[id] || 0) + 1 };
-        set(patch);
+        set({ live: { ...st.live, [id]: [...prev.slice(-399), ev] } });
         break;
       }
-      case 'run:end': set({ runTicks: { ...st.runTicks, [p.agent_id]: (st.runTicks[p.agent_id] || 0) + 1 } }); break;
       case 'notification:new':
         set({ notifications: [p, ...st.notifications].slice(0, 300) });
         toast[p.level === 'error' ? 'error' : p.level === 'success' ? 'success' : p.level === 'warning' ? 'warn' : 'info'](p.title, p.body, { source: p.source_name });

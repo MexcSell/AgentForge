@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bot, Brain, Wrench, MessageSquareText, CircleCheck, CircleX, Play, TriangleAlert, Timer, Hash, ArrowDownToLine, ArrowUpFromLine, Target, Compass,
-  Info, GitFork, Archive, Cpu, Sparkles, BookOpen, History, Activity, Save, Crown, Lock, Coins,
+  Info, GitFork, GitMerge, Archive, Cpu, Sparkles, BookOpen, History, Activity, Save, Crown, Lock, Coins,
 } from 'lucide-react';
 import { api } from '../../lib/api.js';
 import { useStore } from '../../lib/store.js';
@@ -9,47 +9,15 @@ import { toast } from '../../lib/toast.js';
 import { compact, duration, timeAgo, usd, dateTime } from '../../lib/format.js';
 import { Modal } from '../../components/Modal.jsx';
 import { cx, AgentAvatar, Badge, Button, Progress, Tabs, Select, Textarea, Empty, Spinner, STATUS_TONE } from '../../components/ui.jsx';
+import { canMerge, mergeOriginal, MergeButton, MergeConfirm } from './merge.jsx';
 
 const TIER = { 1: 'Executive', 2: 'Management', 3: 'Specialist', 4: 'Verification', 5: 'Evolution' };
-const NO_FEED = { run: null, history: [], seen: null, active: [] };
-
-/** Switcher label: "T2 · AgentForge — title"; runs without a task (planning, commits) show their kind. */
-const runLabel = (r) => `${r.task_key || r.kind}${r.project_name ? ` · ${r.project_name}` : ''}${r.task_title ? ` — ${r.task_title}` : ''}${r.finished ? ' · finished' : ''}`;
 
 function Stat({ icon: Icon, label, value }) {
   return (
     <div className="flex flex-col gap-1 p-2.5 rounded-lg bg-sunken border border-line min-w-0">
       <span className="flex items-center gap-1.5 text-[0.66rem] uppercase tracking-wider text-subtle"><Icon size={11} />{label}</span>
       <span className="text-[0.95rem] font-semibold tabular truncate">{value}</span>
-    </div>
-  );
-}
-
-/** The agent's running tasks. A shared agent can hold several at once, across projects. */
-function CurrentTasks({ tasks }) {
-  if (!tasks.length) return null;
-  if (tasks.length === 1) {
-    const [t] = tasks;
-    return (
-      <div className="p-3 rounded-xl border border-accent/40 bg-accent-soft/40">
-        <div className="flex items-center gap-1.5 text-[0.68rem] uppercase tracking-wider text-accent font-semibold"><Activity size={11} />Current task · {t.project_name}</div>
-        <div className="text-[0.84rem] font-medium mt-1">{t.key} {t.title}</div>
-        <Progress value={t.progress} className="mt-2" striped />
-      </div>
-    );
-  }
-  return (
-    <div className="p-3 rounded-xl border border-accent/40 bg-accent-soft/40">
-      <div className="flex items-center gap-1.5 text-[0.68rem] uppercase tracking-wider text-accent font-semibold"><Activity size={11} />Current tasks · {tasks.length}</div>
-      <ul className="flex flex-col gap-2.5 mt-2">
-        {tasks.map((t) => (
-          <li key={t.id}>
-            <div className="text-[0.84rem] font-medium">{t.key} {t.title}</div>
-            <div className="text-[0.68rem] text-subtle truncate">{t.project_name}</div>
-            <Progress value={t.progress} className="mt-1.5" striped />
-          </li>
-        ))}
-      </ul>
     </div>
   );
 }
@@ -71,54 +39,32 @@ export function AgentDetailModal() {
   const agents = useStore((s) => s.agents);
   const models = useStore((s) => s.models);
   const liveEvents = useStore((s) => (id ? s.live[id] : null));
-  const runTick = useStore((s) => (id ? s.runTicks[id] || 0 : 0));
   const agent = agents.find((a) => a.id === id);
   const [detail, setDetail] = useState(null);
-  const [feed, setFeed] = useState(NO_FEED); // shown run, its stored events and the agent's in-flight runs
-  const [pick, setPick] = useState(null); // run chosen in the switcher; null follows the newest in-flight run
+  const [history, setHistory] = useState([]);
   const [tab, setTab] = useState('live');
   const [edit, setEdit] = useState(null);
+  const [merging, setMerging] = useState(false);
   const streamRef = useRef(null);
-  const liveReq = useRef(0);
-
-  // Stored events of one run plus the agent's in-flight runs (a shared agent can run several at once). Shown: the run
-  // picked in the switcher (2+ in flight), else the newest in-flight run, else the latest run, as before.
-  const loadLive = (want = pick, opts = { quiet: true }) => {
-    const n = ++liveReq.current;
-    api.get(`/api/agents/${id}/live${want ? `?run=${want}` : ''}`, opts).then((d) => {
-      if (n !== liveReq.current) return; // a newer load (switch, reopen) owns the pane
-      const active = d.activeRuns || [];
-      if (active.length < 2) setPick(null);
-      const target = active.length > 1 ? want || active[0].id : active[0]?.id || null;
-      if (target ? d.run?.id !== target : want) return loadLive(target);
-      const history = [...(d.run ? [{ type: 'run-start', data: { kind: d.run.kind, model: d.run.model_id }, ts: d.run.created_at }] : []), ...d.events];
-      setFeed({ run: d.run, history, active, seen: new Set(useStore.getState().live[id] || []) });
-    }).catch(() => { if (want && n === liveReq.current) { setPick(null); loadLive(null); } });
-  };
 
   useEffect(() => {
     if (!id) return;
     setTab('live');
     setEdit(null);
+    setMerging(false);
     setDetail(null);
-    setFeed(NO_FEED);
-    setPick(null);
+    setHistory([]);
     api.get(`/api/agents/${id}`).then(setDetail).catch(() => set({ agentModal: null }));
-    loadLive(null, {});
+    api.get(`/api/agents/${id}/live`).then((d) => setHistory([...(d.run ? [{ type: 'run-start', data: { kind: d.run.kind, model: d.run.model_id }, ts: d.run.created_at }] : []), ...d.events])).catch(() => {});
   }, [id]);
-  useEffect(() => { if (id && agent?.status && detail) api.get(`/api/agents/${id}`).then(setDetail).catch(() => {}); }, [agent?.status, agent?.xp, agent?.active_tasks, agent?.current_task_id]);
-  useEffect(() => { if (id && detail) loadLive(); }, [runTick]); // one of its runs started or ended
+  useEffect(() => { if (id && agent?.status && detail) api.get(`/api/agents/${id}`).then(setDetail).catch(() => {}); }, [agent?.status, agent?.xp]);
 
-  const multi = feed.active.length > 1;
-  const shownId = feed.run?.id;
   const events = useMemo(() => {
-    // Parallel runs interleave in the live stream: with the switcher shown, keep only the shown run's events.
-    const live = multi ? (liveEvents || []).filter((e) => e.run_id === shownId) : liveEvents || [];
-    if (!live.length) return feed.history;
+    const live = liveEvents || [];
+    if (!live.length) return history;
     const firstLive = live.findIndex((e) => e.type === 'run-start');
-    // Events that had arrived before the load are already in the stored history.
-    return firstLive >= 0 ? live.slice(firstLive) : [...feed.history, ...live.filter((e) => !feed.seen?.has(e))];
-  }, [feed, liveEvents, multi, shownId]);
+    return firstLive >= 0 ? live.slice(firstLive) : [...history, ...live];
+  }, [history, liveEvents]);
   useEffect(() => { const el = streamRef.current; if (el) el.scrollTop = el.scrollHeight; }, [events.length, tab]);
 
   if (!id) return null;
@@ -131,11 +77,7 @@ export function AgentDetailModal() {
   const xpNext = 40 * (a.level || 1) ** 2;
   const xpPrev = 40 * ((a.level || 1) - 1) ** 2;
   const nonEditable = a.role === 'executive';
-  const running = detail?.currentTasks || (detail?.current ? [detail.current] : []);
-  // A picked run that has since finished stays selectable until another one is picked.
-  const runOptions = multi && feed.run && !feed.active.some((r) => r.id === feed.run.id)
-    ? [...feed.active, { ...feed.run, project_name: useStore.getState().projects.find((p) => p.id === feed.run.project_id)?.name, finished: true }]
-    : feed.active;
+  const original = canMerge(a) ? mergeOriginal(a, agents) : null;
 
   const save = async () => {
     await api.patch(`/api/agents/${a.id}`, edit);
@@ -144,18 +86,26 @@ export function AgentDetailModal() {
     api.get(`/api/agents/${id}`).then(setDetail);
   };
 
-  return (
+  return (<>
     <Modal open={!!id} onClose={() => set({ agentModal: null })} size="xl" bodyClass="p-0"
       title={<span className="flex items-center gap-2">{a.name}<Lock size={11} className="text-subtle" title="Names are system-managed" /><Badge tone={STATUS_TONE[a.status]}>{a.status}</Badge></span>}
       subtitle={`${a.title || ''} · ${TIER[a.tier] || ''} tier · ${a.department || ''}`} icon={Bot}
-      actions={<>
+      actions={a.id && !a.merged_into && <>
         <Button size="sm" variant="ghost" icon={GitFork} onClick={async () => { const c = await api.post(`/api/agents/${a.id}/clone`); toast.success(`Cloned ${a.name} → ${c.name}`); }}>Clone</Button>
+        {canMerge(a) && <MergeButton clone={a} original={original} onClick={() => setMerging(true)} />}
         {!nonEditable && <Button size="sm" variant="ghost" icon={Archive} onClick={async () => { await api.del(`/api/agents/${a.id}`); set({ agentModal: null }); toast.info(`${a.name} archived`); }}>Archive</Button>}
       </>}>
       {!detail ? <div className="h-full flex items-center justify-center"><Spinner /></div> : (
         <div className="h-full grid md:grid-cols-[minmax(320px,38%)_1fr]">
           {/* Left: identity, metrics, mission */}
           <div className="min-h-0 overflow-auto border-r border-line p-4 flex flex-col gap-4">
+            {a.merged_into && (
+              <div className="flex items-center gap-2 p-3 rounded-xl border border-line bg-sunken text-[0.8rem]">
+                <GitMerge size={14} className="text-accent shrink-0" />
+                <span className="min-w-0">Merged into <button className="font-medium text-accent hover:underline" onClick={() => set({ agentModal: a.merged_into })}>{a.merged_into_name || 'its original'}</button>, which carries on its skills, XP and lessons.</span>
+              </div>
+            )}
+
             <div className="flex items-center gap-3.5">
               <AgentAvatar agent={a} size={56} />
               <div className="min-w-0 flex-1">
@@ -169,7 +119,13 @@ export function AgentDetailModal() {
               </div>
             </div>
 
-            <CurrentTasks tasks={running} />
+            {detail.current && (
+              <div className="p-3 rounded-xl border border-accent/40 bg-accent-soft/40">
+                <div className="flex items-center gap-1.5 text-[0.68rem] uppercase tracking-wider text-accent font-semibold"><Activity size={11} />Current task · {detail.current.project_name}</div>
+                <div className="text-[0.84rem] font-medium mt-1">{detail.current.key} {detail.current.title}</div>
+                <Progress value={detail.current.progress} className="mt-2" striped />
+              </div>
+            )}
 
             <div className="grid grid-cols-2 gap-2">
               <Stat icon={Hash} label="Prompts" value={compact(s.prompts || 0)} />
@@ -248,14 +204,6 @@ export function AgentDetailModal() {
               ]} />
               {a.status === 'working' && <span className="ml-auto flex items-center gap-1.5 text-xs text-accent"><span className="size-1.5 rounded-full bg-accent animate-af-pulse" />thinking…</span>}
             </div>
-            {tab === 'live' && multi && (
-              <div className="flex items-center gap-2 px-4 py-1.5 border-b border-line shrink-0">
-                <span className="text-[0.68rem] uppercase tracking-wider text-subtle tabular shrink-0">{feed.active.length} running</span>
-                <Select aria-label="Run shown in the live pane" value={pick || shownId || ''} onChange={(e) => { setPick(e.target.value); loadLive(e.target.value); }} className="h-7 text-xs min-w-0 flex-1">
-                  {runOptions.map((r) => <option key={r.id} value={r.id}>{runLabel(r)}</option>)}
-                </Select>
-              </div>
-            )}
             <div ref={streamRef} className="flex-1 min-h-0 overflow-auto px-4 py-3">
               {tab === 'live' && (events.length ? <div className="flex flex-col">{events.map((e, i) => <EventRow key={i} e={e} />)}</div> : <Empty icon={Brain} title="No activity yet">This pane streams the agent's reasoning, tool calls and results while it works.</Empty>)}
               {tab === 'tasks' && (detail.tasks.length ? detail.tasks.map((t) => (
@@ -307,6 +255,7 @@ export function AgentDetailModal() {
         </div>
       )}
     </Modal>
-  );
+    <MergeConfirm clone={merging ? a : null} original={original} onClose={() => setMerging(false)} />
+  </>);
 }
 

@@ -8,7 +8,7 @@ import { notify } from '../services/notify.js';
 
 const EVAL_WINDOW = 3;
 
-async function event(stage, agentId, title, detail = {}) {
+export async function event(stage, agentId, title, detail = {}) {
   const row = await one(`INSERT INTO evolution_events(stage, agent_id, title, detail) VALUES ($1,$2,$3,$4) RETURNING *`, [stage, agentId, title, detail]);
   emit('evolution:event', row);
   return row;
@@ -29,7 +29,7 @@ const rate = (arr) => (arr.length ? arr.filter(Boolean).length / arr.length : 1)
 
 /**
  * Called after every task: experience, skills, XP, playbook versions, running experiments.
- * A shared agent can finish several tasks at once, so this read-modify-write runs one at a time per agent.
+ * This read-modify-write runs one at a time per agent, so concurrent writers to the same agent can't lose updates.
  */
 export function learn(args) {
   return withAgentLock('learn', args.agent.id, () => learnLocked(args));
@@ -38,6 +38,8 @@ export function learn(args) {
 async function learnLocked({ agent, task, report, ok, out, settings, project }) {
   const a = await one(`SELECT * FROM agents WHERE id = $1`, [agent.id]);
   if (!a) return;
+  // A task that ended on a clone after it was merged: what it learned goes to the agent it was merged into.
+  if (a.merged_into) return learn({ agent: { ...agent, id: a.merged_into }, task, report, ok, out, settings, project });
   const conf = Math.max(0, Math.min(1, Number(report?.confidence ?? 0.6)));
   const xp = a.xp + (ok ? 20 + Math.round(conf * 10) : 6);
   const level = levelFor(xp);
@@ -96,6 +98,63 @@ async function promote(agent, playbook, reason) {
   const { version } = await one(`UPDATE agents SET playbook=$2, prompt_version=prompt_version + 1 WHERE id=$1 RETURNING prompt_version AS version`, [agent.id, JSON.stringify(playbook)]);
   await query(`INSERT INTO agent_versions(agent_id, version, playbook, reason) VALUES ($1,$2,$3,$4)`, [agent.id, version, JSON.stringify(playbook), reason]);
   await event('promote', agent.id, `${agent.name}: playbook v${version} promoted`, { reason, size: playbook.length });
+  return version;
+}
+
+const USAGE = ['prompts', 'tokensIn', 'tokensOut', 'toolCalls', 'totalMs', 'costUsd'];
+
+/**
+ * What a merge adds to the original: skills, XP and stats the clone gained after it was copied (clone_base).
+ * Clones made before their start was recorded take the higher skill level and XP estimated from their task counts.
+ * Pure: the caller reads both rows under its locks and writes the result.
+ */
+export function combineLearning(target, clone) {
+  const base = clone.clone_base;
+  const start = base && Object.fromEntries((base.skills || []).map((s) => [s.name, s.level]));
+  const skills = target.skills.map((s) => ({ ...s }));
+  let changed = 0;
+  for (const s of clone.skills) {
+    const own = skills.find((k) => k.name === s.name);
+    if (!own) { skills.push({ ...s }); changed++; continue; }
+    // A skill the clone picked up after cloning counts as gained in full.
+    const level = start ? Math.min(100, own.level + Math.max(0, s.level - (start[s.name] ?? 0))) : Math.max(own.level, s.level);
+    if (level !== own.level) { own.level = level; changed++; }
+  }
+  const cs = clone.stats || {};
+  const ts = target.stats || {};
+  const xpGained = base ? Math.max(0, clone.xp - (base.xp || 0)) : 20 * (cs.tasksDone || 0) + 6 * (cs.tasksFailed || 0);
+  const xp = target.xp + xpGained;
+  // The clone's running experiment is dropped; the original keeps its own.
+  const stats = {
+    tasksDone: (ts.tasksDone || 0) + (cs.tasksDone || 0),
+    tasksFailed: (ts.tasksFailed || 0) + (cs.tasksFailed || 0),
+    projects: [...new Set([...(ts.projects || []), ...(cs.projects || [])])].slice(-50),
+  };
+  for (const k of USAGE) if (cs[k] != null) stats[k] = Number(ts[k] || 0) + Number(cs[k] || 0);
+  return { xp, level: levelFor(xp), skills, stats, gained: { skills: changed, xp: xpGained } };
+}
+
+/**
+ * Fold the clone's playbook into the original's: a deduplicated union capped at playbookSize, keeping the entries
+ * backed by the highest-scored lessons. Promoted (versioned) only when it differs. Returns the new version or null.
+ * Run after the clone's lessons moved to the original, inside the original's learn lane.
+ */
+export async function mergePlaybooks(target, clone, settings) {
+  const key = (e) => norm(String(e)).slice(0, 60);
+  const own = target.playbook || [];
+  const ownKeys = new Set(own.map(key));
+  if (!(clone.playbook || []).some((e) => !ownKeys.has(key(e)))) return null;
+  const score = new Map();
+  for (const l of await many(`SELECT content, score FROM experiences WHERE agent_id = $1 AND kind = 'lesson'`, [target.id])) {
+    score.set(key(l.content), Math.max(score.get(key(l.content)) ?? 0, l.score));
+  }
+  const union = [];
+  for (const e of [...own, ...clone.playbook]) if (!union.some((u) => u.k === key(e))) union.push({ e, k: key(e) });
+  // Best-backed entries win the slots (ties keep the original's first); the kept ones stay in union order.
+  const kept = new Set([...union].sort((a, b) => (score.get(b.k) ?? 0) - (score.get(a.k) ?? 0)).slice(0, settings.evolution?.playbookSize || 8));
+  const playbook = union.filter((u) => kept.has(u)).map((u) => u.e);
+  if (JSON.stringify(playbook) === JSON.stringify(own)) return null;
+  return promote(target, playbook, `Merged from ${clone.name}`);
 }
 
 // Prompt evolution: once enough new lessons accumulate, curate a new playbook version.

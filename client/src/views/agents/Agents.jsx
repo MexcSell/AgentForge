@@ -10,27 +10,16 @@ import { timeAgo } from '../../lib/format.js';
 import { roleStyle, ROLE_STYLE } from '../../lib/icons.jsx';
 import { Modal } from '../../components/Modal.jsx';
 import { cx, AgentAvatar, Badge, Button, IconButton, Input, Field, Select, Textarea, Tabs, Empty, StatusDot, Spinner } from '../../components/ui.jsx';
+import { canMerge, mergeOriginal, MergeButton, MergeConfirm } from './merge.jsx';
 
 const TIERS = { 1: 'Executive Intelligence', 2: 'Management & Orchestration', 3: 'Specialist Teams', 4: 'Independent Verification', 5: 'Self-Evolution' };
 
-/** Avatar with a "×N" corner badge while the agent works on several tasks at once (it is shared across projects). */
-function Avatar({ a, size }) {
-  const n = a.active_tasks;
-  const label = `Working on ${n} tasks`;
-  return (
-    <span className="relative flex shrink-0">
-      <AgentAvatar agent={a} size={size} />
-      {n > 1 && <span role="img" aria-label={label} title={label} className="absolute -top-1.5 -right-1.5 min-w-4 h-4 px-1 rounded-full bg-accent text-accent-fg text-[10px] font-semibold leading-4 text-center tabular ring-2 ring-[var(--af-panel)]">×{n}</span>}
-    </span>
-  );
-}
-
-function AgentCard({ a }) {
+function AgentCard({ a, original, onMerge }) {
   const set = useStore((s) => s.set);
   return (
     <div onClick={() => set({ agentModal: a.id })} className="group relative flex flex-col gap-3 p-3.5 rounded-[var(--af-radius)] border border-line bg-panel hover:border-line-strong hover:shadow-af transition-all cursor-pointer">
       <div className="flex items-center gap-3">
-        <Avatar a={a} size={38} />
+        <AgentAvatar agent={a} size={38} />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5"><span className="font-semibold text-[0.88rem] truncate">{a.name}</span>{a.origin === 'cloned' && <GitFork size={11} className="text-subtle" title="Clone" />}{a.origin === 'created' && <Sparkles size={11} className="text-accent" title="Recruited dynamically" />}</div>
           <div className="text-[0.72rem] text-muted truncate">{a.title}</div>
@@ -49,8 +38,9 @@ function AgentCard({ a }) {
         {a.supervisor_name && <><span>·</span><span className="truncate">↑ {a.supervisor_name}</span></>}
         <span className="ml-auto">v{a.prompt_version}</span>
       </div>
-      <div className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 bg-panel rounded-md">
+      <div className="absolute top-2 right-2 flex opacity-0 group-hover:opacity-100 focus-within:opacity-100 bg-panel rounded-md">
         <IconButton icon={GitFork} size="sm" label="Clone" onClick={async (e) => { e.stopPropagation(); const c = await api.post(`/api/agents/${a.id}/clone`); toast.success(`Cloned ${a.name} → ${c.name}`); }} />
+        {canMerge(a) && <MergeButton compact clone={a} original={original} onClick={() => onMerge(a)} />}
       </div>
     </div>
   );
@@ -60,6 +50,7 @@ function Registry() {
   const agents = useStore((s) => s.agents);
   const [q, setQ] = useState('');
   const [role, setRole] = useState('');
+  const [merge, setMerge] = useState(null); // clone whose merge is being confirmed
   const list = agents.filter((a) => (!role || a.role === role) && `${a.name} ${a.title} ${a.role} ${(a.skills || []).map((s) => s.name).join(' ')}`.toLowerCase().includes(q.toLowerCase()));
   const roles = [...new Set(agents.map((a) => a.role))].sort();
   return (
@@ -76,12 +67,13 @@ function Registry() {
           return (
             <section key={tier}>
               <div className="flex items-center gap-2 mb-2.5"><span className="text-[0.68rem] font-semibold uppercase tracking-wider text-muted">Level {tier} · {TIERS[tier]}</span><span className="text-[0.68rem] text-subtle tabular">{items.length}</span><span className="flex-1 h-px bg-line" /></div>
-              <div className="grid gap-2.5 grid-cols-[repeat(auto-fill,minmax(250px,1fr))]">{items.map((a) => <AgentCard key={a.id} a={a} />)}</div>
+              <div className="grid gap-2.5 grid-cols-[repeat(auto-fill,minmax(250px,1fr))]">{items.map((a) => <AgentCard key={a.id} a={a} original={canMerge(a) ? mergeOriginal(a, agents) : null} onMerge={setMerge} />)}</div>
             </section>
           );
         })}
         {!list.length && <Empty icon={Bot} title="No agents match" />}
       </div>
+      <MergeConfirm clone={merge} original={merge && mergeOriginal(merge, agents)} onClose={() => setMerge(null)} />
     </div>
   );
 }
@@ -96,7 +88,7 @@ function OrgNode({ node, collapsed, toggle }) {
       <div className="relative inline-flex flex-col items-center">
         <button onClick={() => set({ agentModal: a.id })} className="flex items-center gap-2.5 pl-2 pr-3 py-2 rounded-xl border border-line bg-panel hover:border-accent/60 hover:shadow-af transition-all text-left min-w-44"
           style={{ boxShadow: a.status === 'working' ? `0 0 0 2px ${R.from}55` : undefined }}>
-          <Avatar a={a} size={30} />
+          <AgentAvatar agent={a} size={30} />
           <span className="min-w-0"><span className="block text-[0.8rem] font-semibold truncate">{a.name}</span><span className="block text-[0.66rem] text-subtle truncate max-w-36">{a.title}</span></span>
           <span className="ml-auto text-[0.64rem] text-accent font-semibold tabular">L{a.level}</span>
         </button>

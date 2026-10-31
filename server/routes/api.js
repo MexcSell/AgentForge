@@ -8,14 +8,14 @@ import { config } from '../config.js';
 import { emit } from '../events.js';
 import { getSettings, sanitizeMonitor } from '../db/seed.js';
 import { ROLES, TIERS } from '../roles.js';
-import { listAgents, getAgent, createAgent, cloneAgent, publishAgent } from '../services/agents.js';
+import { listAgents, getAgent, createAgent, cloneAgent, mergeAgent, publishAgent, withAgentLock } from '../services/agents.js';
 import { listProjects, getProject, createProjectRecord, publishProject } from '../services/projects.js';
 import { listTopics, getTopic, createTopic, updateTopic, deleteTopic, isUuid } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
 import { gitInfo } from '../services/git.js';
 import { disposePreview } from '../services/runner.js';
 import { listModels, publishModels, PROVIDERS, runModel, recordRunUsage } from '../models/index.js';
-import { submitCommand, cancelMission, standup, syncNow, approveProposal, rejectProposal } from '../orchestrator/engine.js';
+import { submitCommand, cancelMission, standup, syncNow, approveProposal, rejectProposal, handOver } from '../orchestrator/engine.js';
 import { evolutionOverview, analyzeMission } from '../orchestrator/evolution.js';
 
 const err = (reply, code, message) => reply.code(code).send({ error: message });
@@ -146,28 +146,19 @@ export default async function apiRoutes(app, opts = {}) {
       many(`SELECT version, reason, created_at FROM agent_versions WHERE agent_id = $1 ORDER BY version DESC LIMIT 20`, [a.id]),
       many(`SELECT id, kind, status, model_id, input_tokens, output_tokens, cost_usd, tool_calls, duration_ms, created_at, finished_at FROM runs WHERE agent_id = $1 ORDER BY created_at DESC LIMIT 30`, [a.id]),
     ]);
-    // A shared agent runs tasks of several missions at once; `current` stays the most recently started one.
-    const running = await many(`SELECT t.*, p.name AS project_name FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.agent_id = $1 AND t.status = 'running' ORDER BY t.started_at DESC NULLS LAST, t.created_at DESC`, [a.id]);
-    const currentTasks = running.map((t) => ({ id: t.id, key: t.key, title: t.title, progress: t.progress, started_at: t.started_at, project_id: t.project_id, project_name: t.project_name, mission_id: t.mission_id }));
+    const current = a.current_task_id ? await one(`SELECT t.*, p.name AS project_name FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = $1`, [a.current_task_id]) : null;
     const reports = await many(`SELECT id, name, role, title, status, level FROM agents WHERE supervisor_id = $1 AND NOT archived`, [a.id]);
-    return { ...a, tasks, experiences, versions, runs, current: running[0] || null, currentTasks, reportsList: reports };
+    // Clone lineage, for the Merge button label and the banner of a merged clone.
+    const names = await one(`SELECT (SELECT name FROM agents WHERE id = $1) AS cloned_from_name, (SELECT name FROM agents WHERE id = $2) AS merged_into_name`, [a.cloned_from, a.merged_into]);
+    return { ...a, ...names, tasks, experiences, versions, runs, current, reportsList: reports };
   });
 
-  // Latest run (or ?run=<id> of this agent) + its event stream, for the live "thinking" pane.
-  // activeRuns lists every run the agent has in flight, one per task it is working on.
-  app.get('/api/agents/:id/live', async (req, reply) => {
-    const pick = req.query.run || null;
-    if (pick && !isUuid(pick)) return err(reply, 400, 'Invalid run id');
-    const [run, activeRuns] = await Promise.all([
-      one(`SELECT r.*, t.title AS task_title, t.key AS task_key FROM runs r LEFT JOIN tasks t ON t.id = r.task_id WHERE r.agent_id = $1${pick ? ' AND r.id = $2' : ''} ORDER BY r.created_at DESC LIMIT 1`, [req.params.id, ...(pick ? [pick] : [])]),
-      many(`SELECT r.id, r.kind, r.task_id, t.key AS task_key, t.title AS task_title, r.project_id, p.name AS project_name, r.created_at
-            FROM runs r LEFT JOIN tasks t ON t.id = r.task_id LEFT JOIN projects p ON p.id = r.project_id
-            WHERE r.agent_id = $1 AND r.status = 'running' ORDER BY r.created_at DESC`, [req.params.id]),
-    ]);
-    if (pick && !run) return err(reply, 404, 'Run not found for this agent');
-    if (!run) return { run: null, events: [], activeRuns };
+  // Latest run + its event stream, for the live "thinking" pane.
+  app.get('/api/agents/:id/live', async (req) => {
+    const run = await one(`SELECT r.*, t.title AS task_title, t.key AS task_key FROM runs r LEFT JOIN tasks t ON t.id = r.task_id WHERE r.agent_id = $1 ORDER BY r.created_at DESC LIMIT 1`, [req.params.id]);
+    if (!run) return { run: null, events: [] };
     const events = await many(`SELECT * FROM (SELECT id, ts, type, data FROM run_events WHERE run_id = $1 ORDER BY id DESC LIMIT 400) x ORDER BY id`, [run.id]);
-    return { run, events, activeRuns };
+    return { run, events };
   });
 
   app.post('/api/agents', async (req, reply) => {
@@ -194,16 +185,41 @@ export default async function apiRoutes(app, opts = {}) {
 
   app.post('/api/agents/:id/clone', async (req) => cloneAgent(req.params.id, 'manual clone'));
 
+  // Merge (return) an idle clone into its original, combining what it learned. Its pending work goes to the original.
+  app.post('/api/agents/:id/merge', async (req, reply) => {
+    if (!isUuid(req.params.id)) return err(reply, 404, 'Not found');
+    let out;
+    try {
+      out = await mergeAgent(req.params.id);
+    } catch (e) {
+      if (e.status) return err(reply, e.status, e.message);
+      throw e;
+    }
+    const { projects, ...merged } = out;
+    for (const id of projects) await publishProject(id).catch(() => {});
+    // The merge is done either way; a task the hand-over misses is replaced when it starts.
+    await handOver(req.params.id).catch((e) => console.error('[handover]', e.message));
+    return merged;
+  });
+
   app.delete('/api/agents/:id', async (req, reply) => {
     const a = await getAgent(req.params.id);
     if (!a) return err(reply, 404, 'Not found');
     if (a.role === 'executive') return err(reply, 400, 'The executive agent cannot be removed');
     if (await one(`SELECT 1 FROM projects WHERE manager_id = $1`, [a.id])) return err(reply, 400, 'This agent manages a project');
-    if (a.status === 'working') return err(reply, 409, 'Agent is working');
-    await query(`UPDATE agents SET supervisor_id = $2 WHERE supervisor_id = $1`, [a.id, a.supervisor_id]);
-    await query(`UPDATE agents SET archived = true, status = 'offline' WHERE id = $1`, [a.id]);
+    // In the agent's 'claim' lane, so no task can start on it between this check and the archive.
+    const removed = await withAgentLock('claim', a.id, async () => {
+      const busy = await one(`SELECT 1 FROM agents b WHERE b.id = $1 AND (b.status = 'working' OR EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = b.id AND t.status = 'running'))`, [a.id]);
+      if (busy) return false;
+      await query(`UPDATE agents SET supervisor_id = $2 WHERE supervisor_id = $1`, [a.id, a.supervisor_id]);
+      await query(`UPDATE agents SET archived = true, status = 'offline' WHERE id = $1`, [a.id]);
+      return true;
+    });
+    if (!removed) return err(reply, 409, 'Agent is working');
     emit('agent:delete', { id: a.id });
     await audit('user', 'agent.archive', a.name);
+    // Pending work in running missions goes to a similar agent instead of waiting on an archived one.
+    await handOver(a.id).catch((e) => console.error('[handover]', e.message));
     return { ok: true };
   });
 

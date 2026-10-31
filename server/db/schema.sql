@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS agents (
   created_at      timestamptz NOT NULL DEFAULT now(),
   updated_at      timestamptz NOT NULL DEFAULT now()
 );
+-- Clone lifecycle: clone_base is a clone's starting point ({ xp, skills } when it was copied), so a merge adds back
+-- only what it learned since; merged_into is the agent a merged clone was folded into.
+ALTER TABLE agents
+  ADD COLUMN IF NOT EXISTS clone_base  jsonb,
+  ADD COLUMN IF NOT EXISTS merged_into uuid REFERENCES agents(id) ON DELETE SET NULL;
 
 CREATE TABLE IF NOT EXISTS projects (
   id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
