@@ -135,25 +135,34 @@ export function combineLearning(target, clone) {
 }
 
 /**
- * Fold the clone's playbook into the original's: a deduplicated union capped at playbookSize, keeping the entries
- * backed by the highest-scored lessons. Promoted (versioned) only when it differs. Returns the new version or null.
- * Run after the clone's lessons moved to the original, inside the original's learn lane.
+ * The playbook own becomes with other folded in: a deduplicated union capped at size, keeping the entries backed by
+ * the highest-scored of lessons ({ content, score }). Null when nothing changes. Pure.
+ */
+export function foldPlaybooks(own = [], other = [], lessons = [], size = 8) {
+  const key = (e) => norm(String(e)).slice(0, 60);
+  const ownKeys = new Set(own.map(key));
+  if (!other.some((e) => !ownKeys.has(key(e)))) return null;
+  const score = new Map();
+  for (const l of lessons) score.set(key(l.content), Math.max(score.get(key(l.content)) ?? 0, l.score));
+  const union = [];
+  for (const e of [...own, ...other]) if (!union.some((u) => u.k === key(e))) union.push({ e, k: key(e) });
+  // Best-backed entries win the slots (ties keep the original's first); the kept ones stay in union order.
+  const kept = new Set([...union].sort((a, b) => (score.get(b.k) ?? 0) - (score.get(a.k) ?? 0)).slice(0, size));
+  const playbook = union.filter((u) => kept.has(u)).map((u) => u.e);
+  return JSON.stringify(playbook) === JSON.stringify(own) ? null : playbook;
+}
+
+/**
+ * Fold the source's playbook into the target's (foldPlaybooks over the target's lessons, capped at playbookSize).
+ * Promoted (versioned) only when it differs. Returns the new version or null.
+ * Run after the source's lessons moved to the target, inside the target's learn lane.
  */
 export async function mergePlaybooks(target, clone, settings) {
-  const key = (e) => norm(String(e)).slice(0, 60);
   const own = target.playbook || [];
-  const ownKeys = new Set(own.map(key));
-  if (!(clone.playbook || []).some((e) => !ownKeys.has(key(e)))) return null;
-  const score = new Map();
-  for (const l of await many(`SELECT content, score FROM experiences WHERE agent_id = $1 AND kind = 'lesson'`, [target.id])) {
-    score.set(key(l.content), Math.max(score.get(key(l.content)) ?? 0, l.score));
-  }
-  const union = [];
-  for (const e of [...own, ...clone.playbook]) if (!union.some((u) => u.k === key(e))) union.push({ e, k: key(e) });
-  // Best-backed entries win the slots (ties keep the original's first); the kept ones stay in union order.
-  const kept = new Set([...union].sort((a, b) => (score.get(b.k) ?? 0) - (score.get(a.k) ?? 0)).slice(0, settings.evolution?.playbookSize || 8));
-  const playbook = union.filter((u) => kept.has(u)).map((u) => u.e);
-  if (JSON.stringify(playbook) === JSON.stringify(own)) return null;
+  if (!foldPlaybooks(own, clone.playbook || [], [], Infinity)) return null; // nothing new: no lesson read
+  const lessons = await many(`SELECT content, score FROM experiences WHERE agent_id = $1 AND kind = 'lesson'`, [target.id]);
+  const playbook = foldPlaybooks(own, clone.playbook, lessons, settings.evolution?.playbookSize || 8);
+  if (!playbook) return null;
   return promote(target, playbook, `Merged from ${clone.name}`);
 }
 

@@ -8,7 +8,7 @@ import { config } from '../config.js';
 import { emit } from '../events.js';
 import { getSettings, sanitizeMonitor } from '../db/seed.js';
 import { ROLES, TIERS } from '../roles.js';
-import { listAgents, getAgent, createAgent, cloneAgent, mergeAgent, publishAgent, publishCloneTargets, withAgentLock, liveAncestor } from '../services/agents.js';
+import { listAgents, getAgent, createAgent, cloneAgent, mergeAgent, consolidateRole, previewConsolidate, publishAgent, publishCloneTargets, withAgentLock, liveAncestor } from '../services/agents.js';
 import { listProjects, getProject, createProjectRecord, publishProject } from '../services/projects.js';
 import { listTopics, getTopic, createTopic, updateTopic, deleteTopic, isUuid } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
@@ -247,6 +247,35 @@ export default async function apiRoutes(app, opts = {}) {
     // The merge is done either way; a task the hand-over misses is replaced when it starts.
     await handOver(req.params.id).catch((e) => console.error('[handover]', e.message));
     return merged;
+  });
+
+  // Read-only preview of POST /api/agents/consolidate: ?role=…[&keeperId=…] → { keeper, merged, skipped, result, moves }.
+  app.get('/api/agents/consolidate/preview', async (req, reply) => {
+    let out;
+    try {
+      out = await previewConsolidate(req.query.role, { keeperId: req.query.keeperId || null });
+    } catch (e) {
+      if (e.status) return err(reply, e.status, e.message);
+      throw e;
+    }
+    return { ...out, moves: await previewHandOver(out.merged.map((m) => m.id), { mergeInto: out.keeper }) };
+  });
+
+  // Fold every live agent of a role into one keeper, combining what they learned. Their pending work goes to the keeper.
+  app.post('/api/agents/consolidate', async (req, reply) => {
+    const { role, keeperId } = req.body || {};
+    let out;
+    try {
+      out = await consolidateRole(role, { keeperId: keeperId || null });
+    } catch (e) {
+      if (e.status) return err(reply, e.status, e.message);
+      throw e;
+    }
+    const { projects, ...result } = out;
+    for (const id of projects) await publishProject(id).catch(() => {});
+    // Each source resolves to the keeper through merged_into; a task the hand-over misses is replaced when it starts.
+    for (const m of result.merged) await handOver(m.id).catch((e) => console.error('[handover]', e.message));
+    return result;
   });
 
   app.delete('/api/agents/:id', async (req, reply) => {

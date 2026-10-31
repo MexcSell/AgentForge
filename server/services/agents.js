@@ -3,7 +3,7 @@ import { getSettings } from '../db/seed.js';
 import { emit } from '../events.js';
 import { CODENAMES, roleInfo, normalizeRole } from '../roles.js';
 import { notify, audit } from './notify.js';
-import { combineLearning, mergePlaybooks, event as evolutionEvent } from '../orchestrator/evolution.js';
+import { combineLearning, mergePlaybooks, foldPlaybooks, event as evolutionEvent } from '../orchestrator/evolution.js';
 
 /**
  * Walk up a clone's chain in SQL: from start, step past each archived agent to its merged_into (else cloned_from),
@@ -202,13 +202,14 @@ export async function liveAncestor(clone) {
  * Merge (return) an idle clone into its original: what it learned since it was copied is added to the original,
  * its experiences move over, and the clone is archived with merged_into set.
  * Lanes: the clone's 'claim' (no task can start on it meanwhile) and 'learn' lanes, then the original's 'learn'
- * lane, so a task the original finishes at the same moment loses nothing. Always clone before ancestor: no deadlock.
+ * lane, so a task the original finishes at the same moment loses nothing. Always clone before ancestor. All of it runs in
+ * the role's 'merge-role' lane, shared with consolidateRole(), whose keeper may be a clone of its source: no deadlock.
  */
 export async function mergeAgent(cloneId) {
   const found = await getAgent(cloneId);
   if (!found) throw httpError(404, 'Not found');
   if (found.origin !== 'cloned') throw httpError(400, 'Only clones can be merged');
-  const { clone, target, merged, projects } = await withAgentLock('claim', found.id, () => withAgentLock('learn', found.id, async () => {
+  const { clone, target, merged, projects } = await withAgentLock('merge-role', found.role, () => withAgentLock('claim', found.id, () => withAgentLock('learn', found.id, async () => {
     const c = await one(`SELECT a.*, EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running') AS running FROM agents a WHERE a.id = $1`, [found.id]);
     if (c.archived) throw httpError(409, c.merged_into ? 'This clone was already merged' : 'Agent is archived');
     if (c.running || c.status === 'working') throw httpError(409, 'Agent is working');
@@ -218,7 +219,7 @@ export async function mergeAgent(cloneId) {
       const done = await withAgentLock('learn', up.id, () => absorb(c.id, up.id));
       if (done) return done; // null: that original was archived meanwhile, look further up
     }
-  }));
+  })));
   await evolutionEvent('merge', target.id, `${clone.name} merged back into ${target.name}`, { clone: clone.id, cloneName: clone.name, ...merged });
   await notify({ source_type: 'admin', source_name: 'Admin', agent_id: target.id, level: 'success', title: `Merged ${clone.name} into ${target.name}`,
     body: `+${merged.xp} XP · ${merged.skills} skills · ${merged.lessons} lessons${merged.playbookVersion ? ` · playbook v${merged.playbookVersion}` : ''}` });
@@ -229,27 +230,29 @@ export async function mergeAgent(cloneId) {
   return { agent: await publishAgent(target.id), merged, projects };
 }
 
-// One transaction: the original gains the clone's learning, experiences and reports, and the clone is retired.
-async function absorb(cloneId, targetId) {
+// One transaction: the target gains the source's learning, experiences, reports and GM projects, and the source is retired.
+// The source is a clone merging into its original, or any agent of the target's role being consolidated into it.
+async function absorb(sourceId, targetId) {
   const settings = await getSettings();
   const db = await pool.connect();
-  let clone, target, gained, moved, projects;
+  let source, target, gained, moved, projects;
   try {
     await db.query('BEGIN');
-    const rows = (await db.query(`SELECT * FROM agents WHERE id = ANY($1) FOR UPDATE`, [[cloneId, targetId]])).rows;
-    clone = rows.find((r) => r.id === cloneId);
+    const rows = (await db.query(`SELECT * FROM agents WHERE id = ANY($1) FOR UPDATE`, [[sourceId, targetId]])).rows;
+    source = rows.find((r) => r.id === sourceId);
     target = rows.find((r) => r.id === targetId);
-    if (clone.archived) throw httpError(409, 'Agent is archived');
+    if (source.archived) throw httpError(409, 'Agent is archived');
     if (!target || target.archived) { await db.query('ROLLBACK'); return null; }
-    const m = combineLearning(target, clone);
+    if (source.role !== target.role) throw httpError(409, 'Only agents of the same role can be merged');
+    const m = combineLearning(target, source);
     gained = m.gained;
     await db.query(`UPDATE agents SET xp=$2, level=$3, skills=$4, stats=stats || $5, updated_at=now() WHERE id=$1`, [target.id, m.xp, m.level, JSON.stringify(m.skills), m.stats]);
-    moved = (await db.query(`UPDATE experiences SET agent_id = $2 WHERE agent_id = $1 AND kind IN ('lesson', 'failure') RETURNING kind`, [clone.id, target.id])).rows;
-    // Reports move to the original (which itself falls back to the clone's supervisor if it reported to the clone).
-    await db.query(`UPDATE agents SET supervisor_id = CASE WHEN id = $2 THEN NULLIF($3::uuid, $2) ELSE $2 END, updated_at=now() WHERE supervisor_id = $1`, [clone.id, target.id, clone.supervisor_id]);
-    // Projects the clone managed get the original as General Manager, in the same step that retires the clone.
-    projects = (await db.query(`UPDATE projects SET manager_id = $2, updated_at = now() WHERE manager_id = $1 RETURNING id`, [clone.id, target.id])).rows.map((r) => r.id);
-    await db.query(`UPDATE agents SET archived=true, status='offline', merged_into=$2, current_task_id=NULL, updated_at=now() WHERE id=$1`, [clone.id, target.id]);
+    moved = (await db.query(`UPDATE experiences SET agent_id = $2 WHERE agent_id = $1 AND kind IN ('lesson', 'failure') RETURNING kind`, [source.id, target.id])).rows;
+    // Reports move to the target (which itself falls back to the source's supervisor if it reported to the source).
+    await db.query(`UPDATE agents SET supervisor_id = CASE WHEN id = $2 THEN NULLIF($3::uuid, $2) ELSE $2 END, updated_at=now() WHERE supervisor_id = $1`, [source.id, target.id, source.supervisor_id]);
+    // Projects the source managed get the target as General Manager, in the same step that retires the source.
+    projects = (await db.query(`UPDATE projects SET manager_id = $2, updated_at = now() WHERE manager_id = $1 RETURNING id`, [source.id, target.id])).rows.map((r) => r.id);
+    await db.query(`UPDATE agents SET archived=true, status='offline', merged_into=$2, current_task_id=NULL, updated_at=now() WHERE id=$1`, [source.id, target.id]);
     await db.query('COMMIT');
   } catch (e) {
     await db.query('ROLLBACK').catch(() => {});
@@ -257,7 +260,108 @@ async function absorb(cloneId, targetId) {
   } finally {
     db.release();
   }
-  const playbookVersion = await mergePlaybooks(target, clone, settings);
+  const playbookVersion = await mergePlaybooks(target, source, settings);
   const lessons = moved.filter((r) => r.kind === 'lesson').length;
-  return { clone, target, projects, merged: { skills: gained.skills, xp: gained.xp, lessons, failures: moved.length - lessons, playbookVersion } };
+  return { clone: source, target, projects, merged: { skills: gained.skills, xp: gained.xp, lessons, failures: moved.length - lessons, playbookVersion } };
+}
+
+// Roles the organization itself runs on (direction, evolution, project GMs): never consolidated.
+export const SYSTEM_ROLES = new Set(['executive', 'evolution', 'analyst', 'optimizer', 'manager']);
+
+const busyReason = (a) => (a.running ? 'Has a running task' : a.status === 'working' ? 'Agent is working' : null);
+
+/**
+ * Who a consolidation of role keeps and folds in. keeper: keeperId (a live agent of the role), else the live agent of
+ * the role with the highest level, then XP, then the oldest. sources: every other live agent of the role, oldest first
+ * (the fold order), each with running (has a running task). SELECT-only.
+ */
+async function consolidatePlan(role, keeperId) {
+  const r = String(role ?? '').trim().toLowerCase();
+  if (!r) throw httpError(400, 'Role is required');
+  if (SYSTEM_ROLES.has(r)) throw httpError(400, `${roleInfo(r).title} agents cannot be consolidated`);
+  const rows = await many(
+    `SELECT a.*, EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running') AS running
+     FROM agents a WHERE a.role = $1 AND NOT a.archived ORDER BY a.level DESC, a.xp DESC, a.created_at, a.id`, [r]);
+  const keeper = keeperId ? rows.find((a) => a.id === keeperId) : rows[0];
+  if (!keeper) throw httpError(keeperId ? 400 : 404, keeperId ? `The keeper must be a live ${r} agent` : `No live ${r} agents`);
+  const sources = rows.filter((a) => a.id !== keeper.id).sort((a, b) => a.created_at - b.created_at || (a.id < b.id ? -1 : 1));
+  return { role: r, keeper, sources };
+}
+
+/**
+ * Read-only preview of consolidateRole(): the same keeper, merged and skipped sets, with what each source would add
+ * (the combineLearning fold in order, the lessons and failures it moves, the playbook version a change would get).
+ * result: the keeper's XP, level, skills and playbook version afterwards.
+ */
+export async function previewConsolidate(role, { keeperId = null } = {}) {
+  const { keeper, sources } = await consolidatePlan(role, keeperId);
+  const settings = await getSettings();
+  const exps = await many(`SELECT agent_id, kind, content, score FROM experiences WHERE agent_id = ANY($1) AND kind IN ('lesson', 'failure')`, [[keeper.id, ...sources.map((s) => s.id)]]);
+  const lessonsOf = (id) => exps.filter((e) => e.agent_id === id && e.kind === 'lesson');
+  let t = keeper;
+  let lessons = lessonsOf(keeper.id);
+  const merged = [];
+  const skipped = [];
+  for (const s of sources) {
+    const reason = busyReason(s);
+    if (reason) { skipped.push({ id: s.id, name: s.name, reason }); continue; }
+    const m = combineLearning(t, s);
+    const own = lessonsOf(s.id);
+    lessons = [...lessons, ...own];
+    const playbook = foldPlaybooks(t.playbook || [], s.playbook || [], lessons, settings.evolution?.playbookSize || 8);
+    t = { ...t, xp: m.xp, level: m.level, skills: m.skills, stats: { ...t.stats, ...m.stats }, playbook: playbook || t.playbook, prompt_version: t.prompt_version + (playbook ? 1 : 0) };
+    const failures = exps.filter((e) => e.agent_id === s.id && e.kind === 'failure').length;
+    merged.push({ id: s.id, name: s.name, xp: m.gained.xp, skills: m.gained.skills, lessons: own.length, failures, playbookVersion: playbook ? t.prompt_version : null });
+  }
+  return { keeper: await getAgent(keeper.id), merged, skipped, result: { xp: t.xp, level: t.level, skills: t.skills, prompt_version: t.prompt_version } };
+}
+
+/**
+ * Fold every other live agent of role into one keeper (see consolidatePlan), one source at a time, each like a clone
+ * merge: absorb() moves its learning, experiences, reports and GM projects, merges playbooks and archives it with
+ * merged_into = keeper. A source that is working or has a running task is skipped with a reason. Lanes per source, in
+ * mergeAgent()'s order: its 'claim', its 'learn', then the keeper's 'learn'; the whole run holds the role's
+ * 'merge-role' lane, so two consolidations (or a clone merge) of one role never take each other's lanes in reverse.
+ * Returns { keeper, merged, skipped, projects }; the caller publishes projects and hands the merged sources' pending
+ * work over (they resolve to the keeper through merged_into).
+ */
+export async function consolidateRole(role, { keeperId = null } = {}) {
+  const r = (await consolidatePlan(role, keeperId)).role; // refuse before queueing behind the lane
+  const out = await withAgentLock('merge-role', r, async () => {
+    const { keeper, sources } = await consolidatePlan(r, keeperId);
+    const merged = [];
+    const skipped = [];
+    const projects = new Set();
+    for (const s of sources) {
+      const done = await withAgentLock('claim', s.id, () => withAgentLock('learn', s.id, async () => {
+        const c = await one(`SELECT a.*, EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running') AS running FROM agents a WHERE a.id = $1`, [s.id]);
+        if (!c || c.archived) return { reason: 'Agent is archived' };
+        const reason = busyReason(c);
+        if (reason) return { reason };
+        try {
+          return (await withAgentLock('learn', keeper.id, () => absorb(c.id, keeper.id))) || { reason: `${keeper.name} was archived` };
+        } catch (e) {
+          if (e.status) return { reason: e.message }; // refused inside the transaction (rolled back): leave it as it is
+          throw e;
+        }
+      }));
+      if (done.reason) { skipped.push({ id: s.id, name: s.name, reason: done.reason }); continue; }
+      const { xp, skills, lessons, failures, playbookVersion } = done.merged;
+      merged.push({ id: s.id, name: s.name, xp, skills, lessons, failures, playbookVersion });
+      for (const id of done.projects) projects.add(id);
+      await evolutionEvent('merge', keeper.id, `${s.name} consolidated into ${keeper.name}`, { source: s.id, sourceName: s.name, origin: s.origin, consolidate: r, ...done.merged });
+      emit('agent:delete', { id: s.id });
+      await publishCloneTargets(s.id);
+    }
+    return { keeper, merged, skipped, projects: [...projects] };
+  });
+  const { keeper, merged, skipped } = out;
+  const total = (k) => merged.reduce((n, m) => n + m[k], 0);
+  const totals = { xp: total('xp'), skills: total('skills'), lessons: total('lessons'), failures: total('failures') };
+  if (merged.length) {
+    await notify({ source_type: 'admin', source_name: 'Admin', agent_id: keeper.id, level: 'success', title: `Consolidated ${merged.length} ${roleInfo(r).title} agent${merged.length === 1 ? '' : 's'} into ${keeper.name}`,
+      body: `+${totals.xp} XP · ${totals.skills} skills · ${totals.lessons} lessons · ${totals.failures} failures${skipped.length ? ` · ${skipped.length} skipped` : ''}` });
+  }
+  await audit('user', 'agent.consolidate', keeper.name, { role: r, keeperId: keeper.id, merged: merged.map((m) => ({ id: m.id, name: m.name })), skipped, ...totals });
+  return { keeper: await publishAgent(keeper.id), merged, skipped, projects: out.projects };
 }
