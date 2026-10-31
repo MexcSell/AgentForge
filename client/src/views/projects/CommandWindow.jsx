@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Send, ImagePlus, X, Copy, Check, Users, Square, Trash2, Lock, FolderOpen, Settings2, ArrowRight, Lightbulb, ThumbsUp, ThumbsDown,
   ListTree, Sparkles, CircleCheck, CircleX, TriangleAlert, Workflow, UserPlus, CopyPlus, Loader2, Slash,
-  Hash, Plus, Pencil, Split, CornerDownRight, Archive, ArchiveRestore, MonitorPlay,
+  Hash, Plus, Pencil, Split, CornerDownRight, Archive, ArchiveRestore, MonitorPlay, ChevronRight,
 } from 'lucide-react';
 import { api } from '../../lib/api.js';
 import { useStore, selectRuns } from '../../lib/store.js';
@@ -84,9 +84,20 @@ const VERDICT = {
   escalate: { tone: 'warn', icon: TriangleAlert, label: (by) => `Escalated by ${by} — needs your call` },
 };
 
+const selectTriage = (s) => s.settings?.orchestrator?.proposalTriage !== false && !s.settings?.orchestrator?.autoApproveProposals;
+
+/**
+ * Superiors decide proposals; the user only gets Approve/Reject on a still-proposed task that was escalated to them
+ * (or that nobody else decides because triage is off).
+ */
+function needsUser(m, t, triage) {
+  const d = proposalDecision(m, t);
+  return (!t || t.status === 'proposed') && (d?.verdict === 'escalate' || (!triage && !d));
+}
+
 function ProposalBody({ m, tasks }) {
   const t = tasks?.find((x) => x.id === m.meta?.task_id);
-  const triage = useStore((s) => s.settings?.orchestrator?.proposalTriage !== false && !s.settings?.orchestrator?.autoApproveProposals);
+  const triage = useStore(selectTriage);
   // Triage runs inside the proposing mission, so an undecided proposal of a finished mission is a legacy row.
   const live = useStore((s) => {
     const x = s.missionsByTopic[m.topic_id];
@@ -112,7 +123,7 @@ function ProposalBody({ m, tasks }) {
           {d.reason && <span className="text-xs text-muted">{d.reason}</span>}
         </div>
       )}
-      {pending && !awaiting && (
+      {needsUser(m, t, triage) && (
         <div className="flex gap-2">
           <Button size="sm" variant="primary" icon={ThumbsUp} onClick={() => api.post(`/api/tasks/${m.meta.task_id}/approve`)}>Approve → new mission</Button>
           <Button size="sm" variant="ghost" icon={ThumbsDown} onClick={() => api.post(`/api/tasks/${m.meta.task_id}/reject`)}>Reject</Button>
@@ -182,6 +193,40 @@ function TopicEmpty({ project, topic, topics, tasks, onPick }) {
   );
 }
 
+const TASK_MARK = { done: { mark: '✓', cls: 'text-ok' }, cancelled: { mark: '⊘', cls: 'text-subtle' } };
+
+/** The summary's per-task lines (meta.tasks), collapsed under the GM digest. */
+function TaskDetails({ m }) {
+  const [open, setOpen] = useState(false);
+  const id = `task-details-${m.id}`;
+  return (
+    <div className="mt-2.5 pt-2 border-t border-line">
+      <button type="button" aria-expanded={open} aria-controls={id} onClick={() => setOpen(!open)}
+        className="flex items-center gap-1 text-xs text-muted hover:text-fg focus-visible:outline-accent!">
+        <ChevronRight size={12} className={cx('transition-transform motion-reduce:transition-none', open && 'rotate-90')} />Task details
+        <span className="tabular text-subtle">({m.meta.tasks.length})</span>
+      </button>
+      {open && (
+        <ul id={id} className="mt-1.5 flex flex-col gap-1">
+          {m.meta.tasks.map((t) => {
+            const s = TASK_MARK[t.status] || { mark: '✗', cls: 'text-bad' };
+            return (
+              <li key={t.key} className="flex items-baseline gap-2 text-xs min-w-0">
+                <span className={cx('w-3 shrink-0 text-center', s.cls)} aria-label={t.status} title={t.status}>{s.mark}</span>
+                <span className="mono text-[0.7rem] text-subtle shrink-0">{t.key}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="font-medium">{t.title}</span>
+                  <span className="text-muted"> — {t.agent || '—'}{(t.summary ?? t.line) ? `: ${t.summary ?? t.line}` : ''}</span>
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function Message({ m, count, tasks }) {
   const [zoom, setZoom] = useState(null);
   const time = <span className="text-[0.68rem] text-subtle" title={dateTime(m.created_at)}>{clockTime(m.created_at)}</span>;
@@ -247,6 +292,7 @@ function Message({ m, count, tasks }) {
         </div>
         <div className={cx('rounded-xl border px-3.5 py-2.5 bg-panel', frame.cls)}>
           {m.kind === 'plan' ? <PlanBody m={m} /> : m.kind === 'proposal' ? <ProposalBody m={m} tasks={tasks} /> : <Markdown>{m.content}</Markdown>}
+          {m.kind === 'summary' && m.meta?.tasks?.length > 0 && <TaskDetails m={m} />}
           {m.kind === 'report' && m.meta?.artifacts?.length > 0 && (
             <div className="flex flex-wrap gap-1.5 mt-2.5 pt-2.5 border-t border-line">
               {m.meta.artifacts.slice(0, 12).map((a) => <span key={a} className="text-[0.7rem] mono px-1.5 py-0.5 rounded bg-sunken border border-line text-muted">{a}</span>)}
@@ -256,6 +302,52 @@ function Message({ m, count, tasks }) {
         </div>
         {images}
       </div>
+    </div>
+  );
+}
+
+/**
+ * The topic feed keeps the GM's main content: orders, the GM's chat/plan/summary/error/meeting/status lines, system
+ * messages and moved-topic notices. Worker reports and proposals, other agents' statuses and meta.detail chatter fold
+ * into one row per mission. An escalated proposal waiting for the user stays visible.
+ */
+function isHeadline(m, gmId, tasks, triage) {
+  if (m.author_type === 'user' || (m.kind === 'status' && m.meta?.topic_id)) return true;
+  if (m.kind === 'proposal') return needsUser(m, tasks?.find((x) => x.id === m.meta?.task_id), triage);
+  if (m.meta?.detail) return false;
+  if (m.author_type === 'system') return true;
+  return !!m.agent_id && m.agent_id === gmId && m.kind !== 'report';
+}
+
+const sameMessage = (a, b) => a.content === b.content && a.author_type === b.author_type && a.agent_id === b.agent_id && a.kind === b.kind && !b.attachments?.length;
+
+/** Collapse consecutive identical messages into one with a counter. */
+function groupIdentical(list) {
+  const out = [];
+  for (const m of list) {
+    const prev = out[out.length - 1];
+    if (prev?.m && sameMessage(prev.m, m)) prev.count++;
+    else out.push({ m, count: 1 });
+  }
+  return out;
+}
+
+/** A mission's folded agent updates: one collapsed row; expanded, the usual message rendering in original order. */
+function AgentUpdates({ id, total, items, tasks }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="py-0.5">
+      <button type="button" aria-expanded={open} aria-controls={id} onClick={() => setOpen(!open)}
+        className="group flex items-center gap-2 w-full px-4 py-1 text-xs text-muted hover:text-fg text-left focus-visible:outline-accent!">
+        <span className="w-8 flex justify-center"><ChevronRight size={13} className={cx('transition-transform motion-reduce:transition-none', open && 'rotate-90')} /></span>
+        <span className="tabular">{total} agent update{total === 1 ? '' : 's'}</span>
+        <span className="flex-1 border-t border-dashed border-line" />
+      </button>
+      {open && (
+        <div id={id} className="ml-6 border-l border-line">
+          {items.map(({ m, count }) => <Message key={m.id} m={m} count={count} tasks={tasks} />)}
+        </div>
+      )}
     </div>
   );
 }
@@ -323,22 +415,41 @@ export function CommandWindow({ project }) {
   useEffect(() => { st.loadPreview(project.id).catch(() => {}); }, [project.id]);
   const previewRunning = st.previews[project.id]?.status === 'running';
 
-  // Collapse consecutive identical messages into one with a counter.
+  // Headline messages stay in the feed; each mission's other messages fold into one row placed before its summary,
+  // or after its latest message while it runs. Identical-message grouping runs after the split, on both sides.
+  const triage = useStore(selectTriage);
   const grouped = useMemo(() => {
+    const list = messages || EMPTY;
+    const head = list.map((m) => isHeadline(m, project.manager_id, tasks, triage));
+    const folded = new Map(); // mission id ('' without one) → its folded messages
+    const anchor = new Map(); // mission id → { at: index in list, before: true at its summary }
+    list.forEach((m, i) => {
+      const k = m.mission_id || '';
+      if (!head[i]) folded.set(k, [...(folded.get(k) || []), m]);
+      if (m.kind === 'summary' && head[i]) anchor.set(k, { at: i, before: true });
+      else if (!anchor.get(k)?.before) anchor.set(k, { at: i, before: false });
+    });
     const out = [];
-    for (const m of messages || []) {
-      const prev = out[out.length - 1];
-      if (prev && prev.m.content === m.content && prev.m.author_type === m.author_type && prev.m.agent_id === m.agent_id && prev.m.kind === m.kind && !m.attachments?.length) prev.count++;
-      else out.push({ m, count: 1 });
-    }
+    const fold = (k) => out.push({ fold: k, total: folded.get(k).length, items: groupIdentical(folded.get(k)) });
+    list.forEach((m, i) => {
+      const k = m.mission_id || '';
+      const a = folded.has(k) && anchor.get(k).at === i ? anchor.get(k) : null;
+      if (a?.before) fold(k);
+      if (head[i]) {
+        const prev = out[out.length - 1];
+        if (prev?.m && sameMessage(prev.m, m)) prev.count++;
+        else out.push({ m, count: 1 });
+      }
+      if (a && !a.before) fold(k);
+    });
     return out;
-  }, [messages]);
+  }, [messages, project.manager_id, tasks, triage]);
 
   useEffect(() => { stick.current = true; }, [project.id, topicId]);
   useEffect(() => {
     const el = scroller.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [grouped.length, project.id, topicId]);
+  }, [messages?.length, grouped.length, project.id, topicId]);
 
   // Topics run their missions side by side. The header, mission bar and "Agents are working…" follow the active topic's
   // own mission; missions of other topics only get an informational line with links.
@@ -472,7 +583,9 @@ export function CommandWindow({ project }) {
                 <CornerDownRight size={11} />Continued from an order in <button className="font-medium text-fg hover:underline" onClick={() => st.setActiveTopic(project.id, origin.id)}>{origin.title}</button>
               </div>
             )}
-            {grouped.map(({ m, count }) => <Message key={m.id} m={m} count={count} tasks={tasks} />)}
+            {grouped.map((g) => g.fold != null
+              ? <AgentUpdates key={`fold:${g.fold}`} id={`agent-updates-${topicId}-${g.fold || 'none'}`} total={g.total} items={g.items} tasks={tasks} />
+              : <Message key={g.m.id} m={g.m} count={g.count} tasks={tasks} />)}
           </div>
         )}
         {run && (
