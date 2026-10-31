@@ -134,7 +134,7 @@ export function AgentAvatar({ agent, role, size = 32, status, className }) {
       style={{ width: size, height: size, backgroundImage: `linear-gradient(135deg, ${st.from}, ${st.to})` }}>
       <RoleIcon role={r} size={Math.round(size * 0.52)} />
       {s && s !== 'idle' && (
-        <span className="absolute -bottom-0.5 -right-0.5 rounded-full p-[2px] bg-panel"><StatusDot status={s} /></span>
+        <span className="absolute -bottom-0.5 -right-0.5 flex rounded-full p-[2px] bg-panel"><StatusDot status={s} /></span>
       )}
     </span>
   );
