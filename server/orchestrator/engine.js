@@ -12,7 +12,7 @@ import { ensureMembers, memberStanding } from '../services/members.js';
 import { syncProject, touchedFiles, repoPaths } from '../services/git.js';
 import { PROVIDERS, resolveModel, runModel, recordRunUsage, publishModels } from '../models/index.js';
 import { heuristicPlan, topicTitle, topicSummary } from './heuristics.js';
-import { planPrompt, taskPrompt, commitPrompt, digestPrompt, triagePrompt, parseJson, topicContext, inflightContext } from './prompts.js';
+import { planPrompt, taskPrompt, retryPrompt, commitPrompt, digestPrompt, triagePrompt, parseJson, topicContext, inflightContext } from './prompts.js';
 import { learn, analyzeMission } from './evolution.js';
 
 // Missions run in per-topic lanes: one at a time per topic (FIFO), different topics in parallel with no project-wide
@@ -124,7 +124,8 @@ function refreshProject(id) {
 // ---- runs ----------------------------------------------------------------
 
 // timeoutMs overrides the task timeout and is also a hard deadline for providers that ignore it (HTTP, simulator).
-async function executeRun({ kind, agent, project, mission, task, model, prompt, system, access, attachments, signal, meta, timeoutMs = null }) {
+// tools/resume/persist/freshPrompt (the prompt when a resume falls back to a new session) go to providers that support them (Claude Code); see runClaudeCode.
+async function executeRun({ kind, agent, project, mission, task, model, prompt, system, access, attachments, signal, meta, timeoutMs = null, tools = null, resume = null, persist = false, freshPrompt = prompt }) {
   const run = await one(
     `INSERT INTO runs(task_id, mission_id, agent_id, project_id, model_id, kind) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
     [task?.id || null, mission?.id || null, agent.id, project.id, model.id, kind],
@@ -146,7 +147,7 @@ async function executeRun({ kind, agent, project, mission, task, model, prompt, 
     const out = await runModel(model, {
       prompt, system, cwd: project.path, access, images, addDirs: images.length ? [config.uploadsDir] : [],
       signal: deadline ? AbortSignal.any([signal, deadline].filter(Boolean)) : signal, onEvent,
-      timeoutMs: timeoutMs || (settings.orchestrator.taskTimeoutMin || 30) * 60000, meta,
+      timeoutMs: timeoutMs || (settings.orchestrator.taskTimeoutMin || 30) * 60000, meta, tools, resume, persist, freshPrompt,
     });
     await recordRunUsage(run.id, out);
     await query(`UPDATE runs SET status='done', output=$2, finished_at=now() WHERE id=$1`, [run.id, String(out.text || '').slice(0, 200000)]);
@@ -203,7 +204,9 @@ export async function submitCommand(projectId, { content, attachments = [], topi
   // Started right away (in parallel with other topics): nothing to say. Only a busy topic makes an order wait.
   const waiting = queues.get(projectId) || [];
   if (waiting.includes(mission)) {
-    const content = `Queued. I will start this after the current mission in this topic (${waiting.filter((m) => m.topic_id === topic.id).length} waiting here).`;
+    // A user order waits only for other user orders (and the running mission): queued proposal missions go after it.
+    const ahead = waiting.filter((m) => m.topic_id === topic.id && (chainDepth(text) || !chainDepth(m.command))).length;
+    const content = `Queued. I will start this after the current mission in this topic (${ahead} waiting here).`;
     await postMessage({ project_id: projectId, mission_id: mission.id, author_type: 'agent', agent_id: project.manager_id, kind: 'status', content });
   }
   return userMsg;
@@ -215,15 +218,22 @@ const activeIn = (projectId) => [...active.values()].filter((a) => a.projectId =
 // original topic still wait for it. Orders typed in the topic it moved to wait for it too, so a topic never runs two.
 const inTopic = (a, topicId) => a.topicId === topicId || a.mission.topic_id === topicId;
 
-/** Start every queued order that may run now: oldest first, never two in one topic. */
+/**
+ * Start every queued order that may run now, never two in one topic: the user's own orders first (oldest first), then
+ * missions launched from approved proposals, so agents' follow-up work never makes the user's next order wait.
+ */
 function pump(projectId) {
   const busy = new Set(activeIn(projectId).flatMap((a) => [a.topicId, a.mission.topic_id]));
-  const waiting = [];
-  for (const m of queues.get(projectId) || []) {
-    if (busy.has(m.topic_id)) { waiting.push(m); continue; }
+  const queued = queues.get(projectId) || [];
+  const order = [...queued.filter((m) => !chainDepth(m.command)), ...queued.filter((m) => chainDepth(m.command))];
+  const started = new Set();
+  for (const m of order) {
+    if (busy.has(m.topic_id)) continue;
     busy.add(m.topic_id);
+    started.add(m);
     start(projectId, m);
   }
+  const waiting = queued.filter((m) => !started.has(m));
   if (waiting.length) queues.set(projectId, waiting);
   else queues.delete(projectId);
 }
@@ -304,7 +314,10 @@ async function plan({ project, gm, mission, topic, history, signal }) {
   let parsed = null;
   let out = null;
   try {
-    out = await executeRun({ kind: 'plan', agent: gm, project, mission, model, prompt, system, access: 'read', attachments: mission.attachments, signal, meta: { kind: 'plan', command: mission.command } });
+    // The planner only decomposes and staffs: the worker explores the code itself, so the planner reads files only to
+    // declare them when other missions share the working tree (and to open attached images).
+    const tools = inflight || mission.attachments?.some((a) => a.path) ? 'Read,Grep,Glob' : '';
+    out = await executeRun({ kind: 'plan', agent: gm, project, mission, model, prompt, system, access: 'read', attachments: mission.attachments, signal, meta: { kind: 'plan', command: mission.command }, tools });
     parsed = parseJson(out.text);
   } catch (err) {
     if (signal.aborted) throw err;
@@ -314,9 +327,23 @@ async function plan({ project, gm, mission, topic, history, signal }) {
     if (out && !parsed && out.text && !/```/.test(out.text) && out.text.length < 4000) {
       return { analysis: '', reply: out.text, tasks: [] };
     }
-    parsed = heuristicPlan(mission.command);
+    parsed = fallbackPlan(mission.command);
   }
   return parsed;
+}
+
+/**
+ * The planner's answer was unusable: one agent carries out the whole order (as in an editor session) instead of the
+ * keyword planner's multi-role split. Conversational messages still get the keyword planner's reply and no tasks.
+ */
+function fallbackPlan(command) {
+  const h = heuristicPlan(command);
+  if (!h.tasks.length) return h;
+  const text = String(command || '').trim();
+  return {
+    ...h,
+    tasks: [{ key: 'T1', title: topicSummary(text).slice(0, 120), role: 'fullstack', skills: ['react', 'node'], description: text.slice(0, 4000), acceptance: ['The order is carried out and verified with the relevant tests or build'], depends_on: [] }],
+  };
 }
 
 /** The project's other active missions, for the planner: topic, order and tasks with status and declared files. */
@@ -388,10 +415,11 @@ function normalizeTasks(raw, settings) {
   });
   const keys = new Set(tasks.map((t) => t.key));
   for (const t of tasks) t.depends_on = t.depends_on.filter((k) => keys.has(k) && k !== t.key);
-  // Independent verification: code-changing work must be checked by someone else.
+  // Independent verification when several agents change code: each verifies its own work, but nobody checks how their
+  // changes fit together. A single code-changing task verifies itself, like one editor session.
   const writes = tasks.filter((t) => roleInfo(t.role).access === 'write' && !['qa'].includes(t.role));
-  if (settings.orchestrator.verification && writes.length && !tasks.some((t) => ['reviewer', 'qa'].includes(t.role))) {
-    tasks.push({ key: `T${tasks.length + 1}`, title: 'Independent verification', description: 'Verify every upstream task against its acceptance criteria. Run available tests/builds. Report any gaps.', role: 'reviewer', skills: ['code-review'], acceptance: ['Each upstream acceptance criterion checked with evidence'], depends_on: tasks.map((t) => t.key) });
+  if (settings.orchestrator.verification && writes.length > 1 && !tasks.some((t) => ['reviewer', 'qa'].includes(t.role))) {
+    tasks.push({ key: `T${tasks.length + 1}`, title: 'Independent verification', description: 'Check that the upstream changes work together against their acceptance criteria: run the relevant tests/build and report any gaps. Keep it proportionate; do not build new harnesses.', role: 'reviewer', skills: ['code-review'], acceptance: ['Each upstream acceptance criterion checked with evidence'], depends_on: tasks.map((t) => t.key) });
   }
   return tasks;
 }
@@ -594,6 +622,8 @@ async function runMission(mission, signal) {
       `SELECT 1 FROM runs r JOIN models m ON m.id = r.model_id JOIN tasks t ON t.id = r.task_id
        WHERE r.mission_id = $1 AND r.status = 'done' AND m.provider = ANY($2::text[]) AND t.status = 'done' LIMIT 1`, [mission.id, editProviders]));
     project = await getProject(project.id);
+    // The digest reads only the task reports, so it is written while the sync commits.
+    const digesting = missionDigest({ project, gm, mission, final, signal });
     let github = '';
     if (project.auto_sync && settings.github.autoSync && !signal.aborted) {
       // Marked done inside the sync lane, so the next mission's sync never counts it as still active.
@@ -601,7 +631,7 @@ async function runMission(mission, signal) {
       if (log) github = `\n\n${syncReport(log)}${deferredNote(log)}`;
     } else if (self) self.phase = 'done';
 
-    const digest = await missionDigest({ project, gm, mission, final, signal });
+    const digest = await digesting;
 
     // Measured after the sync and the digest so the GM's commit-message and digest runs are counted too.
     const usage = await one(`SELECT coalesce(sum(input_tokens + output_tokens),0) AS tokens, coalesce(sum(cost_usd),0) AS cost FROM runs WHERE mission_id = $1`, [mission.id]);
@@ -852,6 +882,25 @@ export async function previewHandOver(goneIds, { mergeInto = null, excludeProjec
   });
 }
 
+// Session continuity: an agent's next task in the same topic continues its last Claude Code session there, the way the
+// next message in an editor session does, instead of re-reading the code from scratch. Only a recent session (its cached
+// prompt is likely still warm) with room left is resumed; anything else starts fresh.
+const RESUME_WINDOW_MIN = 60;
+const RESUME_MAX_CONTEXT = 120000;
+
+async function resumableSession({ agent, model, mission, task, attempt }) {
+  if (model.provider !== 'claude-code') return null;
+  // A retry continues the failed attempt itself: it already knows the code and what went wrong.
+  const row = attempt > 1
+    ? await one(`SELECT session_id, context_tokens FROM runs WHERE task_id = $1 AND agent_id = $2 AND model_id = $3 AND kind = 'task' AND session_id IS NOT NULL AND status <> 'cancelled' ORDER BY created_at DESC LIMIT 1`, [task.id, agent.id, model.id])
+    : await one(
+      `SELECT r.session_id, r.context_tokens FROM runs r JOIN missions m ON m.id = r.mission_id
+       WHERE r.agent_id = $1 AND r.model_id = $2 AND r.kind = 'task' AND r.status = 'done' AND r.session_id IS NOT NULL
+         AND m.topic_id = $3 AND m.project_id = $4 AND r.finished_at > now() - make_interval(mins => $5)
+       ORDER BY r.finished_at DESC LIMIT 1`, [agent.id, model.id, mission.topic_id, mission.project_id, RESUME_WINDOW_MIN]);
+  return row && row.context_tokens <= RESUME_MAX_CONTEXT ? row.session_id : null;
+}
+
 async function runTask({ task, state, project, gm, mission, settings, signal, attempt = 1 }) {
   let agent;
   for (let claimed = null; !claimed;) {
@@ -926,7 +975,8 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
       progress = Math.min(92, progress + Math.max(1, Math.round((95 - progress) / 12)));
       query(`UPDATE tasks SET progress=$2 WHERE id=$1 AND status='running'`, [task.id, progress]).then(() => publishTask(task.id)).catch(() => {});
     }, 4000);
-    out = await executeRun({ kind: 'task', agent, project, mission, task, model, prompt, system, access, attachments: mission.attachments, signal, meta: { kind: 'task', role: agent.role, title: task.title } });
+    const resume = await resumableSession({ agent, model, mission, task, attempt });
+    out = await executeRun({ kind: 'task', agent, project, mission, task, model, prompt: resume && task.failure ? retryPrompt(task.failure) : prompt, freshPrompt: prompt, system, access, attachments: mission.attachments, signal, meta: { kind: 'task', role: agent.role, title: task.title, resumed: !!resume }, resume, persist: true });
     report = parseJson(out.text) || { status: 'done', summary: String(out.text || '').slice(-1500) };
     ok = !['failed', 'blocked'].includes(String(report.status || 'done').toLowerCase());
   } catch (err) {
@@ -983,7 +1033,8 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
 
   if (!ok && attempt === 1 && settings.orchestrator.retryFailed && !errorText?.includes('limit reached')) {
     await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content: `${task.key} failed — asking ${agent.name} to retry once with the failure context.`, meta: { detail: true } });
-    task.description = `${task.description}\n\nPREVIOUS ATTEMPT FAILED:\n${String(report.summary || errorText).slice(0, 1500)}\nFix the cause and complete the task.`;
+    task.failure = String(report.summary || errorText).slice(0, 1500); // a resumed retry gets only this, a fresh one the whole contract
+    task.description = `${task.description}\n\nPREVIOUS ATTEMPT FAILED:\n${task.failure}\nFix the cause and complete the task.`;
     // 'running' again only on a live agent: one merged or removed since the first attempt is replaced as the retry starts.
     await query(`UPDATE tasks t SET description=$2, status = CASE WHEN EXISTS (SELECT 1 FROM agents a WHERE a.id = t.agent_id AND NOT a.archived) THEN 'running' ELSE t.status END WHERE t.id=$1`, [task.id, task.description]);
     refreshProject(project.id);
@@ -1072,7 +1123,7 @@ export function commitMessageBuilder({ project, gm, mission, tasks = [], signal,
       try {
         const model = await resolveModel(gm.model_id);
         const { system, prompt } = commitPrompt({ project, gm, command: mission?.command, reason, tasks, files, stat, diff });
-        const out = await executeRun({ kind: 'commit', agent: gm, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'commit' }, timeoutMs: COMMIT_TIMEOUT });
+        const out = await executeRun({ kind: 'commit', agent: gm, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'commit' }, timeoutMs: COMMIT_TIMEOUT, tools: '' });
         msg = cleanCommitMessage(out.text);
       } catch (err) {
         console.error('[commit message]', err.message);
@@ -1095,11 +1146,14 @@ export function commitMessageBuilder({ project, gm, mission, tasks = [], signal,
  */
 async function missionDigest({ project, gm, mission, final, signal }) {
   if (!gm || signal?.aborted) return null;
+  // One finished task: its own report already is the digest (as an editor session ends with the agent's answer), so
+  // no extra GM run. A failed one still gets the GM's digest of what went wrong.
+  if (final.length === 1 && final[0].status === 'done' && final[0].report?.summary) return String(final[0].report.summary).trim().slice(0, 4000) || null;
   try {
     const model = await resolveModel(gm.model_id);
     const tasks = final.map((t) => ({ key: t.key, title: t.title, agent: t.agent_name, status: t.status, summary: t.report?.summary || t.result || '' }));
     const { system, prompt } = digestPrompt({ project, gm, mission, tasks });
-    const out = await executeRun({ kind: 'digest', agent: gm, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'digest' }, timeoutMs: COMMIT_TIMEOUT });
+    const out = await executeRun({ kind: 'digest', agent: gm, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'digest' }, timeoutMs: COMMIT_TIMEOUT, tools: '' });
     const text = String(out.text || '').replace(/^\s*```[\w-]*\s*\n?|\n?\s*```\s*$/g, '').trim();
     if (!text || signal?.aborted) return null;
     return text.replace(/\n{3,}/g, '\n\n').slice(0, 4000);
@@ -1182,7 +1236,7 @@ async function askTriage({ decider, final, gm, row, proposer, report, project, m
       project, decider, proposer, relation: triageRelation(decider, gm), final, command: mission.command,
       summary: report.summary, proposal: row, inflight, escalation,
     });
-    const out = await executeRun({ kind: 'triage', agent: decider, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'triage', task_id: row.id, title: row.title, escalated: !!escalation }, timeoutMs: TRIAGE_TIMEOUT });
+    const out = await executeRun({ kind: 'triage', agent: decider, project, mission, model, prompt, system, access: 'read', signal, meta: { kind: 'triage', task_id: row.id, title: row.title, escalated: !!escalation }, timeoutMs: TRIAGE_TIMEOUT, tools: '' });
     const parsed = parseJson(out.text);
     const said = String(parsed?.decision || '').trim().toLowerCase();
     const why = String(parsed?.reason || '').replace(/\s+/g, ' ').trim().slice(0, 500);

@@ -145,6 +145,10 @@ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS runs_model_time_idx ON runs(model_id, created_at);
 CREATE INDEX IF NOT EXISTS runs_agent_idx ON runs(agent_id, created_at DESC);
+-- Claude Code session of a task run, and its last prompt size: the agent's next task in the topic resumes it.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS session_id text;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS context_tokens integer NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS runs_session_idx ON runs(agent_id, finished_at DESC) WHERE session_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS run_events (
   id       bigserial PRIMARY KEY,

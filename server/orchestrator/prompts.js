@@ -68,14 +68,15 @@ export function planPrompt({ project, gm, command, attachments, agents, standing
     .join('\n');
   const system = `You are ${gmIntro(gm, project)} inside AgentForge, a hierarchical multi-agent engineering organization.${boss ? `
 Your superior is ${boss.name}, top-level manager of AgentForge and project manager of "AgentForge".` : ''}
-You receive orders from the user, decompose them into small, independently verifiable task contracts, and staff them from the agent registry. You do not write code yourself.
+You receive orders from the user, turn each into task contracts (usually a single one), and staff them from the agent registry. You do not write code yourself.
 Rules:
-- Split by independently testable outcome, not by file. Prefer 2–8 tasks; very large orders may use up to 14.
+- Default to ONE task: a single capable agent implements the whole order end to end and verifies it itself (runs the relevant tests/build), like one engineer in an editor session. Every extra task is a separate agent that has to re-read the code, so it costs time and tokens.
+- Split only into genuinely independent parts that are each substantial (e.g. a separate service and a separate UI that do not touch the same files), so agents gain by working in parallel. Never split one change into implement/test/review steps. At most 4 tasks; very large orders may use up to 8.
 - Use "depends_on" so independent tasks run in parallel; serialize tasks that edit the same files.${inflight ? `
 - Other missions are running in this working tree right now (IN-FLIGHT MISSIONS IN OTHER TOPICS). Every code-changing task declares "files": [repo-relative paths or directories it will edit]. Prefer a plan that avoids their files, but declare overlaps anyway: the platform makes an overlapping task wait until theirs finishes.` : ''}
 - Valid roles: ${Object.keys(ROLES).filter((r) => !['executive', 'evolution', 'analyst', 'optimizer', 'manager'].includes(r)).join(', ')}. You may invent a new specialist role (kebab-case) when none fits; the platform will recruit that agent.
 - Registry entries marked "on team" are this project's members; prefer them when their skills fit. Never plan around agents marked "released from this project": the platform won't staff them here, so describe the work by role and skills instead of relying on them.
-- Code-changing work must be followed by an independent verification task (role "reviewer" or "qa") that depends on it.
+- Do not add separate verification, review or test tasks: each agent verifies its own work. Add a "reviewer" or "qa" task only when the user asks for a review or tests, or when several agents' code changes must be checked together.
 - If the message is a question or small talk that needs no work, answer it in "reply" and return an empty "tasks" array.
 - Never include git commit/push steps: the platform syncs GitHub automatically after the mission.
 - Orders arrive in chat topics. Give "topic" a title of 1-3 key words (at most 28 characters, no filler words or sentences), 1-3 short lowercase tags, and a "summary" of 1-3 sentences on what the topic covers so far, including this order. The title may change as the topic develops; keep it when it still fits. Set "new": true only when the order is clearly unrelated to the current topic's title, summary and recent missions; small talk and follow-ups stay in the topic.`;
@@ -91,7 +92,7 @@ ORDER FROM THE USER:
 ${command}
 """
 ${imageNote(attachments)}
-You may inspect the project files (read-only) to plan precisely. Respond with ONLY one JSON object in a \`\`\`json block:
+${inflight || attachments?.some((a) => a.path) ? 'You may look up files (Read, Grep, Glob) only as far as needed to declare each task\'s "files" or to see attached images; do not investigate the code, the assigned agent does that.' : 'Plan from the order and the context above; you have no tools here and do not need them. The assigned agent reads the code itself, so describe the outcome, not the implementation.'} Respond with ONLY one JSON object in a \`\`\`json block:
 {
   "analysis": "one or two sentences on what is needed",
   "reply": "optional direct answer to the user (for questions/small talk)",
@@ -178,23 +179,25 @@ Write the digest now: 3-8 short markdown lines. Nothing else.`;
  */
 export function taskPrompt({ project, agent, task, gm, supervisor, deps, mission, attachments, playbook, shared = null }) {
   const info = roleInfo(agent.role);
-  const lessons = (playbook || []).slice(0, 12);
+  const lessons = [...new Set((playbook || []).map((l) => String(l).trim()).filter(Boolean))].slice(0, 12);
   const system = `You are ${agent.name}, ${agent.title} (tier ${agent.tier}, ${info.department}) in the AgentForge engineering organization.
 Mission: ${agent.mission || '-'}
 Purpose: ${agent.purpose || '-'}
 Skills: ${agent.skills.map((s) => `${s.name} (${s.level}/100)`).join(', ')}
-Hierarchy: you received this task from ${gm.name} (${gm.role === 'executive' ? gmRole(gm, project) : `General Manager of "${project.name}"`})${supervisor ? `; your line supervisor is ${supervisor}` : ''}. Report results upward honestly; raise proposals for improvements you notice.
+Hierarchy: you received this task from ${gm.name} (${gm.role === 'executive' ? gmRole(gm, project) : `General Manager of "${project.name}"`})${supervisor ? `; your line supervisor is ${supervisor}` : ''}. Report results upward honestly.
 ${lessons.length ? `Playbook v${agent.prompt_version} (lessons learned from previous projects):\n${lessons.map((l) => `- ${l}`).join('\n')}` : ''}
 Operating rules:
-- Stay strictly inside the task scope and the working directory ${project.path}.${shared ? `
-- Other missions are editing this working tree right now (their files: ${shared.length ? clip(shared.join(', '), 400) : 'none yet'}). Never run git stash/checkout/reset/restore/clean or project-wide formatters; never revert, reformat or delete files you did not change; never build into the live dist.` : ''}
+- Stay strictly inside the task scope and the working directory ${project.path}.
+- Work like an efficient senior engineer: read only the code the task needs, make the change, then verify it in proportion to its size and risk (the relevant existing tests, a build or a quick targeted check). Do not build mutation suites, control trees or new test harnesses unless the task asks for them.
 - ${info.access === 'write' ? 'You may edit files needed for this task. Keep changes minimal and consistent with the existing code style.' : 'You have full tool authority: you may run commands, fetch the web and write scratch files (e.g. in /tmp). Your job is to inspect, analyze and report findings; do not rewrite project source unless the task asks for it.'}
 - Do not run git commit, git push, or restart services; the platform does that after verification.
 - Never print secrets.`;
   const depText = deps.length
     ? `Results from upstream tasks:\n${deps.map((d) => `### ${d.key} ${d.title} (${d.agent_name || 'agent'}, ${d.status})\n${(d.report?.summary || d.result || '').slice(0, 1800)}`).join('\n\n')}\n`
     : '';
-  const prompt = `TASK CONTRACT
+  // In the prompt rather than the system prompt: a resumed session keeps the system prompt it started with.
+  const sharedNote = shared ? `WORKING TREE NOTE: other missions are editing this working tree right now (their files: ${shared.length ? clip(shared.join(', '), 400) : 'none yet'}). Never run git stash/checkout/reset/restore/clean or project-wide formatters; never revert, reformat or delete files you did not change; never build into the live dist.\n\n` : '';
+  const prompt = `${sharedNote}TASK CONTRACT
 ${JSON.stringify({ task_id: task.key, mission: mission.command.slice(0, 600), project: project.name, role: task.role, goal: task.title, description: task.description, acceptance: task.acceptance, depends_on: task.depends_on, ...(task.files?.length ? { files: task.files } : {}) }, null, 2)}
 
 ${depText}${imageNote(attachments)}
@@ -204,10 +207,20 @@ Do the work now. When finished, end your reply with a JSON report in a \`\`\`jso
   "summary": "what you did and the evidence (tests run, files changed)",
   "artifacts": ["relative/paths/changed/or/created"],
   "lesson": "one reusable lesson for future tasks of this kind",
-  "proposals": [{ "title": "follow-up you recommend", "description": "why and what", "role": "role" }],
+  "proposals": [],
   "confidence": 0.0
-}`;
+}
+"proposals" stays empty unless the order clearly needs follow-up work you could not do within this task's scope; then add at most one { "title", "description", "role" }.`;
   return { system, prompt };
+}
+
+/** The next message to a resumed session whose previous attempt at the task failed: it already holds the contract. */
+export function retryPrompt(failure) {
+  return `Your previous attempt at this task failed:
+"""
+${String(failure || '').slice(0, 1500)}
+"""
+Fix the cause and complete the task. When finished, end your reply with the same JSON report in a \`\`\`json block as before.`;
 }
 
 /**

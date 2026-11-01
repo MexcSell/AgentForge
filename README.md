@@ -29,11 +29,12 @@ The service binds to `127.0.0.1` only. It has no authentication yet and includes
 
 ## How a mission runs
 
-1. **Plan**: the project's General Manager (one per project) reads the project read-only and returns task contracts: role, skills, scope, acceptance criteria and dependencies.
+1. **Plan**: the project's General Manager (one per project) turns the order into task contracts: role, skills, scope, acceptance criteria and dependencies. Usually that is one task, so one agent does the whole order the way a single Claude Code session would. The planner runs without tools; it reads files only to declare them when other missions share the working tree.
 2. **Staff**: for each task, the best idle agent of that role is chosen by skill score. If it is busy, it is **cloned**; if the role does not exist, a new specialist is **recruited** and placed in the hierarchy.
 3. **Execute**: a DAG scheduler runs independent tasks in parallel (`maxParallel`). Write-roles may edit files; read-roles (research, security, review) cannot.
-4. **Verify**: code changes are always followed by an independent reviewer or QA task.
-5. **Report**: every agent reports upward to the GM. Agents may raise **proposals**, which become new missions when approved.
+4. **Verify**: each agent verifies its own change (relevant tests or build). An independent reviewer task is added only when several agents change code in one mission, or when the order asks for a review.
+5. **Report**: every agent reports upward to the GM. Agents may raise **proposals**. By default these wait for your approval; with "Superiors decide agent proposals" on, the GM decides them. Approved proposals become new missions, which queue behind the user's own orders in the topic.
+   An agent's next task in the same topic resumes its previous Claude Code session (within 60 min, up to 120k context tokens), and a retry resumes the failed attempt, so the code is not re-read from scratch.
 6. **Sync**: if Claude Code changed files, the project is committed and pushed (source only: `.gitignore` is enforced and files over 50 MB are skipped).
 7. **Evolve**: XP, levels, skill growth and lessons are recorded. Lessons are curated into versioned playbooks. Agents with repeated failures run a candidate playbook, which is promoted only if it beats their baseline success rate and is rolled back otherwise.
 

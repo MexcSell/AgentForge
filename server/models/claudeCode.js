@@ -11,14 +11,31 @@ function brief(input) {
 // Tools that write files; their events carry `files` so a mission's edits can be committed on their own.
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
-/** Runs one Claude Code turn non-interactively and streams normalized events. */
-export function runClaudeCode({ model, prompt, system, cwd, addDirs = [], signal, onEvent, timeoutMs }) {
+/**
+ * Runs one Claude Code turn non-interactively and streams normalized events.
+ * tools: null = Claude Code's default set, '' = no tools (a plain answer), or a comma list such as 'Read,Grep,Glob'.
+ * resume: a session id to continue (warm context, like the next message in an editor session); a session the CLI no
+ * longer has falls back to a fresh run with freshPrompt (default: prompt). persist: keep the session on disk so a later run can resume it.
+ */
+export function runClaudeCode(opts) {
+  return runOnce(opts).catch((err) => {
+    if (!opts.resume || !err.resumeMissing || opts.signal?.aborted) throw err;
+    opts.onEvent?.({ type: 'status', text: 'Previous session not found · starting fresh' });
+    return runOnce({ ...opts, resume: null, prompt: opts.freshPrompt ?? opts.prompt });
+  });
+}
+
+function runOnce({ model, prompt, system, cwd, addDirs = [], signal, onEvent, timeoutMs, tools = null, resume = null, persist = false }) {
   const cfg = model.config || {};
-  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--no-session-persistence'];
+  const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+  if (resume) args.push('--resume', resume);
+  else if (!persist) args.push('--no-session-persistence');
   if (model.model) args.push('--model', model.model);
   if (cfg.effort) args.push('--effort', cfg.effort);
   if (cfg.maxBudgetUsd) args.push('--max-budget-usd', String(cfg.maxBudgetUsd));
   if (system) args.push('--append-system-prompt', system);
+  // A tool-less run needs no MCP servers either: their tool schemas and connection time would be wasted.
+  if (tools !== null) args.push('--tools', tools, ...(tools ? [] : ['--strict-mcp-config']));
   // Every agent runs with full tool authority, whatever its role or the stored model config.
   args.push('--permission-mode', 'bypassPermissions');
   for (const d of addDirs) args.push('--add-dir', d);
@@ -32,6 +49,8 @@ export function runClaudeCode({ model, prompt, system, cwd, addDirs = [], signal
     let text = '';
     let final = null;
     let rateLimit = null;
+    let sessionId = null;
+    let contextTokens = 0; // prompt size of the last model call: what a resume of this session starts from
     let stderr = '';
     let buf = '';
     let settled = false;
@@ -46,10 +65,13 @@ export function runClaudeCode({ model, prompt, system, cwd, addDirs = [], signal
 
     const handle = (e) => {
       if (e.type === 'system' && e.subtype === 'init') {
-        onEvent?.({ type: 'status', text: `Session started · ${e.model} · ${e.permissionMode}` });
+        sessionId = e.session_id || null;
+        onEvent?.({ type: 'status', text: `Session ${resume ? 'resumed' : 'started'} · ${e.model} · ${e.permissionMode}` });
       } else if (e.type === 'rate_limit_event') {
         rateLimit = e.rate_limit_info || null;
       } else if (e.type === 'assistant') {
+        const u = e.message?.usage;
+        if (u && !e.parent_tool_use_id) contextTokens = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
         for (const b of e.message?.content || []) {
           if (b.type === 'text' && b.text) { text += (text ? '\n' : '') + b.text; onEvent?.({ type: 'text', text: b.text }); }
           else if (b.type === 'thinking' && b.thinking) onEvent?.({ type: 'thinking', text: b.thinking });
@@ -108,8 +130,14 @@ export function runClaudeCode({ model, prompt, system, cwd, addDirs = [], signal
         costUsd: final?.total_cost_usd || 0,
         durationMs: final?.duration_ms || Date.now() - started,
         rateLimit,
+        sessionId,
+        contextTokens,
       };
       if (signal?.aborted) return reject(Object.assign(new Error('Cancelled'), { partial: out }));
+      // --resume of a session the CLI no longer has: an error result before any init event, nothing ran.
+      if (resume && !sessionId && final?.is_error && !final.num_turns) {
+        return reject(Object.assign(new Error('Claude Code session not found'), { partial: out, resumeMissing: true }));
+      }
       if (!final || final.is_error) {
         const why = final?.subtype && final.subtype !== 'success' ? final.subtype : (stderr.trim().split('\n').pop() || `exit code ${code}`);
         return reject(Object.assign(new Error(`Claude Code failed: ${why}`), { partial: out }));

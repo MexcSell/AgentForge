@@ -100,7 +100,7 @@ export async function runModel(model, opts, runId) {
 export async function recordRunUsage(runId, out) {
   if (!out) return;
   await query(
-    `UPDATE runs SET input_tokens=$2, output_tokens=$3, cache_tokens=$4, cost_usd=$5, tool_calls=$6, duration_ms=$7 WHERE id=$1`,
-    [runId, out.usage?.input || 0, out.usage?.output || 0, out.usage?.cache || 0, out.costUsd || 0, out.toolCalls || {}, out.durationMs || 0],
+    `UPDATE runs SET input_tokens=$2, output_tokens=$3, cache_tokens=$4, cost_usd=$5, tool_calls=$6, duration_ms=$7, session_id=$8, context_tokens=$9 WHERE id=$1`,
+    [runId, out.usage?.input || 0, out.usage?.output || 0, out.usage?.cache || 0, out.costUsd || 0, out.toolCalls || {}, out.durationMs || 0, out.sessionId || null, out.contextTokens || 0],
   );
 }

@@ -211,11 +211,12 @@ async function diagnose(agentId) {
   if (r >= 0.67) return;
   await event('diagnose', a.id, `${a.name}: success rate ${Math.round(r * 100)}% over last ${outcomes.length} tasks`, { rate: r });
   const failures = await many(`SELECT content FROM experiences WHERE agent_id = $1 AND kind = 'failure' ORDER BY created_at DESC LIMIT 4`, [a.id]);
-  const candidate = [
+  // Repeated failures (e.g. the same CLI exit) would otherwise fill the playbook with copies of one lesson.
+  const candidate = [...new Set([
     'Before editing, restate the acceptance criteria and check each one explicitly before reporting done.',
     ...failures.map((f) => `Avoid repeating: ${f.content.slice(0, 160)}`),
     ...(a.playbook || []),
-  ].slice(0, 10);
+  ])].slice(0, 10);
   await event('generate', a.id, `Failure-aware playbook candidate for ${a.name}`, { size: candidate.length });
   await query(`UPDATE agents SET stats = stats || $2 WHERE id = $1`, [a.id, { experiment: { playbook: candidate, baseline: r, outcomes: [], startedAt: new Date().toISOString() } }]);
   await event('experiment', a.id, `${a.name} runs candidate playbook for the next ${EVAL_WINDOW} tasks`, {});
