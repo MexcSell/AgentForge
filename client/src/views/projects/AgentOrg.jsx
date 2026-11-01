@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
-import { Network, UserMinus } from 'lucide-react';
+import { List, Network, UserMinus } from 'lucide-react';
 import { useStore } from '../../lib/store.js';
 import { cx, AgentAvatar, Badge, Empty, IconButton, Progress } from '../../components/ui.jsx';
 import { AgentWorkDialog, agentTasks, currentWork, TIER } from './AgentWorkDialog.jsx';
@@ -69,10 +69,6 @@ const stateLabel = (task) => (task?.status === 'running' ? `Working ${Math.round
 
 function OrgCard({ agent, gm, task, orchestrating, releasable, onOpen }) {
   const level = agent.level || 1;
-  const xp = agent.xp || 0;
-  const xpPrev = 40 * (level - 1) ** 2;
-  const xpNext = 40 * level ** 2;
-  const xpPct = Math.max(0, Math.min(100, ((xp - xpPrev) / Math.max(1, xpNext - xpPrev)) * 100));
   const tier = TIER[agent.tier];
   const coordinating = gm && !task && orchestrating;
   const state = coordinating ? 'orchestrating' : stateOf(task);
@@ -81,20 +77,11 @@ function OrgCard({ agent, gm, task, orchestrating, releasable, onOpen }) {
   return (
     <button type="button" onClick={onOpen} aria-label={name} data-agent={agent.id}
       className={cx('block w-full min-w-0 text-left p-2 rounded-xl border transition-colors hover:border-accent/50', state === 'working' || coordinating ? 'border-accent/40 bg-accent-soft/40' : 'border-line bg-raised')}>
-      <span className="flex items-start gap-2 min-w-0">
+      <span className={cx('flex items-center gap-2 min-w-0', releasable && 'pr-6')}>
         <AgentAvatar agent={agent} size={AVATAR} />
-        <span className="min-w-0 flex-1">
-          <span className={cx('flex items-center gap-1 min-w-0', releasable && 'pr-6')}>
-            <span className="text-[0.8rem] font-medium truncate">{agent.name}</span>
-            {gm && <Badge tone="accent" className="shrink-0">GM</Badge>}
-            <Badge className="shrink-0 h-4 px-1 text-[0.62rem] tabular">L{level}</Badge>
-          </span>
-          {tier && <span className="block text-[0.66rem] leading-4 text-subtle truncate">{tier}</span>}
-          <span role="progressbar" aria-label={`XP toward L${level + 1}`} aria-valuenow={Math.round(xpPct)} aria-valuemin={0} aria-valuemax={100} aria-valuetext={`${xp} / ${xpNext} XP`}
-            title={`${xp} / ${xpNext} XP to L${level + 1}`} className="mt-1.5 block h-1 rounded-full bg-hover overflow-hidden">
-            <span className="block h-full rounded-full bg-series-1 transition-[width] duration-500" style={{ width: `${xpPct}%` }} />
-          </span>
-        </span>
+        <span className="text-[0.8rem] font-medium truncate">{agent.name}</span>
+        {gm && <Badge tone="accent" className="shrink-0">GM</Badge>}
+        <Badge className="shrink-0 h-4 px-1 text-[0.62rem] tabular">L{level}</Badge>
       </span>
       <span className="mt-2 pt-2 border-t border-line flex flex-col gap-1.5 min-w-0">
         {task ? <>
@@ -127,7 +114,7 @@ function ReleaseButton({ agent, busy, onRelease }) {
   const label = busy.length ? `Can't release ${agent.name} yet: ${busy.join(', ')} ${busy.length === 1 ? 'is' : 'are'} queued or running in this project` : `Release ${agent.name} from the project`;
   return (
     <IconButton icon={UserMinus} size="sm" label={label} tone={busy.length ? undefined : 'danger'} aria-disabled={busy.length ? true : undefined} data-release={agent.id}
-      className={cx('absolute top-1.5 right-1.5', busy.length && 'opacity-40 cursor-not-allowed hover:bg-transparent hover:text-muted')}
+      className={cx('absolute top-[8px] right-1.5', busy.length && 'opacity-40 cursor-not-allowed hover:bg-transparent hover:text-muted')}
       onClick={(e) => onRelease(agent, e.currentTarget, busy)} />
   );
 }
@@ -174,12 +161,17 @@ function Chip({ children, label }) {
  */
 export function AgentOrg({ project, team, release }) {
   const agents = useStore((s) => s.agents);
+  const tree = useStore((s) => s.orgTree);
+  const set = useStore((s) => s.set);
   const tasks = useStore((s) => s.tasks[project.id]) || EMPTY;
   const topics = useStore((s) => s.topics[project.id]) || EMPTY;
   const missionsByTopic = useStore((s) => s.missionsByTopic);
   const [selected, setSelected] = useState(null);
   const opener = useRef(null);
-  const roots = useMemo(() => orgTree(team, agents, project.manager_id), [team, agents, project.manager_id]);
+  // Hierarchy off: one flat list in rank order, the GM first.
+  const roots = useMemo(() => (tree ? orgTree(team, agents, project.manager_id)
+    : team.map((a) => ({ agent: a, children: [] })).sort((x, y) => (y.agent.id === project.manager_id) - (x.agent.id === project.manager_id) || byRank(x.agent, y.agent))),
+  [tree, team, agents, project.manager_id]);
   const work = useMemo(() => new Map(team.map((a) => [a.id, currentWork(agentTasks(tasks, a.id))])), [team, tasks]);
   // The GM never holds mission tasks, so while the project is orchestrating it counts as orchestrating rather than idle.
   const orchestrating = useMemo(() => topics.some((t) => t.running)
@@ -206,6 +198,8 @@ export function AgentOrg({ project, team, release }) {
               <Chip key={k} label={`${n} ${STATES[k].label.toLowerCase()}`}><span className={cx('size-1.5 rounded-full', STATES[k].dot)} /><span className="tabular text-fg">{n}</span>{STATES[k].label.toLowerCase()}</Chip>
             ))}
           </ul>
+          <IconButton icon={tree ? Network : List} size="sm" label={tree ? 'Hide hierarchy' : 'Show hierarchy'} aria-pressed={tree} active={tree}
+            className="ml-auto" onClick={() => set({ orgTree: !tree })} />
         </div>
       </div>
       <ul aria-label="Team hierarchy" className="min-w-0 flex flex-col gap-1.5">

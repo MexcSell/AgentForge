@@ -159,6 +159,24 @@ test('team comes from GET /members: GM + active members; released listed under a
   assert.ok(probe, 'Probe at depth 2 under Lens');
 });
 
+test('cards show no tier line or XP bar; the hierarchy toggle flattens the tree and is remembered', async () => {
+  const card = q(`#root [data-agent="${id(2)}"]`);
+  assert.doesNotMatch(card.textContent, /Specialist|Executive|Management|Verification|Evolution/);
+  assert.ok(card.children[0].querySelector('[role="progressbar"]') === null, 'no XP bar on the name row');
+  const toggle = () => q('#root [aria-pressed][aria-label$="hierarchy"]');
+  assert.equal(toggle().getAttribute('aria-label'), 'Hide hierarchy');
+  assert.equal(toggle().getAttribute('aria-pressed'), 'true');
+  await click(toggle());
+  assert.equal(toggle().getAttribute('aria-label'), 'Show hierarchy');
+  assert.equal(toggle().getAttribute('aria-pressed'), 'false');
+  assert.deepEqual(qa('#root li[data-depth]').map((li) => li.dataset.depth), qa('#root li[data-depth]').map(() => '0'), 'all at depth 0');
+  assert.equal(qa('#root [aria-label="Team hierarchy"] [data-agent]')[0].dataset.agent, id(1), 'GM first');
+  await assertMatchesServer();
+  assert.equal(JSON.parse(localStorage.getItem('af.prefs')).orgTree, false);
+  await click(toggle());
+  assert.ok(q(`#root li[data-depth="2"] [data-agent="${id(6)}"]`), 'tree back');
+});
+
 test('the GM card has no Release action; a busy agent\'s Release is disabled with an explanation and sends nothing', async () => {
   assert.ok(q(`#root [data-release="${id(1)}"]`) === null, 'no Release on the GM');
   assert.ok(q(`#root [data-agent="${id(1)}"]`), 'GM card present');

@@ -9,18 +9,17 @@ export function measure() {
   const TIERS = /^(Executive|Management|Specialist|Verification|Evolution)$/;
   return [...document.querySelectorAll('[data-pane]')].map((v) => ({ w: +v.dataset.w, pane: r(v), cards: [...v.querySelectorAll('[aria-label="Team hierarchy"] button[data-agent]')].map((c) => {
     const li = c.closest('li'); const rel = [...li.children].find((x) => x.tagName === 'DIV')?.querySelector(':scope > [data-release]') || null;
-    const col = c.querySelector(':scope > span > span.flex-1');
-    const nameRow = col.children[0]; const nameEl = nameRow.children[0];
-    const badges = [...nameRow.parentElement.querySelectorAll('span')].filter((b) => /^(GM|L\d+)$/.test(b.textContent) && b.className.includes('inline-flex'));
-    const tierEl = [...col.children].find((x) => x !== nameRow && x.getAttribute('role') !== 'progressbar' && TIERS.test(x.textContent.trim()))
-      || [...col.querySelectorAll('span')].find((x) => TIERS.test(x.textContent.trim()) && !x.className.includes('inline-flex')) || null;
+    const nameRow = c.children[0]; const nameEl = nameRow.querySelector(':scope > .font-medium');
+    const badges = [...nameRow.querySelectorAll('span')].filter((b) => /^(GM|L\d+)$/.test(b.textContent) && b.className.includes('inline-flex'));
+    // The card no longer shows a tier line or XP bar: any found is reported (and must not overlap the rest).
+    const tierEl = [...c.querySelectorAll('span')].find((x) => TIERS.test(x.textContent.trim()) && !x.className.includes('inline-flex')) || null;
     const hit = rel && (() => { const k = rel.getBoundingClientRect(); const e = document.elementFromPoint(k.left + k.width / 2, k.top + k.height / 2); return !!e && rel.contains(e); })();
     // Where the Release should be: 16px left of the card's right edge, on the name row's centre line.
     const cornerHit = rel && (() => { const k = c.getBoundingClientRect(), n = nameRow.getBoundingClientRect(); const e = document.elementFromPoint(k.right - 16, (n.top + n.bottom) / 2); return !!e && rel.contains(e); })();
     const cs = rel && getComputedStyle(rel);
     return { agent: c.dataset.agent, name: nameEl.textContent, card: r(c), nameRow: r(nameRow), nameBox: r(nameEl), nameInk: ink(nameEl),
       badges: badges.map((x) => ({ t: x.textContent, ...r(x), fs: getComputedStyle(x).fontSize, visible: x.getBoundingClientRect().width > 0 })),
-      tier: r(tierEl), tierInk: ink(tierEl), xp: r(col.querySelector('[role=progressbar]')), bottom: r(c.children[1]),
+      tier: r(tierEl), tierInk: ink(tierEl), xp: r(nameRow.querySelector('[role=progressbar]')), bottom: r(c.children[1]),
       release: r(rel), relPos: cs?.position, relHit: hit, relCornerHit: cornerHit, relAria: rel?.getAttribute('aria-disabled') };
   }) }));
 }
