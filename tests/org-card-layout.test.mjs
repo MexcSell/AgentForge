@@ -7,12 +7,12 @@
 // `npx playwright install chromium-headless-shell`. Without one the test is skipped. Run just this file: `npm run test:browser`.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { extname, join, normalize } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findChrome, launch } from './browser/cdp.mjs';
+import { build, serve } from './browser/build-serve.mjs';
 import { measure, check } from './browser/org-card/geometry.mjs';
 
 const FIXTURE = fileURLToPath(new URL('./browser/org-card', import.meta.url));
@@ -21,29 +21,6 @@ const AGENTS = 7;
 const cleanup = [];
 after(async () => { for (const fn of cleanup.reverse()) await fn(); });
 
-async function build() {
-  const outDir = mkdtempSync(join(tmpdir(), 'af-org-card-dist-'));
-  cleanup.push(() => rmSync(outDir, { recursive: true, force: true }));
-  const { build } = await import('vite');
-  const { default: react } = await import('@vitejs/plugin-react');
-  const { default: tailwindcss } = await import('@tailwindcss/vite');
-  await build({ configFile: false, root: FIXTURE, base: './', plugins: [react(), tailwindcss()], logLevel: 'error',
-    build: { outDir, emptyOutDir: true, chunkSizeWarningLimit: 5000 } });
-  return outDir;
-}
-
-const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.woff2': 'font/woff2', '.svg': 'image/svg+xml' };
-async function serve(dir) {
-  const srv = createServer((req, res) => {
-    const path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname)).replace(/^\/+/, '') || 'index.html';
-    try { res.writeHead(200, { 'content-type': TYPES[extname(path)] || 'application/octet-stream' }).end(readFileSync(join(dir, path))); }
-    catch { res.writeHead(404).end(); }
-  });
-  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
-  cleanup.push(() => new Promise((r) => { srv.closeAllConnections(); srv.close(r); }));
-  return `http://127.0.0.1:${srv.address().port}`;
-}
-
 test('Org cards keep their layout in a real browser at 243 and 307px', { timeout: 180_000 }, async (t) => {
   const bin = findChrome();
   if (!bin) {
@@ -51,7 +28,7 @@ test('Org cards keep their layout in a real browser at 243 and 307px', { timeout
       : 'no chrome-headless-shell found: set AF_CHROME_BIN or run `npx playwright install chromium-headless-shell`');
     return;
   }
-  const base = await serve(await build());
+  const base = await serve(await build(FIXTURE, cleanup, 'af-org-card-dist-'), cleanup);
   const userDataDir = mkdtempSync(join(tmpdir(), 'af-org-card-chrome-'));
   cleanup.push(() => rmSync(userDataDir, { recursive: true, force: true }));
   const b = await launch(bin, { userDataDir });

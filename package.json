@@ -13,7 +13,7 @@
     "dev": "node scripts/dev.js",
     "build": "vite build",
     "test": "node --test \"tests/**/*.test.mjs\"",
-    "test:browser": "node --test tests/org-card-layout.test.mjs",
+    "test:browser": "node --test tests/org-card-layout.test.mjs tests/chat-header-layout.test.mjs",
     "db:check": "node server/db/check.js",
     "stop": "node -e \"process.kill(+require('fs').readFileSync('data/supervisor.pid','utf8'),'SIGTERM')\"",
     "logs": "tail -f data/logs/agentforge.log"
