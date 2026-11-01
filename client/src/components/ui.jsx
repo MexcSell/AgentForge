@@ -1,9 +1,25 @@
 import { forwardRef, useEffect, useState } from 'react';
 import clsx from 'clsx';
+import { extendTailwindMerge } from 'tailwind-merge';
 import { LoaderCircle } from 'lucide-react';
 import { roleStyle, RoleIcon } from '../lib/icons.jsx';
 
+/**
+ * Class names for ui.jsx components. A className passed to a ui.jsx component overrides its conflicting base utilities
+ * (`<Badge className="h-4">` drops the base h-5), because the components merge with `cn`, caller className last; '!' is
+ * only needed to beat classes outside ui.jsx components (e.g. the global :focus-visible outline). `cx` stays plain clsx:
+ * it keeps every class, so other files that compose their own class lists don't change behaviour.
+ */
 export const cx = clsx;
+
+// tailwind-merge needs the @theme colors from styles.css: by default any `text-*` / `shadow-*` word counts as a color,
+// so `text-grad` would drop `text-fg` and `shadow-af` would drop `shadow-sm`. Unknown words (tabular, af-stripes,
+// grad-accent, shadow-af, rounded-af, animate-af-*) are not in any group and are never dropped.
+const THEME_COLORS = ['bg', 'panel', 'raised', 'sunken', 'hover', 'line', 'line-strong', 'fg', 'muted', 'subtle', 'accent', 'accent-2',
+  'accent-fg', 'accent-soft', 'ok', 'warn', 'bad', 'info', 'series-1', 'ok-soft', 'warn-soft', 'bad-soft', 'info-soft', 'info-ink', 'ok-ink', 'warn-ink',
+  'inherit', 'current', 'transparent', 'black', 'white', (v) => /^[a-z]+-(50|[1-9]00|950)$/.test(v)];
+const twMerge = extendTailwindMerge({ override: { theme: { color: THEME_COLORS } } });
+const cn = (...args) => twMerge(clsx(...args));
 
 const BTN = {
   primary: 'grad-accent text-accent-fg shadow-sm hover:brightness-110 border border-transparent',
@@ -16,7 +32,7 @@ const BTN = {
 export const Button = forwardRef(function Button({ variant = 'secondary', size = 'md', icon: Icon, loading, className, children, ...rest }, ref) {
   const sz = size === 'sm' ? 'h-7 px-2.5 text-xs gap-1.5' : size === 'lg' ? 'h-10 px-4 text-sm gap-2' : 'h-8 px-3 text-[0.82rem] gap-1.5';
   return (
-    <button ref={ref} className={cx('inline-flex items-center justify-center rounded-lg font-medium transition-all duration-150 select-none whitespace-nowrap disabled:opacity-45 disabled:pointer-events-none active:scale-[0.98]', BTN[variant], sz, className)} {...rest}>
+    <button ref={ref} className={cn('inline-flex items-center justify-center rounded-lg font-medium transition-all duration-150 select-none whitespace-nowrap disabled:opacity-45 disabled:pointer-events-none active:scale-[0.98]', BTN[variant], sz, className)} {...rest}>
       {loading ? <LoaderCircle size={14} className="animate-spin" /> : Icon ? <Icon size={size === 'sm' ? 13 : 15} strokeWidth={2} /> : null}
       {children}
     </button>
@@ -29,7 +45,7 @@ const DOT = { ok: 'bg-ok', accent: 'bg-accent', warn: 'bg-warn', bad: 'bg-bad' }
 export const IconButton = forwardRef(function IconButton({ icon: Icon, label, active, size = 'md', className, badge, dot, tone, ...rest }, ref) {
   const sz = size === 'sm' ? 'size-6' : size === 'lg' ? 'size-9' : 'size-7';
   return (
-    <button ref={ref} title={label} aria-label={label} className={cx('relative inline-flex items-center justify-center rounded-md transition-colors shrink-0 disabled:opacity-40 disabled:pointer-events-none', sz,
+    <button ref={ref} title={label} aria-label={label} className={cn('relative inline-flex items-center justify-center rounded-md transition-colors shrink-0 disabled:opacity-40 disabled:pointer-events-none', sz,
       active ? 'bg-accent-soft text-accent' : tone === 'danger' ? 'text-muted hover:text-bad hover:bg-bad-soft' : 'text-muted hover:text-fg hover:bg-hover', className)} {...rest}>
       <Icon size={size === 'sm' ? 14 : size === 'lg' ? 18 : 16} strokeWidth={1.9} />
       {badge ? <span className="absolute -top-0.5 -right-0.5 min-w-4 h-4 px-1 rounded-full bg-bad text-white text-[10px] font-semibold leading-4 text-center tabular">{badge > 99 ? '99+' : badge}</span>
@@ -40,7 +56,7 @@ export const IconButton = forwardRef(function IconButton({ icon: Icon, label, ac
 
 export const Input = forwardRef(function Input({ className, icon: Icon, right, ...rest }, ref) {
   return (
-    <div className={cx('relative flex items-center', className)}>
+    <div className={cn('relative flex items-center', className)}>
       {Icon && <Icon size={14} className="absolute left-2.5 text-subtle pointer-events-none" />}
       <input ref={ref} className={cx('w-full h-8 rounded-lg bg-sunken border border-line px-2.5 text-[0.85rem] text-fg placeholder:text-subtle outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent-soft', Icon && 'pl-8', right && 'pr-9')} {...rest} />
       {right && <div className="absolute right-1">{right}</div>}
@@ -49,12 +65,12 @@ export const Input = forwardRef(function Input({ className, icon: Icon, right, .
 });
 
 export const Textarea = forwardRef(function Textarea({ className, ...rest }, ref) {
-  return <textarea ref={ref} className={cx('w-full rounded-lg bg-sunken border border-line px-2.5 py-2 text-[0.85rem] text-fg placeholder:text-subtle outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent-soft resize-none', className)} {...rest} />;
+  return <textarea ref={ref} className={cn('w-full rounded-lg bg-sunken border border-line px-2.5 py-2 text-[0.85rem] text-fg placeholder:text-subtle outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent-soft resize-none', className)} {...rest} />;
 });
 
 export function Select({ className, children, ...rest }) {
   return (
-    <select className={cx('h-8 rounded-lg bg-sunken border border-line px-2 text-[0.85rem] text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent-soft', className)} {...rest}>
+    <select className={cn('h-8 rounded-lg bg-sunken border border-line px-2 text-[0.85rem] text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent-soft', className)} {...rest}>
       {children}
     </select>
   );
@@ -74,7 +90,7 @@ export function Toggle({ checked, onChange, label, disabled }) {
 
 export function Field({ label, hint, children, className }) {
   return (
-    <label className={cx('flex flex-col gap-1.5', className)}>
+    <label className={cn('flex flex-col gap-1.5', className)}>
       <span className="text-[0.72rem] font-medium uppercase tracking-wider text-subtle">{label}</span>
       {children}
       {hint && <span className="text-xs text-subtle">{hint}</span>}
@@ -93,7 +109,7 @@ const TONES = {
 
 export function Badge({ tone = 'neutral', className, children, icon: Icon }) {
   return (
-    <span className={cx('inline-flex items-center gap-1 h-5 px-1.5 rounded-md border text-[0.7rem] font-medium whitespace-nowrap', TONES[tone], className)}>
+    <span className={cn('inline-flex items-center gap-1 h-5 px-1.5 rounded-md border text-[0.7rem] font-medium whitespace-nowrap', TONES[tone], className)}>
       {Icon && <Icon size={11} strokeWidth={2.2} />}
       {children}
     </span>
@@ -105,7 +121,7 @@ export const STATUS_TONE = { idle: 'neutral', working: 'accent', running: 'accen
 export function StatusDot({ status, className }) {
   const color = { online: 'bg-ok', working: 'bg-accent', running: 'bg-accent', busy: 'bg-info', planning: 'bg-info', degraded: 'bg-warn', restarting: 'bg-warn', down: 'bg-bad', failed: 'bg-bad', done: 'bg-ok', idle: 'bg-subtle', offline: 'bg-subtle' }[status] || 'bg-subtle';
   const pulse = ['working', 'running', 'busy', 'planning', 'restarting'].includes(status);
-  return <span className={cx('relative inline-flex size-2 shrink-0 rounded-full', color, className)}>{pulse && <span className={cx('absolute inset-0 rounded-full animate-ping opacity-60', color)} />}</span>;
+  return <span className={cn('relative inline-flex size-2 shrink-0 rounded-full', color, className)}>{pulse && <span className={cx('absolute inset-0 rounded-full animate-ping opacity-60', color)} />}</span>;
 }
 
 export function Kbd({ children }) {
@@ -113,13 +129,13 @@ export function Kbd({ children }) {
 }
 
 export function Spinner({ size = 14, className }) {
-  return <LoaderCircle size={size} className={cx('animate-spin text-accent', className)} />;
+  return <LoaderCircle size={size} className={cn('animate-spin text-accent', className)} />;
 }
 
 export function Progress({ value = 0, tone = 'accent', className, striped }) {
   const bar = { accent: 'grad-accent', ok: 'bg-ok', warn: 'bg-warn', bad: 'bg-bad', series: 'bg-series-1' }[tone];
   return (
-    <div className={cx('h-1.5 w-full rounded-full bg-hover overflow-hidden', className)} role="progressbar" aria-valuenow={Math.round(value)} aria-valuemin={0} aria-valuemax={100}>
+    <div className={cn('h-1.5 w-full rounded-full bg-hover overflow-hidden', className)} role="progressbar" aria-valuenow={Math.round(value)} aria-valuemin={0} aria-valuemax={100}>
       <div className={cx('h-full rounded-full transition-[width] duration-500', bar, striped && 'af-stripes')} style={{ width: `${Math.max(0, Math.min(100, value))}%` }} />
     </div>
   );
@@ -130,7 +146,7 @@ export function AgentAvatar({ agent, role, size = 32, status, className }) {
   const st = roleStyle(r);
   const s = status ?? agent?.status;
   return (
-    <span className={cx('relative inline-flex shrink-0 items-center justify-center rounded-[28%] text-white shadow-sm', className)}
+    <span className={cn('relative inline-flex shrink-0 items-center justify-center rounded-[28%] text-white shadow-sm', className)}
       style={{ width: size, height: size, backgroundImage: `linear-gradient(135deg, ${st.from}, ${st.to})` }}>
       <RoleIcon role={r} size={Math.round(size * 0.52)} />
       {s && s !== 'idle' && (
@@ -153,7 +169,7 @@ export function Empty({ icon: Icon, title, children, action }) {
 
 export function PanelHeader({ icon: Icon, title, count, children, className }) {
   return (
-    <div className={cx('flex items-center gap-2 h-10 px-3 border-b border-line shrink-0', className)}>
+    <div className={cn('flex items-center gap-2 h-10 px-3 border-b border-line shrink-0', className)}>
       {Icon && <Icon size={15} className="text-subtle" />}
       <span className="text-[0.72rem] font-semibold uppercase tracking-wider text-muted truncate">{title}</span>
       {count != null && <span className="text-[0.7rem] font-semibold text-subtle tabular">{count}</span>}
@@ -164,7 +180,7 @@ export function PanelHeader({ icon: Icon, title, count, children, className }) {
 
 export function Tabs({ tabs, value, onChange, className, size = 'md' }) {
   return (
-    <div className={cx('inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-sunken border border-line', className)} role="tablist">
+    <div className={cn('inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-sunken border border-line', className)} role="tablist">
       {tabs.map((t) => (
         <button key={t.id} role="tab" aria-selected={value === t.id} onClick={() => onChange(t.id)}
           className={cx('inline-flex items-center gap-1.5 rounded-md font-medium transition-all', size === 'sm' ? 'h-6 px-2 text-[0.72rem]' : 'h-7 px-2.5 text-[0.78rem]',

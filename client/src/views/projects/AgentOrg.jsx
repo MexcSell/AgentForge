@@ -87,7 +87,7 @@ function OrgCard({ agent, gm, task, orchestrating, releasable, onOpen }) {
           <span className={cx('flex items-center gap-1 min-w-0', releasable && 'pr-6')}>
             <span className="text-[0.8rem] font-medium truncate">{agent.name}</span>
             {gm && <Badge tone="accent" className="shrink-0">GM</Badge>}
-            <Badge className="shrink-0 h-4! px-1! text-[0.62rem]! tabular">L{level}</Badge>
+            <Badge className="shrink-0 h-4 px-1 text-[0.62rem] tabular">L{level}</Badge>
           </span>
           {tier && <span className="block text-[0.66rem] leading-4 text-subtle truncate">{tier}</span>}
           <span role="progressbar" aria-label={`XP toward L${level + 1}`} aria-valuenow={Math.round(xpPct)} aria-valuemin={0} aria-valuemax={100} aria-valuetext={`${xp} / ${xpNext} XP`}
@@ -127,7 +127,7 @@ function ReleaseButton({ agent, busy, onRelease }) {
   const label = busy.length ? `Can't release ${agent.name} yet: ${busy.join(', ')} ${busy.length === 1 ? 'is' : 'are'} queued or running in this project` : `Release ${agent.name} from the project`;
   return (
     <IconButton icon={UserMinus} size="sm" label={label} tone={busy.length ? undefined : 'danger'} aria-disabled={busy.length ? true : undefined} data-release={agent.id}
-      className={cx('absolute! top-1.5 right-1.5', busy.length && 'opacity-40 cursor-not-allowed hover:bg-transparent hover:text-muted')}
+      className={cx('absolute top-1.5 right-1.5', busy.length && 'opacity-40 cursor-not-allowed hover:bg-transparent hover:text-muted')}
       onClick={(e) => onRelease(agent, e.currentTarget, busy)} />
   );
 }

@@ -29,7 +29,7 @@ export const isLeased = (a) => canMerge(a) && !!a.lease_mission_id;
 export function LeaseBadge({ clone, original, className }) {
   if (!isLeased(clone)) return null;
   const text = `Leased · returns to ${original?.name || 'its original'} after mission`;
-  return <Badge tone="info" icon={Timer} className={`max-w-full h-auto! min-h-5 py-0.5 whitespace-normal! ${className || ''}`}><span className="min-w-0 break-words">{text}</span></Badge>;
+  return <Badge tone="info" icon={Timer} className={`max-w-full h-auto min-h-5 py-0.5 whitespace-normal ${className || ''}`}><span className="min-w-0 break-words">{text}</span></Badge>;
 }
 
 const mergeLabel = (original) => `Merge into ${original?.name || 'original'}`;
