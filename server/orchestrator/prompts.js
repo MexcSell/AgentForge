@@ -57,11 +57,14 @@ const gmRole = (gm, project) => (gm?.role === 'executive'
   : `General Manager of the software project "${project.name}"`);
 const gmIntro = (gm, project) => `${gm?.name || 'the General Manager'}, ${gmRole(gm, project)}`;
 
-export function planPrompt({ project, gm, command, attachments, agents, topic, inflight = '' }) {
+// An agent's standing in the project for the registry: on its team, released from it, or (no mark) not a member.
+const standingMark = (standing, id) => ({ active: ' · on team', released: ' · released from this project' })[standing?.get(id)] || '';
+
+export function planPrompt({ project, gm, command, attachments, agents, standing = null, topic, inflight = '' }) {
   const boss = gm.role === 'executive' ? null : agents.find((a) => a.role === 'executive');
   const roster = agents
     .filter((a) => !['executive', 'evolution', 'analyst', 'optimizer', 'manager'].includes(a.role))
-    .map((a) => `- ${a.name} · ${a.role} · L${a.level} · skills: ${a.skills.map((s) => `${s.name}:${s.level}`).join(', ')} · ${a.status}`)
+    .map((a) => `- ${a.name} · ${a.role} · L${a.level} · skills: ${a.skills.map((s) => `${s.name}:${s.level}`).join(', ')} · ${a.status}${standingMark(standing, a.id)}`)
     .join('\n');
   const system = `You are ${gmIntro(gm, project)} inside AgentForge, a hierarchical multi-agent engineering organization.${boss ? `
 Your superior is ${boss.name}, top-level manager of AgentForge and project manager of "AgentForge".` : ''}
@@ -71,6 +74,7 @@ Rules:
 - Use "depends_on" so independent tasks run in parallel; serialize tasks that edit the same files.${inflight ? `
 - Other missions are running in this working tree right now (IN-FLIGHT MISSIONS IN OTHER TOPICS). Every code-changing task declares "files": [repo-relative paths or directories it will edit]. Prefer a plan that avoids their files, but declare overlaps anyway: the platform makes an overlapping task wait until theirs finishes.` : ''}
 - Valid roles: ${Object.keys(ROLES).filter((r) => !['executive', 'evolution', 'analyst', 'optimizer', 'manager'].includes(r)).join(', ')}. You may invent a new specialist role (kebab-case) when none fits; the platform will recruit that agent.
+- Registry entries marked "on team" are this project's members; prefer them when their skills fit. Never plan around agents marked "released from this project": the platform won't staff them here, so describe the work by role and skills instead of relying on them.
 - Code-changing work must be followed by an independent verification task (role "reviewer" or "qa") that depends on it.
 - If the message is a question or small talk that needs no work, answer it in "reply" and return an empty "tasks" array.
 - Never include git commit/push steps: the platform syncs GitHub automatically after the mission.

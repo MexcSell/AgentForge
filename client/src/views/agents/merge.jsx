@@ -1,10 +1,10 @@
 import { useId } from 'react';
-import { GitMerge } from 'lucide-react';
+import { GitMerge, Timer } from 'lucide-react';
 import { api } from '../../lib/api.js';
 import { useStore } from '../../lib/store.js';
 import { toast } from '../../lib/toast.js';
 import { Confirm } from '../../components/Modal.jsx';
-import { Button, IconButton } from '../../components/ui.jsx';
+import { Badge, Button, IconButton } from '../../components/ui.jsx';
 import { HandOverPreview } from './HandOverPreview.jsx';
 
 export const MERGE_BUSY = 'Busy — merge when it is idle';
@@ -21,6 +21,16 @@ export const mergeOriginal = (a, agents) => {
   if (!a.merge_target_id) return null;
   return agents.find((x) => x.id === a.merge_target_id) || { id: a.merge_target_id, name: a.merge_target_name };
 };
+
+/** A live clone leased to a mission (lease_mission_id): the engine merges it back into its original when that mission ends. */
+export const isLeased = (a) => canMerge(a) && !!a.lease_mission_id;
+
+/** 'Leased · returns to <merge target> after mission'; wraps instead of widening a narrow column. Nothing for originals and unleased clones. */
+export function LeaseBadge({ clone, original, className }) {
+  if (!isLeased(clone)) return null;
+  const text = `Leased · returns to ${original?.name || 'its original'} after mission`;
+  return <Badge tone="info" icon={Timer} className={`max-w-full h-auto! min-h-5 py-0.5 whitespace-normal! ${className || ''}`}><span className="min-w-0 break-words">{text}</span></Badge>;
+}
 
 const mergeLabel = (original) => `Merge into ${original?.name || 'original'}`;
 

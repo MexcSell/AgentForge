@@ -8,8 +8,9 @@ import { config } from '../config.js';
 import { emit } from '../events.js';
 import { getSettings, sanitizeMonitor } from '../db/seed.js';
 import { ROLES, TIERS } from '../roles.js';
-import { listAgents, getAgent, createAgent, cloneAgent, mergeAgent, consolidateRole, previewConsolidate, publishAgent, publishCloneTargets, withAgentLock, liveAncestor } from '../services/agents.js';
+import { listAgents, getAgent, createAgent, cloneAgent, mergeAgent, consolidateRole, previewConsolidate, publishAgent, retireAgent, liveAncestor, refreshAgentStatus } from '../services/agents.js';
 import { listProjects, getProject, createProjectRecord, publishProject } from '../services/projects.js';
+import { listMembers, addMember, releaseMember, releaseIdle } from '../services/members.js';
 import { listTopics, getTopic, createTopic, updateTopic, deleteTopic, isUuid } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
 import { gitInfo } from '../services/git.js';
@@ -20,21 +21,18 @@ import { evolutionOverview, analyzeMission } from '../orchestrator/evolution.js'
 
 const err = (reply, code, message) => reply.code(code).send({ error: message });
 
-// Archive an agent and move its reports up to its own supervisor. In the agent's 'claim' lane, so no task can start on
-// it in between. ready() is checked first in the lane: when it returns false nothing changes and the result is false.
-const retireAgent = (id, supervisorId, ready = () => true) => withAgentLock('claim', id, async () => {
-  if (!(await ready())) return false;
-  await query(`UPDATE agents SET supervisor_id = $2 WHERE supervisor_id = $1`, [id, supervisorId]);
-  await query(`UPDATE agents SET archived = true, status = 'offline' WHERE id = $1`, [id]);
-  return true;
-}).then(async (done) => {
-  // Outside the lane, so a clone's republish never waits behind it. Clones that merged into it now resolve further up.
-  if (done) await publishCloneTargets(id);
-  return done;
-});
-
 // The projects a delete covers, with their GMs. The hand-over preview reads them the same way, so it goes in the same order.
-const deleteRows = (ids) => many(`SELECT p.id, p.name, p.protected, p.manager_id, m.supervisor_id AS manager_supervisor_id FROM projects p LEFT JOIN agents m ON m.id = p.manager_id WHERE p.id = ANY($1)`, [ids]);
+// retire_id: the GM to retire with the project; null when it is an executive, which is never retired, or a clone.
+// merge_id: a cloned GM (createProjectRecord clones the original manager), merged back into its original instead.
+// Projects have no finished/archived status (only idle/running), so deleting a project is the only time its GM goes.
+const deleteRows = (ids) => many(`SELECT p.id, p.name, p.protected, p.manager_id, m.supervisor_id AS manager_supervisor_id,
+  CASE WHEN m.role = 'executive' OR m.origin = 'cloned' THEN NULL ELSE p.manager_id END AS retire_id,
+  CASE WHEN m.role <> 'executive' AND m.origin = 'cloned' AND NOT m.archived THEN p.manager_id END AS merge_id
+  FROM projects p LEFT JOIN agents m ON m.id = p.manager_id WHERE p.id = ANY($1)`, [ids]);
+
+// Where a deleted project's cloned GM would merge back: its live original, as mergeAgent() resolves it. A clone with
+// none left is retired like a legacy GM.
+const gmMergeTarget = async (p) => (p.merge_id ? liveAncestor(await getAgent(p.merge_id)) : null);
 
 // opts.onSettingsChange(key, value) lets the server react to a saved setting without a restart.
 export default async function apiRoutes(app, opts = {}) {
@@ -47,7 +45,18 @@ export default async function apiRoutes(app, opts = {}) {
     const ids = String(req.query.ids ?? '').split(',').map((s) => s.trim()).filter(Boolean);
     if (!ids.every((id) => isUuid(id))) return err(reply, 400, 'Invalid project id');
     const doomed = (await deleteRows(ids)).filter((p) => !p.protected);
-    return { moves: await previewHandOver(doomed.map((p) => p.manager_id).filter(Boolean), { excludeProjects: doomed.map((p) => p.id) }) };
+    const excludeProjects = doomed.map((p) => p.id);
+    // merges: cloned GMs that merge back into their original ({ project, from, into }); their pending work goes there.
+    const merges = [];
+    const retire = [];
+    for (const p of doomed) {
+      const into = await gmMergeTarget(p);
+      if (into) merges.push({ project: { id: p.id, name: p.name }, from: { id: p.merge_id, name: (await getAgent(p.merge_id)).name }, into: { id: into.id, name: into.name } });
+      else if (p.retire_id || p.merge_id) retire.push(p.retire_id || p.merge_id);
+    }
+    const moves = await previewHandOver(retire, { excludeProjects });
+    for (const m of merges) moves.push(...(await previewHandOver([m.from.id], { mergeInto: m.into, excludeProjects })));
+    return { moves, merges };
   });
 
   app.post('/api/projects', async (req, reply) => {
@@ -86,14 +95,30 @@ export default async function apiRoutes(app, opts = {}) {
       await cancelMission(p.id).catch(() => {});
       await disposePreview(p.id).catch(() => {});
       await query(`DELETE FROM projects WHERE id = $1`, [p.id]);
-      // Retired like a deleted agent, but with no busy check: its missions were just cancelled.
-      if (p.manager_id) await retireAgent(p.manager_id, p.manager_supervisor_id);
+      // A cloned GM merges back into its original manager (its xp and skills grow, the clone is archived with
+      // merged_into). Its missions were just cancelled; a status still left 'working' by them is recomputed first.
+      let merged = null;
+      if (await gmMergeTarget(p)) {
+        await refreshAgentStatus(p.merge_id).catch(() => {});
+        try {
+          merged = await mergeAgent(p.merge_id, { why: `Project ${p.name} deleted · ` });
+        } catch (e) {
+          if (!e.status) throw e;
+          console.error('[project-delete merge]', p.name, e.message); // retired below instead
+        }
+      }
+      // Otherwise retired like a deleted agent, but with no busy check: its missions were just cancelled.
+      // An executive GM stays (retireAgent refuses it too): it only loses this project.
+      const gone = merged ? p.merge_id : p.retire_id || p.merge_id;
+      const retired = !merged && gone ? await retireAgent(gone, p.manager_supervisor_id) : false;
       emit('project:delete', { id: p.id });
-      if (p.manager_id) emit('agent:delete', { id: p.manager_id });
+      if (retired) emit('agent:delete', { id: gone }); // mergeAgent emitted it already
+      for (const id of merged?.projects || []) await publishProject(id).catch(() => {});
       deleted.push(p.name);
-      await audit('user', 'project.delete', p.name);
-      // This project's missions are gone with it; pending work the GM had in other projects' missions moves on.
-      if (p.manager_id) await handOver(p.manager_id).catch((e) => console.error('[handover]', e.message));
+      await audit('user', 'project.delete', p.name, merged ? { mergedInto: merged.agent.name, mergedIntoId: merged.agent.id } : {});
+      // This project's missions are gone with it; pending work the GM had in other projects' missions moves on
+      // (to the original it merged into, else to a similar agent).
+      if (retired || merged) await handOver(gone).catch((e) => console.error('[handover]', e.message));
     }
     return { deleted, refused };
   });
@@ -131,6 +156,30 @@ export default async function apiRoutes(app, opts = {}) {
     return { ...(await gitInfo(p.path)), logs: await many(`SELECT * FROM sync_logs WHERE project_id = $1 ORDER BY created_at DESC LIMIT 20`, [p.id]) };
   });
 
+  // ---- project members ---------------------------------------------------
+  // Changes publish 'project:members' { project_id, members } and write an audit row. Refusals (409): adding an archived
+  // agent, releasing the GM or an agent with a pending or running task in the project; nothing changes then.
+  const members = (fn) => async (req, reply) => {
+    if (!isUuid(req.params.id) || (req.params.agentId !== undefined && !isUuid(req.params.agentId))) return err(reply, 404, 'Not found');
+    try {
+      return await fn(req);
+    } catch (e) {
+      if (e.status) return err(reply, e.status, e.message);
+      throw e;
+    }
+  };
+  app.get('/api/projects/:id/members', members(async (req) => {
+    if (!(await one(`SELECT 1 FROM projects WHERE id = $1`, [req.params.id]))) throw Object.assign(new Error('Project not found'), { status: 404 });
+    return listMembers(req.params.id);
+  }));
+  app.post('/api/projects/:id/members', members(async (req) => {
+    const agentId = req.body?.agent_id;
+    if (!isUuid(agentId)) throw Object.assign(new Error('agent_id is required'), { status: 400 });
+    return addMember(req.params.id, agentId, 'user');
+  }));
+  app.delete('/api/projects/:id/members/:agentId', members((req) => releaseMember(req.params.id, req.params.agentId)));
+  app.post('/api/projects/:id/members/release-idle', members((req) => releaseIdle(req.params.id)));
+
   // ---- topics (chat threads) ---------------------------------------------
   app.get('/api/projects/:id/topics', async (req, reply) => {
     if (!isUuid(req.params.id)) return err(reply, 404, 'Not found');
@@ -139,9 +188,9 @@ export default async function apiRoutes(app, opts = {}) {
 
   app.post('/api/projects/:id/topics', async (req, reply) => {
     if (!isUuid(req.params.id) || !(await one(`SELECT 1 FROM projects WHERE id = $1`, [req.params.id]))) return err(reply, 404, 'Not found');
-    const { title, tags } = req.body || {};
+    const { title, tags, summary } = req.body || {};
     const named = typeof title === 'string' && !!title.trim();
-    const t = await createTopic({ project_id: req.params.id, title: named ? title : undefined, tags, title_locked: named });
+    const t = await createTopic({ project_id: req.params.id, title: named ? title : undefined, tags, summary: typeof summary === 'string' ? summary : '', title_locked: named });
     emit('topic:new', t);
     return t;
   });
@@ -149,10 +198,11 @@ export default async function apiRoutes(app, opts = {}) {
   app.patch('/api/topics/:id', async (req, reply) => {
     const t = await getTopic(req.params.id);
     if (!t) return err(reply, 404, 'Not found');
-    const { title, tags, archived } = req.body || {};
+    const { title, tags, archived, summary } = req.body || {};
     if (title !== undefined && !String(title ?? '').trim()) return err(reply, 400, 'Title cannot be empty');
-    // A human rename pins the title so the manager stops auto-naming the topic.
-    return updateTopic(t.id, { title, tags, archived, title_locked: title !== undefined ? true : undefined });
+    if (summary !== undefined && typeof summary !== 'string') return err(reply, 400, 'Summary must be text');
+    // A human rename pins the title so the manager stops auto-naming the topic; the summary keeps evolving.
+    return updateTopic(t.id, { title, tags, archived, summary, title_locked: title !== undefined ? true : undefined });
   });
 
   app.delete('/api/topics/:id', async (req, reply) => {

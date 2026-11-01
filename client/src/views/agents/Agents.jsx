@@ -8,6 +8,7 @@ import { useStore } from '../../lib/store.js';
 import { toast } from '../../lib/toast.js';
 import { timeAgo } from '../../lib/format.js';
 import { roleStyle, ROLE_STYLE } from '../../lib/icons.jsx';
+import { ExecBadge } from '../../lib/dualRole.js';
 import { Modal } from '../../components/Modal.jsx';
 import { cx, AgentAvatar, Badge, Button, IconButton, Input, Field, Select, Textarea, Tabs, Empty, StatusDot, Spinner } from '../../components/ui.jsx';
 import { canMerge, mergeOriginal, MergeButton, MergeConfirm } from './merge.jsx';
@@ -24,6 +25,7 @@ function AgentCard({ a, original, onMerge }) {
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5"><span className="font-semibold text-[0.88rem] truncate">{a.name}</span>{a.origin === 'cloned' && <GitFork size={11} className="text-subtle" title="Clone" />}{a.origin === 'created' && <Sparkles size={11} className="text-accent" title="Recruited dynamically" />}</div>
           <div className="text-[0.72rem] text-muted truncate">{a.title}</div>
+          <ExecBadge agent={a} className="mt-1" />
         </div>
         <div className="text-right">
           <div className="text-[0.72rem] font-semibold text-accent tabular">L{a.level}</div>
@@ -93,7 +95,7 @@ function OrgNode({ node, collapsed, toggle }) {
         <button onClick={() => set({ agentModal: a.id })} className="flex items-center gap-2.5 pl-2 pr-3 py-2 rounded-xl border border-line bg-panel hover:border-accent/60 hover:shadow-af transition-all text-left min-w-44"
           style={{ boxShadow: a.status === 'working' ? `0 0 0 2px ${R.from}55` : undefined }}>
           <AgentAvatar agent={a} size={30} />
-          <span className="min-w-0"><span className="block text-[0.8rem] font-semibold truncate">{a.name}</span><span className="block text-[0.66rem] text-subtle truncate max-w-36">{a.title}</span></span>
+          <span className="min-w-0"><span className="block text-[0.8rem] font-semibold truncate">{a.name}</span><span className="block text-[0.66rem] text-subtle truncate max-w-36">{a.title}</span><ExecBadge agent={a} className="mt-0.5 max-w-36" /></span>
           <span className="ml-auto text-[0.64rem] text-accent font-semibold tabular">L{a.level}</span>
         </button>
         {node.children.length > 0 && (

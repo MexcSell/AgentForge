@@ -87,6 +87,7 @@ export const useStore = create((set, get) => ({
   retitled: {}, // { [topicId]: earlierTitle } — the title before a live keyword retitle (this session only)
   announce: '', // polite live-region text for topic changes
   tasks: {},
+  members: {}, // { [projectId]: Member[] } — GET /members, kept live by project:members (GM first, active before released)
   missionsByTopic: {}, // { [topicId]: Mission } — from mission:update; see pickMission
   loadedRuns: {}, // { [topicId]: true } — already running when loadTopics fetched it; no mission:update seen since
   live: {},
@@ -181,6 +182,25 @@ export const useStore = create((set, get) => ({
     get().applyEvent('topic:delete', { id: t.id, project_id: t.project_id });
   },
 
+  async loadMembers(projectId) {
+    const members = await api.get(`/api/projects/${projectId}/members`);
+    set((st) => ({ members: { ...st.members, [projectId]: members } }));
+    return members;
+  },
+
+  /**
+   * Membership changes: add (also restores a released member), release, release-idle. Live state arrives as project:members;
+   * the reply's list only counts if no event beat it here. Refusals (409) throw after api.js showed the server's message.
+   */
+  async memberAction(projectId, action, agentId) {
+    const before = get().members[projectId];
+    const r = action === 'add' ? await api.post(`/api/projects/${projectId}/members`, { agent_id: agentId })
+      : action === 'release' ? await api.del(`/api/projects/${projectId}/members/${agentId}`)
+        : await api.post(`/api/projects/${projectId}/members/release-idle`);
+    if (Array.isArray(r?.members) && get().members[projectId] === before) set((st) => ({ members: { ...st.members, [projectId]: r.members } }));
+    return r;
+  },
+
   /** Fetches the project's preview session snapshot (never starts it). */
   async loadPreview(projectId) {
     const p = await api.get(`/api/projects/${projectId}/preview`, { quiet: true });
@@ -214,7 +234,8 @@ export const useStore = create((set, get) => ({
         set(patch);
         break;
       }
-      case 'project:delete': set({ projects: st.projects.filter((x) => x.id !== p.id), activeProjectId: st.activeProjectId === p.id ? null : st.activeProjectId }); break;
+      case 'project:delete': set({ projects: st.projects.filter((x) => x.id !== p.id), activeProjectId: st.activeProjectId === p.id ? null : st.activeProjectId, members: without(st.members, p.id) }); break;
+      case 'project:members': if (p.project_id && Array.isArray(p.members)) set({ members: { ...st.members, [p.project_id]: p.members } }); break;
       case 'agent:new':
       case 'agent:update': set({ agents: upsert(st.agents, p) }); break;
       case 'agent:delete': set({ agents: st.agents.filter((x) => x.id !== p.id) }); break;

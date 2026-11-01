@@ -2,13 +2,15 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Send, ImagePlus, X, Copy, Check, Users, Square, Trash2, Lock, FolderOpen, Settings2, ArrowRight, Lightbulb, ThumbsUp, ThumbsDown,
   ListTree, Sparkles, CircleCheck, CircleX, TriangleAlert, Workflow, UserPlus, CopyPlus, Loader2, Slash,
-  Hash, Plus, Pencil, Split, CornerDownRight, Archive, ArchiveRestore, MonitorPlay, ChevronRight,
+  Hash, Plus, Pencil, Split, CornerDownRight, Archive, ArchiveRestore, MonitorPlay, ChevronRight, Crown,
 } from 'lucide-react';
 import { api } from '../../lib/api.js';
 import { useStore, selectRuns } from '../../lib/store.js';
 import { toast } from '../../lib/toast.js';
 import { copyText, clockTime, dateTime } from '../../lib/format.js';
 import { parseNew, isUntitled, tagCounts, MAX_TAGS } from '../../lib/topics.js';
+import { isHeadline, needsUser, proposalDecision } from '../../lib/feed.js';
+import { executiveRoles } from '../../lib/dualRole.js';
 import { GithubMark, roleStyle } from '../../lib/icons.jsx';
 import { Markdown } from '../../components/Markdown.jsx';
 import { Modal, Confirm } from '../../components/Modal.jsx';
@@ -71,13 +73,6 @@ function PlanBody({ m }) {
   );
 }
 
-/** A superior's verdict on a proposal: messages.meta.decision, else read back from the task result. */
-function proposalDecision(m, t) {
-  if (m.meta?.decision?.verdict) return m.meta.decision;
-  const r = /^(Approved|Rejected|Escalated) by (.+?)(?: → new mission|: ([\s\S]*))$/.exec(t?.result || '');
-  return r ? { verdict: { Approved: 'approve', Rejected: 'reject', Escalated: 'escalate' }[r[1]], by: r[2], reason: r[3] || '' } : null;
-}
-
 const VERDICT = {
   approve: { tone: 'ok', icon: ThumbsUp, label: (by) => `Approved by ${by} → new mission` },
   reject: { tone: 'neutral', icon: ThumbsDown, label: (by) => `Rejected by ${by}` },
@@ -85,15 +80,6 @@ const VERDICT = {
 };
 
 const selectTriage = (s) => s.settings?.orchestrator?.proposalTriage !== false && !s.settings?.orchestrator?.autoApproveProposals;
-
-/**
- * Superiors decide proposals; the user only gets Approve/Reject on a still-proposed task that was escalated to them
- * (or that nobody else decides because triage is off).
- */
-function needsUser(m, t, triage) {
-  const d = proposalDecision(m, t);
-  return (!t || t.status === 'proposed') && (d?.verdict === 'escalate' || (!triage && !d));
-}
 
 function ProposalBody({ m, tasks }) {
   const t = tasks?.find((x) => x.id === m.meta?.task_id);
@@ -330,19 +316,6 @@ function Message({ m, count, tasks }) {
   );
 }
 
-/**
- * The topic feed keeps the GM's main content: orders, the GM's chat/plan/summary/error/meeting/status lines, system
- * messages and moved-topic notices. Worker reports and proposals, other agents' statuses and meta.detail chatter fold
- * into one row per mission. An escalated proposal waiting for the user stays visible.
- */
-function isHeadline(m, gmId, tasks, triage) {
-  if (m.author_type === 'user' || (m.kind === 'status' && m.meta?.topic_id)) return true;
-  if (m.kind === 'proposal') return needsUser(m, tasks?.find((x) => x.id === m.meta?.task_id), triage);
-  if (m.meta?.detail) return false;
-  if (m.author_type === 'system') return true;
-  return !!m.agent_id && m.agent_id === gmId && m.kind !== 'report';
-}
-
 const sameMessage = (a, b) => a.content === b.content && a.author_type === b.author_type && a.agent_id === b.agent_id && a.kind === b.kind && !b.attachments?.length;
 
 /** Collapse consecutive identical messages into one with a counter. */
@@ -527,6 +500,8 @@ export function CommandWindow({ project }) {
     }
   };
   const slash = text.startsWith('/') && !text.includes(' ') ? SLASH.filter((s) => s.cmd.startsWith(text)) : [];
+  const gmExec = executiveRoles(st.agents.find((x) => x.id === project.manager_id), st.projects).top;
+  const execLabel = `Top-level manager · GM of ${project.name}`;
 
   return (
     <div className="h-full flex flex-col relative" onDragOver={(e) => { if ([...e.dataTransfer.types].includes('Files')) { e.preventDefault(); setDrag(true); } }}
@@ -541,7 +516,10 @@ export function CommandWindow({ project }) {
           </div>
           <div className="flex items-center gap-2 text-[0.7rem] text-subtle min-w-0">
             <button className="mono truncate hover:text-accent" title="Open in Files" onClick={() => st.set({ view: 'files', filePanes: [{ id: 'p1', path: project.path }], activePane: 'p1' })}>{project.path}</button>
-            <span>·</span><span className="shrink-0">GM <button className="hover:underline text-muted" onClick={() => st.set({ agentModal: project.manager_id })}>{project.manager_name}</button></span>
+            <span>·</span><span className="shrink-0">GM <button className="hover:underline text-muted" title={gmExec ? execLabel : undefined} onClick={() => st.set({ agentModal: project.manager_id })}>{project.manager_name}</button>{gmExec && (
+              // Below @md (25% pane) line 2 already runs under the icon group, so the crown takes no width there (tooltip on the name instead).
+              <Crown size={11} role="img" className="inline-block align-[-1px] ml-1 text-warn @max-md:sr-only" aria-label={execLabel}><title>{execLabel}</title></Crown>
+            )}</span>
           </div>
         </div>
         <div className="flex items-center gap-2.5 @max-md:gap-1 shrink-0">

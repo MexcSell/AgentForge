@@ -83,6 +83,10 @@ CREATE TABLE IF NOT EXISTS missions (
   finished_at  timestamptz
 );
 
+-- A clone made for one mission (engine staffing): merged back into its original when that mission ends. NULL for
+-- originals, manual clones and clones made before leases existed.
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS lease_mission_id uuid REFERENCES missions(id) ON DELETE SET NULL;
+
 CREATE TABLE IF NOT EXISTS tasks (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id   uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -267,3 +271,78 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   detail      jsonb NOT NULL DEFAULT '{}',
   created_at  timestamptz NOT NULL DEFAULT now()
 );
+
+-- One-time (marked by its audit_logs row): the executive becomes 'AgentForge Agent' unless a human renamed it or the
+-- name is taken, and every live GM of an unprotected project reports to it. seed.js makes it the AgentForge project's GM.
+DO $$
+DECLARE exec uuid; renamed int; gms int;
+BEGIN
+  IF EXISTS (SELECT 1 FROM audit_logs WHERE action = 'migrate.executive-gm') THEN RETURN; END IF;
+  SELECT id INTO exec FROM agents WHERE role = 'executive' AND NOT archived ORDER BY created_at, id LIMIT 1;
+  IF exec IS NULL THEN RETURN; END IF; -- empty database: seed.js creates the organization this way already
+  UPDATE agents SET name = 'AgentForge Agent', updated_at = now()
+  WHERE id = exec AND name = 'Atlas' AND NOT EXISTS (SELECT 1 FROM agents WHERE name = 'AgentForge Agent');
+  GET DIAGNOSTICS renamed = ROW_COUNT;
+  UPDATE agents a SET supervisor_id = exec, updated_at = now() FROM projects p
+  WHERE p.manager_id = a.id AND NOT p.protected AND NOT a.archived AND a.id <> exec AND a.supervisor_id IS DISTINCT FROM exec;
+  GET DIAGNOSTICS gms = ROW_COUNT;
+  INSERT INTO audit_logs(actor, action, target, detail)
+  VALUES ('system', 'migrate.executive-gm', (SELECT name FROM agents WHERE id = exec), jsonb_build_object('executive', exec, 'renamed', renamed > 0, 'gms', gms));
+END $$;
+
+-- Topic titles hold key words; the summary says what the topic covers so far (kept current by the GM's plans).
+ALTER TABLE topics ADD COLUMN IF NOT EXISTS summary text NOT NULL DEFAULT '';
+-- One-time (marked by its audit_logs row): unlocked titles of more than 3 words become at most 3 key words (28 chars,
+-- same stopwords as heuristics.js topicTitle); the full old title moves into an empty summary.
+DO $$
+DECLARE r record; w text; core text; keys text[]; words text[]; picked text[]; kw text; n int := 0;
+  stop text[] := string_to_array('a an the and or but nor so of to in on at by for from with without into onto over under about as is are was were be been being am do does did has have had it its this that these those there here what which who whom whose when where why how i me my we our you your he she they them their please can could should would will shall may might must just also only very too then than not no all any some more most each every make let lets get show add use new now up out off via vs', ' ');
+BEGIN
+  IF EXISTS (SELECT 1 FROM audit_logs WHERE action = 'migrate.topic-keywords') THEN RETURN; END IF;
+  FOR r IN SELECT id, title FROM topics WHERE NOT title_locked AND array_length(regexp_split_to_array(btrim(title), '\s+'), 1) > 3 LOOP
+    keys := '{}'; words := '{}';
+    FOREACH w IN ARRAY regexp_split_to_array(btrim(r.title), '\s+') LOOP
+      core := regexp_replace(w, '^[^[:alnum:]]+|[^[:alnum:]]+$', '', 'g');
+      CONTINUE WHEN core = '';
+      words := words || core;
+      IF NOT lower(core) = ANY(stop) THEN keys := keys || core; END IF;
+    END LOOP;
+    picked := (CASE WHEN cardinality(keys) > 0 THEN keys ELSE words END)[1:3];
+    WHILE cardinality(picked) > 1 AND length(array_to_string(picked, ' ')) > 28 LOOP
+      picked := picked[1:cardinality(picked) - 1];
+    END LOOP;
+    kw := btrim(left(array_to_string(picked, ' '), 28));
+    CONTINUE WHEN kw = '';
+    UPDATE topics SET title = kw, summary = CASE WHEN summary = '' THEN r.title ELSE summary END, updated_at = now() WHERE id = r.id;
+    n := n + 1;
+  END LOOP;
+  INSERT INTO audit_logs(actor, action, target, detail) VALUES ('system', 'migrate.topic-keywords', 'topics', jsonb_build_object('shortened', n));
+END $$;
+
+-- Project membership: the agents added to a project (by a human, or automatically when the GM staffs them) and whether
+-- they are still on it. The GM is always a member and can't be released. A merged agent's rows move to the agent it was
+-- merged into (absorb() in services/agents.js); a retired (archived, unmerged) agent's rows stay and are ignored.
+CREATE TABLE IF NOT EXISTS project_members (
+  project_id   uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  agent_id     uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  status       text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'released')),
+  added_by     text NOT NULL DEFAULT 'user' CHECK (added_by IN ('user', 'auto')),
+  added_at     timestamptz NOT NULL DEFAULT now(),
+  released_at  timestamptz,
+  PRIMARY KEY (project_id, agent_id)
+);
+CREATE INDEX IF NOT EXISTS project_members_agent_idx ON project_members(agent_id);
+-- One-time (marked by its audit_logs row): every agent that had a task in a project, and its GM, become active members.
+DO $$
+DECLARE n int;
+BEGIN
+  IF EXISTS (SELECT 1 FROM audit_logs WHERE action = 'migrate.project-members') THEN RETURN; END IF;
+  INSERT INTO project_members(project_id, agent_id, status, added_by)
+  SELECT DISTINCT x.project_id, x.agent_id, 'active', 'auto' FROM (
+    SELECT t.project_id, t.agent_id FROM tasks t WHERE t.agent_id IS NOT NULL
+    UNION SELECT p.id, p.manager_id FROM projects p WHERE p.manager_id IS NOT NULL
+  ) x
+  ON CONFLICT (project_id, agent_id) DO UPDATE SET status = 'active', released_at = NULL;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  INSERT INTO audit_logs(actor, action, target, detail) VALUES ('system', 'migrate.project-members', 'project_members', jsonb_build_object('members', n));
+END $$;

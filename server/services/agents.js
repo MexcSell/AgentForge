@@ -3,6 +3,7 @@ import { getSettings } from '../db/seed.js';
 import { emit } from '../events.js';
 import { CODENAMES, roleInfo, normalizeRole } from '../roles.js';
 import { notify, audit } from './notify.js';
+import { publishMembers } from './members.js';
 import { combineLearning, mergePlaybooks, foldPlaybooks, event as evolutionEvent } from '../orchestrator/evolution.js';
 
 /**
@@ -104,6 +105,13 @@ async function allocateName(base) {
   }
 }
 
+// The executive: the oldest live agent of role 'executive' (its clones are newer). Top manager and GM of the protected project.
+export const EXECUTIVE_SQL = `SELECT id FROM agents WHERE role = 'executive' AND NOT archived ORDER BY created_at, id LIMIT 1`;
+
+export async function executiveId() {
+  return (await one(EXECUTIVE_SQL))?.id || null;
+}
+
 export async function defaultSupervisorFor(role) {
   const info = roleInfo(role);
   const pick = async (r) => (await one(`SELECT id FROM agents WHERE role=$1 AND NOT archived ORDER BY created_at LIMIT 1`, [r]))?.id;
@@ -132,17 +140,18 @@ export async function createAgent({ role, title, skills, supervisor_id, mission,
   return agent;
 }
 
-// Duplicate an agent (same role, skills, playbook) so work can run in parallel.
-export async function cloneAgent(sourceId, reason = 'parallel work') {
+// Duplicate an agent (same role, skills, playbook) so work can run in parallel. leaseMissionId: the mission the clone
+// is made for; mergeMissionClones() folds it back into its original when that mission ends.
+export async function cloneAgent(sourceId, reason = 'parallel work', { leaseMissionId = null } = {}) {
   const src = await getAgent(sourceId);
   if (!src) throw new Error('agent not found');
   const base = src.name.replace(/-\d+$/, '');
   const row = await one(
-    `INSERT INTO agents(name, role, title, tier, department, skills, supervisor_id, mission, purpose, playbook, prompt_version, model_id, origin, cloned_from, xp, level, clone_base)
+    `INSERT INTO agents(name, role, title, tier, department, skills, supervisor_id, mission, purpose, playbook, prompt_version, model_id, origin, cloned_from, xp, level, clone_base, lease_mission_id)
      SELECT $2, role, title, tier, department, skills, supervisor_id, mission, purpose, playbook, prompt_version, model_id, 'cloned', id, xp / 2, GREATEST(1, level - 1),
-       jsonb_build_object('xp', xp / 2, 'skills', skills)
+       jsonb_build_object('xp', xp / 2, 'skills', skills), $3
      FROM agents WHERE id = $1 RETURNING id`,
-    [sourceId, await allocateName(base)],
+    [sourceId, await allocateName(base), leaseMissionId],
   );
   const agent = await getAgent(row.id);
   emit('agent:new', { ...agent, reason });
@@ -193,9 +202,35 @@ export async function replacementFor(gone, task = {}) {
 
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 
+/**
+ * Archive an agent and move its reports up to supervisorId. In the agent's 'claim' lane, so no task can start on it in
+ * between. ready() is checked first in the lane: when it returns false nothing changes and the result is false. An
+ * executive is never retired (false).
+ */
+export const retireAgent = (id, supervisorId, ready = () => true) => withAgentLock('claim', id, async () => {
+  if ((await one(`SELECT role FROM agents WHERE id = $1`, [id]))?.role === 'executive') return false;
+  if (!(await ready())) return false;
+  await query(`UPDATE agents SET supervisor_id = $2 WHERE supervisor_id = $1`, [id, supervisorId]);
+  await query(`UPDATE agents SET archived = true, status = 'offline' WHERE id = $1`, [id]);
+  return true;
+}).then(async (done) => {
+  // Outside the lane, so a clone's republish never waits behind it. Clones that merged into it now resolve further up.
+  if (done) await publishCloneTargets(id);
+  return done;
+});
+
 // First live agent up the clone's chain: its source, or wherever an archived source was merged into (or cloned from).
 export async function liveAncestor(clone) {
   return one(ancestorWalk('$1::uuid', '$2::uuid'), [clone.id, clone.cloned_from]);
+}
+
+// The original behind an agent: itself when it is not a clone, else the first live non-clone up its chain; null if none.
+export async function originalOf(agent) {
+  for (let a = agent, seen = new Set(); a && !seen.has(a.id); a = await liveAncestor(a)) {
+    if (a.origin !== 'cloned') return a;
+    seen.add(a.id);
+  }
+  return null;
 }
 
 /**
@@ -205,11 +240,11 @@ export async function liveAncestor(clone) {
  * lane, so a task the original finishes at the same moment loses nothing. Always clone before ancestor. All of it runs in
  * the role's 'merge-role' lane, shared with consolidateRole(), whose keeper may be a clone of its source: no deadlock.
  */
-export async function mergeAgent(cloneId) {
+export async function mergeAgent(cloneId, { actor = 'user', why = '' } = {}) {
   const found = await getAgent(cloneId);
   if (!found) throw httpError(404, 'Not found');
   if (found.origin !== 'cloned') throw httpError(400, 'Only clones can be merged');
-  const { clone, target, merged, projects } = await withAgentLock('merge-role', found.role, () => withAgentLock('claim', found.id, () => withAgentLock('learn', found.id, async () => {
+  const { clone, target, merged, projects, memberProjects } = await withAgentLock('merge-role', found.role, () => withAgentLock('claim', found.id, () => withAgentLock('learn', found.id, async () => {
     const c = await one(`SELECT a.*, EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running') AS running FROM agents a WHERE a.id = $1`, [found.id]);
     if (c.archived) throw httpError(409, c.merged_into ? 'This clone was already merged' : 'Agent is archived');
     if (c.running || c.status === 'working') throw httpError(409, 'Agent is working');
@@ -222,12 +257,57 @@ export async function mergeAgent(cloneId) {
   })));
   await evolutionEvent('merge', target.id, `${clone.name} merged back into ${target.name}`, { clone: clone.id, cloneName: clone.name, ...merged });
   await notify({ source_type: 'admin', source_name: 'Admin', agent_id: target.id, level: 'success', title: `Merged ${clone.name} into ${target.name}`,
-    body: `+${merged.xp} XP · ${merged.skills} skills · ${merged.lessons} lessons${merged.playbookVersion ? ` · playbook v${merged.playbookVersion}` : ''}` });
-  await audit('user', 'agent.merge', clone.name, { into: target.name, intoId: target.id, ...merged });
+    body: `${why}+${merged.xp} XP · ${merged.skills} skills · ${merged.lessons} lessons${merged.playbookVersion ? ` · playbook v${merged.playbookVersion}` : ''}` });
+  await audit(actor, 'agent.merge', clone.name, { into: target.name, intoId: target.id, ...merged, ...(clone.lease_mission_id ? { missionId: clone.lease_mission_id } : {}) });
   emit('agent:delete', { id: clone.id });
   await publishCloneTargets(clone.id);
+  for (const id of memberProjects) await publishMembers(id).catch(() => {});
   // projects: those the clone managed, now managed by the original (the caller publishes them).
   return { agent: await publishAgent(target.id), merged, projects };
+}
+
+const mergeWaits = new Map(); // missionId -> retry timer while a leased clone still runs a task
+
+/**
+ * The mission is over: merge each live clone leased to it (lease_mission_id) into its original with mergeAgent(), and
+ * call onMerged(cloneId, result) after each merge (the engine hands the clone's pending work over and publishes its
+ * projects). A clone that still runs a task (or reads 'working') is retried every retryMs until it is idle, merged or
+ * archived; it is never merged while a task runs (mergeAgent re-checks in the clone's 'claim' lane). Executive clones,
+ * clones without a lease and clones with no live original are left alone. ids: clones
+ * leased to it whose lease_mission_id may be gone (its project was deleted). Returns { merged: [ids], waiting: [ids] }.
+ */
+export async function mergeMissionClones(missionId, { ids = [], onMerged = async () => {}, retryMs = 2000 } = {}) {
+  clearTimeout(mergeWaits.get(missionId));
+  mergeWaits.delete(missionId);
+  const clones = await many(
+    `SELECT a.id, a.name, EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running') AS running
+     FROM agents a WHERE (a.lease_mission_id = $1 OR a.id = ANY($2::uuid[])) AND a.origin = 'cloned' AND NOT a.archived AND a.role <> 'executive' ORDER BY a.created_at, a.id`, [missionId, ids]);
+  const merged = [];
+  const waiting = [];
+  for (const c of clones) {
+    if (c.running) { waiting.push(c.id); continue; }
+    try {
+      const out = await mergeAgent(c.id, { actor: 'system', why: 'Mission finished · ' });
+      merged.push(c.id);
+      await onMerged(c.id, out);
+    } catch (e) {
+      if (e.status === 409 && e.message === 'Agent is working') {
+        await refreshAgentStatus(c.id); // a stale 'working' with no running task clears here
+        waiting.push(c.id);
+      } else if (e.status) console.error('[lease-merge]', c.name, e.message); // archived, or no live original: leave it
+      else throw e;
+    }
+  }
+  if (waiting.length) {
+    const timer = setTimeout(() => {
+      if (mergeWaits.get(missionId) !== timer) return;
+      mergeWaits.delete(missionId);
+      mergeMissionClones(missionId, { ids, onMerged, retryMs }).catch((e) => console.error('[lease-merge]', e.message));
+    }, retryMs);
+    timer.unref?.();
+    mergeWaits.set(missionId, timer);
+  }
+  return { merged, waiting };
 }
 
 // One transaction: the target gains the source's learning, experiences, reports and GM projects, and the source is retired.
@@ -235,7 +315,7 @@ export async function mergeAgent(cloneId) {
 async function absorb(sourceId, targetId) {
   const settings = await getSettings();
   const db = await pool.connect();
-  let source, target, gained, moved, projects;
+  let source, target, gained, moved, projects, memberProjects;
   try {
     await db.query('BEGIN');
     const rows = (await db.query(`SELECT * FROM agents WHERE id = ANY($1) FOR UPDATE`, [[sourceId, targetId]])).rows;
@@ -244,6 +324,8 @@ async function absorb(sourceId, targetId) {
     if (source.archived) throw httpError(409, 'Agent is archived');
     if (!target || target.archived) { await db.query('ROLLBACK'); return null; }
     if (source.role !== target.role) throw httpError(409, 'Only agents of the same role can be merged');
+    // Only a clone of the executive may fold back into it; the executive itself is never merged away.
+    if (source.role === 'executive' && source.origin !== 'cloned') throw httpError(409, 'The executive agent cannot be merged');
     const m = combineLearning(target, source);
     gained = m.gained;
     await db.query(`UPDATE agents SET xp=$2, level=$3, skills=$4, stats=stats || $5, updated_at=now() WHERE id=$1`, [target.id, m.xp, m.level, JSON.stringify(m.skills), m.stats]);
@@ -252,6 +334,15 @@ async function absorb(sourceId, targetId) {
     await db.query(`UPDATE agents SET supervisor_id = CASE WHEN id = $2 THEN NULLIF($3::uuid, $2) ELSE $2 END, updated_at=now() WHERE supervisor_id = $1`, [source.id, target.id, source.supervisor_id]);
     // Projects the source managed get the target as General Manager, in the same step that retires the source.
     projects = (await db.query(`UPDATE projects SET manager_id = $2, updated_at = now() WHERE manager_id = $1 RETURNING id`, [source.id, target.id])).rows.map((r) => r.id);
+    // Project memberships move to the target; where both are members it stays active if either was, except that an
+    // 'auto' membership (e.g. a leased clone's) never re-activates a target the user released from that project.
+    memberProjects = (await db.query(`WITH moved AS (DELETE FROM project_members WHERE agent_id = $1 RETURNING *)
+      INSERT INTO project_members(project_id, agent_id, status, added_by, added_at, released_at)
+      SELECT project_id, $2, status, added_by, added_at, released_at FROM moved
+      ON CONFLICT (project_id, agent_id) DO UPDATE SET
+        status = CASE WHEN EXCLUDED.status = 'active' AND (project_members.status = 'active' OR EXCLUDED.added_by = 'user') THEN 'active' ELSE project_members.status END,
+        released_at = CASE WHEN EXCLUDED.status = 'active' AND (project_members.status = 'active' OR EXCLUDED.added_by = 'user') THEN NULL ELSE project_members.released_at END
+      RETURNING project_id`, [source.id, target.id])).rows.map((r) => r.project_id);
     await db.query(`UPDATE agents SET archived=true, status='offline', merged_into=$2, current_task_id=NULL, updated_at=now() WHERE id=$1`, [source.id, target.id]);
     await db.query('COMMIT');
   } catch (e) {
@@ -262,7 +353,7 @@ async function absorb(sourceId, targetId) {
   }
   const playbookVersion = await mergePlaybooks(target, source, settings);
   const lessons = moved.filter((r) => r.kind === 'lesson').length;
-  return { clone: source, target, projects, merged: { skills: gained.skills, xp: gained.xp, lessons, failures: moved.length - lessons, playbookVersion } };
+  return { clone: source, target, projects, memberProjects, merged: { skills: gained.skills, xp: gained.xp, lessons, failures: moved.length - lessons, playbookVersion } };
 }
 
 // Roles the organization itself runs on (direction, evolution, project GMs): never consolidated.
@@ -352,6 +443,7 @@ export async function consolidateRole(role, { keeperId = null } = {}) {
       await evolutionEvent('merge', keeper.id, `${s.name} consolidated into ${keeper.name}`, { source: s.id, sourceName: s.name, origin: s.origin, consolidate: r, ...done.merged });
       emit('agent:delete', { id: s.id });
       await publishCloneTargets(s.id);
+      for (const id of done.memberProjects) await publishMembers(id).catch(() => {});
     }
     return { keeper, merged, skipped, projects: [...projects] };
   });

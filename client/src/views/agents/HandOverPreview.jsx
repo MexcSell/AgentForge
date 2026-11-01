@@ -14,19 +14,35 @@ const target = (m) => m.agent ? <>move to <span className="text-fg" title={m.age
  * project delete with several GMs) say whose they are.
  */
 export function HandOverPreview({ url }) {
-  const [res, setRes] = useState(null); // { url, moves }: the answer to the request for `url`
+  const [res, setRes] = useState(null); // { url, moves, merges }: the answer to the request for `url`
   useEffect(() => {
     if (!url) return;
     let live = true;
-    const done = (moves) => { if (live) setRes({ url, moves }); };
-    api.get(url, { quiet: true }).then((d) => done(Array.isArray(d?.moves) ? d.moves : []), () => done([]));
+    const done = (moves, merges = []) => { if (live) setRes({ url, moves, merges }); };
+    api.get(url, { quiet: true }).then((d) => done(Array.isArray(d?.moves) ? d.moves : [], Array.isArray(d?.merges) ? d.merges : []), () => done([]));
     return () => { live = false; };
   }, [url]);
   const moves = res?.url === url ? res.moves : null;
+  const merges = res?.url === url ? res.merges : [];
   return (
     <div aria-live="polite">
-      {!url ? null : !moves ? <div className="mt-3 text-[0.75rem] text-subtle">Checking pending work…</div> : <HandOverList moves={moves} />}
+      {!url ? null : !moves ? <div className="mt-3 text-[0.75rem] text-subtle">Checking pending work…</div> : <><MergeList merges={merges} /><HandOverList moves={moves} /></>}
     </div>
+  );
+}
+
+/** Cloned project GMs a delete merges back into their original manager (the project preview's merges) instead of retiring. */
+function MergeList({ merges }) {
+  if (!merges.length) return null;
+  const byProject = merges.length > 1;
+  return (
+    <ul aria-label="Managers merged back" className="mt-3 space-y-1 text-[0.8rem] leading-snug">
+      {merges.map((m) => (
+        <li key={m.project?.id || m.from?.id} className="break-words">
+          {byProject && m.project?.name && <>{m.project.name}: </>}<span className="font-medium text-fg">{m.from?.name}</span> merges back into <span className="font-medium text-fg">{m.into?.name}</span>, which keeps what it learned.
+        </li>
+      ))}
+    </ul>
   );
 }
 

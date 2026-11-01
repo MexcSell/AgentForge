@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from 'react';
-import { Network } from 'lucide-react';
+import { Network, UserMinus } from 'lucide-react';
 import { useStore } from '../../lib/store.js';
-import { cx, AgentAvatar, Badge, Empty, Progress } from '../../components/ui.jsx';
+import { cx, AgentAvatar, Badge, Empty, IconButton, Progress } from '../../components/ui.jsx';
 import { AgentWorkDialog, agentTasks, currentWork, TIER } from './AgentWorkDialog.jsx';
 
 // Work state of an agent's current work (AgentWorkDialog's rules): a finished task stays on the card as Completed / Failed / Cancelled.
@@ -67,7 +67,7 @@ export function orgTree(team, agents, managerId) {
 const stateOf = (task) => (task ? STATE_OF[task.status] || 'idle' : 'idle');
 const stateLabel = (task) => (task?.status === 'running' ? `Working ${Math.round(task.progress || 0)}%` : STATES[stateOf(task)].label);
 
-function OrgCard({ agent, gm, task, orchestrating, onOpen }) {
+function OrgCard({ agent, gm, task, orchestrating, releasable, onOpen }) {
   const level = agent.level || 1;
   const xp = agent.xp || 0;
   const xpPrev = 40 * (level - 1) ** 2;
@@ -84,14 +84,12 @@ function OrgCard({ agent, gm, task, orchestrating, onOpen }) {
       <span className="flex items-start gap-2 min-w-0">
         <AgentAvatar agent={agent} size={AVATAR} />
         <span className="min-w-0 flex-1">
-          <span className="flex items-center gap-1 min-w-0">
+          <span className={cx('flex items-center gap-1 min-w-0', releasable && 'pr-6')}>
             <span className="text-[0.8rem] font-medium truncate">{agent.name}</span>
-            {gm && <Badge tone="accent">GM</Badge>}
+            {gm && <Badge tone="accent" className="shrink-0">GM</Badge>}
+            <Badge className="shrink-0 h-4! px-1! text-[0.62rem]! tabular">L{level}</Badge>
           </span>
-          <span className="flex items-center gap-1.5 min-w-0 mt-0.5">
-            <Badge>L{level}</Badge>
-            {tier && <span className="text-[0.68rem] text-subtle truncate">{tier}</span>}
-          </span>
+          {tier && <span className="block text-[0.66rem] leading-4 text-subtle truncate">{tier}</span>}
           <span role="progressbar" aria-label={`XP toward L${level + 1}`} aria-valuenow={Math.round(xpPct)} aria-valuemin={0} aria-valuemax={100} aria-valuetext={`${xp} / ${xpNext} XP`}
             title={`${xp} / ${xpNext} XP to L${level + 1}`} className="mt-1.5 block h-1 rounded-full bg-hover overflow-hidden">
             <span className="block h-full rounded-full bg-series-1 transition-[width] duration-500" style={{ width: `${xpPct}%` }} />
@@ -121,20 +119,39 @@ function OrgCard({ agent, gm, task, orchestrating, onOpen }) {
   );
 }
 
-function OrgNode({ node, depth, last, work, managerId, orchestrating, onOpen }) {
+/**
+ * A member's Release button, top-right on its card (a sibling of the card button: buttons don't nest). With queued or running
+ * work in the project it stays focusable but aria-disabled, and says why; activating it then only repeats the reason.
+ */
+function ReleaseButton({ agent, busy, onRelease }) {
+  const label = busy.length ? `Can't release ${agent.name} yet: ${busy.join(', ')} ${busy.length === 1 ? 'is' : 'are'} queued or running in this project` : `Release ${agent.name} from the project`;
+  return (
+    <IconButton icon={UserMinus} size="sm" label={label} tone={busy.length ? undefined : 'danger'} aria-disabled={busy.length ? true : undefined} data-release={agent.id}
+      className={cx('absolute! top-1.5 right-1.5', busy.length && 'opacity-40 cursor-not-allowed hover:bg-transparent hover:text-muted')}
+      onClick={(e) => onRelease(agent, e.currentTarget, busy)} />
+  );
+}
+
+function OrgNode({ node, depth, last, work, managerId, orchestrating, release, onOpen }) {
   const { agent } = node;
   const task = work.get(agent.id);
   const state = stateOf(task);
+  const releasable = !!release && agent.id !== managerId;
   return (
     <li className={cx('relative min-w-0', depth > 0 && 'pt-1.5')} style={depth > 0 ? { paddingLeft: INDENT } : undefined} data-depth={depth}>
       {depth > 0 && <>
         <span aria-hidden="true" className="absolute top-0 w-px bg-line-strong" style={{ left: TRUNK_X, ...(last ? { height: ELBOW_END } : { bottom: 0 }) }} />
         <span aria-hidden="true" data-line={state} className={cx('absolute h-px', LINE[state] || 'bg-line-strong')} style={{ left: TRUNK_X, top: ELBOW_Y, width: ELBOW_W }} />
       </>}
-      <OrgCard agent={agent} gm={agent.id === managerId} task={task} orchestrating={orchestrating} onOpen={(e) => onOpen(agent.id, e)} />
+      {releasable ? (
+        <div className="relative min-w-0">
+          <OrgCard agent={agent} gm={false} task={task} orchestrating={orchestrating} releasable onOpen={(e) => onOpen(agent.id, e)} />
+          <ReleaseButton agent={agent} busy={release.busy(agent.id)} onRelease={release.onRelease} />
+        </div>
+      ) : <OrgCard agent={agent} gm={agent.id === managerId} task={task} orchestrating={orchestrating} onOpen={(e) => onOpen(agent.id, e)} />}
       {node.children.length > 0 && (
         <ul className="min-w-0">
-          {node.children.map((c, i) => <OrgNode key={c.agent.id} node={c} depth={depth + 1} last={i === node.children.length - 1} work={work} managerId={managerId} orchestrating={orchestrating} onOpen={onOpen} />)}
+          {node.children.map((c, i) => <OrgNode key={c.agent.id} node={c} depth={depth + 1} last={i === node.children.length - 1} work={work} managerId={managerId} orchestrating={orchestrating} release={release} onOpen={onOpen} />)}
         </ul>
       )}
     </li>
@@ -150,8 +167,12 @@ function Chip({ children, label }) {
   );
 }
 
-/** The project team as a hierarchy under the GM, with each agent's level and current work; a card opens AgentWorkDialog. */
-export function AgentOrg({ project, team }) {
+/**
+ * The project team as a hierarchy under the GM, with each agent's level and current work; a card opens AgentWorkDialog.
+ * release (optional): { busy(agentId) → task keys that block a release, onRelease(agent, opener, busy) } adds a Release
+ * button to every card but the GM's.
+ */
+export function AgentOrg({ project, team, release }) {
   const agents = useStore((s) => s.agents);
   const tasks = useStore((s) => s.tasks[project.id]) || EMPTY;
   const topics = useStore((s) => s.topics[project.id]) || EMPTY;
@@ -188,7 +209,7 @@ export function AgentOrg({ project, team }) {
         </div>
       </div>
       <ul aria-label="Team hierarchy" className="min-w-0 flex flex-col gap-1.5">
-        {roots.map((n) => <OrgNode key={n.agent.id} node={n} depth={0} work={work} managerId={project.manager_id} orchestrating={orchestrating} onOpen={open} />)}
+        {roots.map((n) => <OrgNode key={n.agent.id} node={n} depth={0} work={work} managerId={project.manager_id} orchestrating={orchestrating} release={release} onOpen={open} />)}
       </ul>
       <AgentWorkDialog project={project} agentId={selected} onClose={close} />
     </div>

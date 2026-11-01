@@ -9,7 +9,8 @@ import { toast } from '../../lib/toast.js';
 import { compact, duration, timeAgo, usd, dateTime } from '../../lib/format.js';
 import { Modal } from '../../components/Modal.jsx';
 import { cx, AgentAvatar, Badge, Button, Progress, Tabs, Select, Textarea, Empty, Spinner, STATUS_TONE } from '../../components/ui.jsx';
-import { canMerge, mergeOriginal, MergeButton, MergeConfirm } from './merge.jsx';
+import { canMerge, mergeOriginal, MergeButton, MergeConfirm, LeaseBadge } from './merge.jsx';
+import { ExecBadge } from '../../lib/dualRole.js';
 
 const TIER = { 1: 'Executive', 2: 'Management', 3: 'Specialist', 4: 'Verification', 5: 'Evolution' };
 
@@ -111,6 +112,8 @@ export function AgentDetailModal() {
               <div className="min-w-0 flex-1">
                 <div className="text-lg font-semibold tracking-tight">{a.name}</div>
                 <div className="text-xs text-muted">{a.title}</div>
+                <ExecBadge agent={a} className="mt-1.5" />
+                <LeaseBadge clone={a} original={original} className="mt-1.5" />
                 <div className="mt-2 flex items-center gap-2 text-[0.7rem] text-subtle">
                   <span className="font-semibold text-accent">Level {a.level}</span>
                   <Progress value={((a.xp - xpPrev) / Math.max(1, xpNext - xpPrev)) * 100} className="flex-1" />

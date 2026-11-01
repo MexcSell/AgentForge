@@ -95,6 +95,8 @@ export async function seed() {
   } else if (!config.candidate) {
     await adoptCoreProject(core.id, await executiveId());
   }
+  // Project GMs are clones of one original manager; make sure it exists. Not on a candidate boot, like the adoption.
+  if (!config.candidate) await (await import('../services/projects.js')).originalManager();
 }
 
 /**
