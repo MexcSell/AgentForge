@@ -39,7 +39,8 @@ export async function createLoader({ stubs = {} } = {}) {
     root: `${ROOT}/client`,
     logLevel: 'error',
     appType: 'custom',
-    server: { middlewareMode: true, watch: null, hmr: false },
+    // Vite 8 still binds the HMR WebSocket (port 24678) unless ws:false; the parallel node --test files clashed on it.
+    server: { middlewareMode: true, watch: null, hmr: false, ws: false },
     plugins: [{ name: 'test-stubs', enforce: 'pre', load: (id) => byPath[id.split('?')[0]] }],
   });
   return { load: (path) => server.ssrLoadModule(path), close: () => server.close() };

@@ -29,7 +29,8 @@ before(async () => {
     root: `${ROOT}/client`,
     logLevel: 'error',
     appType: 'custom',
-    server: { middlewareMode: true, watch: null, hmr: false },
+    // Vite 8 still binds the HMR WebSocket (port 24678) unless ws:false; the parallel node --test files clashed on it.
+    server: { middlewareMode: true, watch: null, hmr: false, ws: false },
     plugins: [{
       name: 'ui-cn-virtual', enforce: 'pre',
       resolveId: (id) => (virt[`${ROOT}/client${id}`] ? `${ROOT}/client${id}` : null),
