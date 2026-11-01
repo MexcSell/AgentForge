@@ -106,7 +106,7 @@ function ReleasedSection({ released, agentsById, onRestore }) {
               <li key={m.agent_id} className="flex items-center gap-2 min-w-0">
                 <AgentAvatar agent={a} size={20} status="idle" />
                 <span className="flex-1 min-w-0 text-[0.75rem] truncate" title={a.name}>{a.name}</span>
-                <Button size="sm" variant="ghost" className="h-6 px-2 shrink-0" loading={restoring === m.agent_id} disabled={!!restoring}
+                <Button size="sm" variant="ghost" className="shrink-0" loading={restoring === m.agent_id} disabled={!!restoring}
                   aria-label={`Restore ${a.name} to the project`} onClick={() => restore(m)}>Restore</Button>
               </li>
             );
