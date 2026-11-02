@@ -185,7 +185,7 @@ export const useStore = create((set, get) => ({
     const me = get().me;
     const [projects, agents, models, notifications, settings, roles, system, pending] = await Promise.all([
       api.get('/api/projects'), api.get('/api/agents'), api.get('/api/models'), api.get('/api/notifications'),
-      can(me, 'manageSettings') ? api.get('/api/settings') : null, api.get('/api/roles'), api.get('/api/system/status'),
+      isAdmin(me) ? api.get('/api/settings') : null, api.get('/api/roles'), api.get('/api/system/status'),
       isAdmin(me) ? api.get('/api/users/pending', { quiet: true }).catch(() => null) : null,
     ]);
     const s = { projects, agents, models, notifications, settings, roles, system, pendingUsers: Number(pending?.count) || 0, loaded: true };

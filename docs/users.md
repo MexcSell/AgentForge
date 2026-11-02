@@ -62,15 +62,23 @@ The administrator can see and do everything. Every other account has:
 | `createProjects` | Creating projects. A project a user creates is added to their `projects` automatically. |
 | `runMissions` | In granted projects: orders, stop, stand-ups, sync, approving and rejecting proposals, topics, team changes, starting and stopping the preview, and uploads. Without it, a user can only read granted projects. |
 | `manageAgents` | The Agents view (registry, org chart, evolution) and every agent API. |
-| `manageSettings` | Settings and Models (view and change). |
+| `manageSettings` | Models (view and change). |
+
+**Settings** is open to every user, but a non-admin sees only **Appearance** and **Screen format** there: browser preferences kept in that browser, never sent to the server. Every other section (orchestrator, self-learning, system monitor, network, service) and `GET /api/settings` / `PUT /api/settings/:key` are admin-only (403), and `settings:update` events reach administrators only.
 
 These are **admin-only** whatever the permissions: the Users page, Files and the terminal (both give full access to the host), GitHub, Bittensor, project edit and delete, posting notices, and the safe restart. Any API route not listed in `POLICY` in `server/routes/auth.js` is admin-only by default.
 
 **The AgentForge platform project (the protected one) is never visible to a non-admin.** That holds even if it is granted (the Users page does not offer it, and the server strips it). Ungranted projects are hidden in the same way:
 
 - **REST:** they are not in `/api/projects`, the dashboard or notifications. Their routes, including a topic or task addressed by its own id, answer **404**.
-- **WebSocket:** each event is checked per socket (`eventVisibleTo`). Project events go only to users who can see that project. Agent events go only with `manageAgents`, and settings or models events only with `manageSettings`. Event types not listed there go to administrators only.
+- **WebSocket:** each event is checked per socket (`eventVisibleTo`). Project events go only to users who can see that project. Agent events go only with `manageAgents`, models events only with `manageSettings`, and settings events only to administrators. Event types not listed there go to administrators only.
 - **Agents:** without `manageAgents`, `/api/agents` lists only the agents on the user's projects (members and GMs), so the team views keep working.
+
+## Git identity per user
+
+On the Users page (**Git**) the administrator sets each account's GitHub `user.name`, `user.email` and branch (`PUT /api/users/:id/git`, admin-only). The email must look like an address and the branch must pass `git check-ref-format --branch`; anything else is refused with a 400 naming the field. Empty fields fall back to the global GitHub settings, so nothing changes without configuration. The values are shown only to administrators and to the account itself.
+
+When a mission's auto-sync runs, the user who typed the order (`missions.ordered_by`) is the commit's author and committer, and the commit is pushed to their branch (`HEAD:<branch>`; a branch missing on the remote is created from the default branch). The working tree stays on the default branch, since other missions edit it at the same time, so the commit is also on the local default branch and reaches the remote default branch with the next default-branch push. Manual syncs and missions launched from proposals use the global identity and branch.
 
 Changing an account's permissions updates its open WebSockets immediately. The browser receives an `auth:update` event and reloads its data.
 

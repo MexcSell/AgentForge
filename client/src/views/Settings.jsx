@@ -99,6 +99,8 @@ export default function Settings() {
     if (st.settings) { setOrc(st.settings.orchestrator); setEvo(st.settings.evolution); setMon({ enabled: true, intervalSec: 3, ...st.settings.monitor }); }
   }, [st.settings]);
   const sys = st.system;
+  // A non-admin sees Appearance and Screen format only (browser preferences); the server refuses the rest.
+  const admin = isAdmin(st.me);
   const save = async (key, value) => { await api.put(`/api/settings/${key}`, value); toast.success('Settings saved'); };
   return (
     <div className="h-full overflow-auto">
@@ -141,7 +143,7 @@ export default function Settings() {
           </div>
         </Section>
 
-        {orc && (
+        {admin && orc && (
           <Section icon={Workflow} title="Orchestrator" desc="How General Managers run missions — orders in different topics run at the same time; orders in one topic run in order">
             <div className="grid gap-4 md:grid-cols-2 items-start">
               <Field label="Max parallel agents per mission"><Input type="number" min="1" max="12" value={orc.maxParallel} onChange={(e) => setOrc({ ...orc, maxParallel: Number(e.target.value) })} /></Field>
@@ -157,7 +159,7 @@ export default function Settings() {
           </Section>
         )}
 
-        {evo && (
+        {admin && evo && (
           <Section icon={Dna} title="Self-learning" desc="Playbooks evolve from lessons; experiments must beat the baseline">
             <div className="grid gap-4 md:grid-cols-3">
               <Toggle checked={evo.enabled} onChange={(v) => setEvo({ ...evo, enabled: v })} label="Evolve playbooks automatically" />
@@ -168,7 +170,7 @@ export default function Settings() {
           </Section>
         )}
 
-        {mon && (
+        {admin && mon && (
           <Section icon={Gauge} title="System monitor" desc="CPU, memory, disk and network usage of this machine">
             <div className="grid gap-4 md:grid-cols-2 items-end">
               <div className="flex items-center h-8"><Toggle checked={mon.enabled} onChange={(v) => setMon({ ...mon, enabled: v })} label="Show machine usage in the status bar" /></div>
@@ -182,9 +184,9 @@ export default function Settings() {
           </Section>
         )}
 
-        {isAdmin(st.me) && <NetworkSection startedAt={sys?.startedAt} />}
+        {admin && <NetworkSection startedAt={sys?.startedAt} />}
 
-        <Section icon={Server} title="Service" desc="Self-restart is guarded: syntax check → candidate health check → wait for idle agents → swap">
+        {admin && <Section icon={Server} title="Service" desc="Self-restart is guarded: syntax check → candidate health check → wait for idle agents → swap">
           {sys && (
             <div className="grid gap-4 md:grid-cols-[1fr_auto] items-start">
               <dl className="grid grid-cols-[150px_1fr] gap-y-2 text-xs">
@@ -197,9 +199,9 @@ export default function Settings() {
               <Button icon={RefreshCw} disabled={!sys.supervisor?.attached} onClick={async () => { await api.post('/api/system/restart', {}); toast.info('Safe restart scheduled', 'Waits for running agents to finish first'); }}>Safe restart</Button>
             </div>
           )}
-        </Section>
+        </Section>}
 
-        <Section icon={Boxes} title="Technology choices" desc="Why this stack">
+        {admin && <Section icon={Boxes} title="Technology choices" desc="Why this stack">
           <div className="grid gap-3 md:grid-cols-2 text-xs">
             {[
               [Server, 'Backend · Node.js + Fastify', 'One language across UI, API and agent orchestration; non-blocking I/O suits many concurrent agent processes, WebSockets and terminals.'],
@@ -215,7 +217,7 @@ export default function Settings() {
               </div>
             ))}
           </div>
-        </Section>
+        </Section>}
       </div>
     </div>
   );

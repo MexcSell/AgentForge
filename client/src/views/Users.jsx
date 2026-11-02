@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Users as UsersIcon, Check, X, Ban, Power, Trash2, MonitorSmartphone, ShieldCheck, RefreshCw, Save } from 'lucide-react';
+import { Users as UsersIcon, Check, X, Ban, Power, Trash2, MonitorSmartphone, ShieldCheck, RefreshCw, Save, GitBranch } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { useStore } from '../lib/store.js';
 import { toast } from '../lib/toast.js';
 import { dateTime } from '../lib/format.js';
-import { cx, Button, Badge, Empty, Spinner, Toggle } from '../components/ui.jsx';
+import { cx, Button, Badge, Empty, Spinner, Toggle, Field, Input } from '../components/ui.jsx';
 
 const STATUS = { pending: 'warn', active: 'ok', disabled: 'neutral', rejected: 'bad' };
 
@@ -47,6 +47,38 @@ function Permissions({ user, projects, capabilities, onSaved }) {
   );
 }
 
+const GIT_FIELDS = [['git_name', 'GitHub user.name', 'Global name'], ['git_email', 'GitHub user.email', 'Global email'], ['git_branch', 'Branch', 'Global branch']];
+const gitOf = (u) => Object.fromEntries(GIT_FIELDS.map(([k]) => [k, u[k] || '']));
+
+/**
+ * The commit author/committer and push branch of the missions this account orders. Empty fields use the global GitHub
+ * identity and branch; the server validates the email and the branch name (git check-ref-format --branch).
+ */
+function GitIdentity({ user, onSaved }) {
+  const [g, setG] = useState(() => gitOf(user));
+  const [busy, setBusy] = useState(false);
+  useEffect(() => setG(gitOf(user)), [user.git_name, user.git_email, user.git_branch]);
+  const dirty = JSON.stringify(g) !== JSON.stringify(gitOf(user));
+  return (
+    <div className="pt-3 mt-3 border-t border-line flex flex-col gap-3" data-git-identity>
+      <div className="grid md:grid-cols-3 gap-3">
+        {GIT_FIELDS.map(([k, label, placeholder]) => (
+          <Field key={k} label={label}>
+            <Input name={k} value={g[k]} placeholder={placeholder} spellCheck={false} onChange={(e) => setG({ ...g, [k]: e.target.value })} />
+          </Field>
+        ))}
+      </div>
+      <div className="flex items-center gap-3">
+        <span className="text-xs text-subtle">Commits of the missions {user.username} orders use this name and email and are pushed to this branch (created from the default branch when missing). Empty fields use the global GitHub settings.</span>
+        <Button size="sm" variant="primary" icon={Save} className="ml-auto shrink-0" disabled={!dirty} loading={busy}
+          onClick={async () => { setBusy(true); try { onSaved(await api.put(`/api/users/${user.id}/git`, g)); toast.success(`Git identity saved · ${user.username}`); } catch { /* api showed the error */ } finally { setBusy(false); } }}>
+          Save Git identity
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 /** The computer the account registered (or bound) from, as its browser described it: for the administrator to judge. */
 function DeviceInfo({ info }) {
   const parts = [info.os, info.browser, info.platform, info.screen && `screen ${info.screen}`, info.language, info.timezone].filter(Boolean);
@@ -61,6 +93,7 @@ function DeviceInfo({ info }) {
 
 function UserRow({ user, me, projects, capabilities, onChange, onDelete }) {
   const [open, setOpen] = useState(false);
+  const [gitOpen, setGitOpen] = useState(false);
   const self = user.id === me?.id;
   const admin = user.role === 'admin';
   const act = (action, label) => async () => {
@@ -74,6 +107,7 @@ function UserRow({ user, me, projects, capabilities, onChange, onDelete }) {
         {admin && <Badge tone="accent" icon={ShieldCheck}>Administrator</Badge>}
         <Badge tone={STATUS[user.status]}>{user.status}</Badge>
         {user.team && <Badge>Team · {user.team}</Badge>}
+        {user.git_branch && <Badge icon={GitBranch}>{user.git_branch}</Badge>}
         <Badge tone={user.device_bound ? 'info' : 'neutral'} icon={MonitorSmartphone}>{user.device_bound ? 'Device bound' : 'No device bound'}</Badge>
         <span className="text-xs text-subtle">Registered {dateTime(user.created_at)}{user.last_login_at ? ` · last login ${dateTime(user.last_login_at)}` : ''}</span>
         <div className="ml-auto flex flex-wrap gap-1.5">
@@ -85,12 +119,14 @@ function UserRow({ user, me, projects, capabilities, onChange, onDelete }) {
           {!self && !admin && user.status === 'active' && <Button size="sm" icon={Ban} onClick={act('disable', 'Disabled')}>Disable</Button>}
           {user.status === 'disabled' && <Button size="sm" icon={Power} onClick={act('enable', 'Enabled')}>Enable</Button>}
           {user.device_bound && <Button size="sm" variant="ghost" icon={MonitorSmartphone} title="The user registers again from their new computer (or a password account logs in from it) and waits for your approval" onClick={act('reset-device', 'Device binding reset')}>Reset device</Button>}
+          <Button size="sm" variant="ghost" icon={GitBranch} onClick={() => setGitOpen(!gitOpen)}>{gitOpen ? 'Hide Git' : 'Git'}</Button>
           {!admin && <Button size="sm" variant="ghost" onClick={() => setOpen(!open)}>{open ? 'Hide permissions' : 'Permissions'}</Button>}
           {!self && !admin && <Button size="sm" variant="ghost" icon={Trash2} label="Delete" title="Delete account"
             onClick={async () => { if (!confirm(`Delete the account ${user.username}?`)) return; await api.del(`/api/users/${user.id}`); onDelete(user.id); toast.info(`Deleted · ${user.username}`); }} />}
         </div>
       </div>
       {user.device_info && <DeviceInfo info={user.device_info} />}
+      {gitOpen && <GitIdentity user={user} onSaved={onChange} />}
       {open && !admin && <Permissions user={user} projects={projects} capabilities={capabilities} onSaved={onChange} />}
     </div>
   );

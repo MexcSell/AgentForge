@@ -3,6 +3,8 @@
 // salt) remain for accounts created before that and for the administrator's break-glass. Sessions: a random token in an
 // httpOnly cookie, stored as its SHA-256.
 import crypto from 'node:crypto';
+import os from 'node:os';
+import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { one, many, query } from '../db/pool.js';
 import { notify, audit } from './notify.js';
@@ -101,6 +103,7 @@ export function publicUser(u) {
     id: u.id, username: u.username, role: u.role, status: u.status, team: u.team || null, permissions: sanitizeStored(u.permissions),
     device_bound: !!(u.device_secret_hash || u.device), device_bound_at: u.device_bound_at, device_info: u.device_info || null, has_password: !!u.password_hash,
     created_at: u.created_at, approved_at: u.approved_at, last_login_at: u.last_login_at,
+    git_name: u.git_name || null, git_email: u.git_email || null, git_branch: u.git_branch || null,
   };
 }
 const sanitizeStored = (p) => ({ projects: [], ...(p || {}) });
@@ -343,6 +346,36 @@ export async function setPermissions(actor, id, permissions) {
   const p = sanitizePermissions(permissions);
   await query(`UPDATE users SET permissions = $2, updated_at = now() WHERE id = $1`, [u.id, p]);
   await audit(actor.username, 'user.permissions', u.username, p);
+  return changed(u.id);
+}
+
+// ---- GitHub identity -------------------------------------------------------------
+const GIT_EMAIL = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
+
+/** Whether git accepts name as a branch (`git check-ref-format --branch`, run outside any repo). */
+export async function validBranch(name) {
+  if (!name || name.length > 200 || name.startsWith('-') || name.includes('@{') || /[\0-\x1f\x7f]/.test(name)) return false;
+  return new Promise((resolve) => {
+    execFile('git', ['check-ref-format', '--branch', name], { cwd: os.tmpdir(), timeout: 10000, env: { ...process.env, GIT_DIR: '/nonexistent' } },
+      (err, stdout) => resolve(!err && stdout.trim() === name));
+  });
+}
+
+/**
+ * The GitHub user.name, user.email and branch of a user's missions (services/git.js gitIdentityFor), by an
+ * administrator. Empty fields are stored as NULL: that user's missions then use the global identity and branch.
+ */
+export async function setGitIdentity(actor, id, body) {
+  const u = await getUser(id);
+  if (!u) throw fail(404, 'User not found');
+  const clean = (v) => (typeof v === 'string' ? v.trim() : v === undefined || v === null ? '' : null);
+  const [name, email, branch] = ['git_name', 'git_email', 'git_branch'].map((k) => clean(body[k]));
+  if (name === null || email === null || branch === null) throw fail(400, 'Git name, email and branch must be text');
+  if (name.length > 200 || /[<>\n\0]/.test(name)) throw fail(400, 'Git user.name: at most 200 characters, without < > or line breaks', { code: 'invalid_git_name' });
+  if (email && (email.length > 254 || !GIT_EMAIL.test(email))) throw fail(400, `Git user.email "${email.slice(0, 80)}" is not an email address (like name@example.com)`, { code: 'invalid_git_email' });
+  if (branch && !(await validBranch(branch))) throw fail(400, `Git branch "${branch.slice(0, 80)}" is not a valid branch name (git check-ref-format --branch)`, { code: 'invalid_git_branch' });
+  await query(`UPDATE users SET git_name = $2, git_email = $3, git_branch = $4, updated_at = now() WHERE id = $1`, [u.id, name || null, email || null, branch || null]);
+  await audit(actor.username, 'user.git-identity', u.username, { name: name || null, branch: branch || null });
   return changed(u.id);
 }
 

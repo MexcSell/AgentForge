@@ -5,7 +5,7 @@ import { isUuid } from '../services/topics.js';
 import { can, canSeeProject, isAdmin, CAPABILITIES } from '../services/access.js';
 import {
   signup, login, deviceLogin, needsSetup, createSession, sessionUser, destroySession, tokenOf, sessionCookie, clearedCookie, publicUser,
-  listUsers, pendingCount, userAction, setPermissions, deleteUser,
+  listUsers, pendingCount, userAction, setPermissions, setGitIdentity, deleteUser,
 } from '../services/auth.js';
 import { previewTarget } from './preview.js';
 
@@ -67,8 +67,8 @@ const POLICY = {
   'GET /api/evolution': { cap: 'manageAgents' },
   'POST /api/evolution/cycle': { cap: 'manageAgents' },
 
-  'GET /api/settings': { cap: 'manageSettings' },
-  'PUT /api/settings/:key': { cap: 'manageSettings' },
+  // GET/PUT /api/settings are admin-only (not listed): a non-admin's Settings page has only Appearance and Screen
+  // format, which are browser preferences (client/src/lib/store.js PREFS) and never reach the server.
   'GET /api/providers': { cap: 'manageSettings' },
   'POST /api/models': { cap: 'manageSettings' },
   'PATCH /api/models/:id': { cap: 'manageSettings' },
@@ -209,6 +209,11 @@ export default async function authRoutes(app, opts = {}) {
   app.put('/api/users/:id/permissions', guard(async (req) => {
     if (!isUuid(req.params.id)) throw Object.assign(new Error('User not found'), { status: 404 });
     return setPermissions(req.user, req.params.id, req.body || {});
+  }));
+  // GitHub identity of the account's missions: { git_name, git_email, git_branch }, '' or null falls back to the global one.
+  app.put('/api/users/:id/git', guard(async (req) => {
+    if (!isUuid(req.params.id)) throw Object.assign(new Error('User not found'), { status: 404 });
+    return setGitIdentity(req.user, req.params.id, req.body || {});
   }));
   app.delete('/api/users/:id', guard(async (req) => {
     if (!isUuid(req.params.id)) throw Object.assign(new Error('User not found'), { status: 404 });

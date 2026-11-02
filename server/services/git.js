@@ -12,9 +12,9 @@ const DIFF_LIMIT = 40000;
 const DIFF_EXCLUDES = [':(exclude)package-lock.json', ':(exclude)*/package-lock.json', ':(exclude)*.lock'];
 const MESSAGE_TIMEOUT = 240000; // outer guard: the engine's builder bounds its model run to ~3 min itself
 
-function run(cmd, args, cwd, timeout = 60000, { input, maxBuffer = 8 * 1024 * 1024 } = {}) {
+function run(cmd, args, cwd, timeout = 60000, { input, maxBuffer = 8 * 1024 * 1024, env = {} } = {}) {
   return new Promise((resolve) => {
-    const child = execFile(cmd, args, { cwd, timeout, maxBuffer, env: childEnv({ GIT_TERMINAL_PROMPT: '0' }) }, (err, stdout, stderr) => {
+    const child = execFile(cmd, args, { cwd, timeout, maxBuffer, env: childEnv({ GIT_TERMINAL_PROMPT: '0', ...env }) }, (err, stdout, stderr) => {
       resolve({ ok: !err, code: err?.code ?? 0, out: `${stdout || ''}${stderr || ''}`.trim(), stdout: (stdout || '').trim(), raw: stdout || '' });
     });
     if (input !== undefined) {
@@ -115,6 +115,21 @@ async function credentialArgs() {
     ghHelper = r.ok;
   }
   return ghHelper ? ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential'] : [];
+}
+
+/**
+ * The github settings for a mission the user (users.id, or null) ordered: `as` { name, email } is the commit's author
+ * and committer (their git_name / git_email, each falling back to the global userName / userEmail) and pushBranch their
+ * git_branch. The settings object itself when the user has none of them, so nothing changes.
+ */
+export async function gitIdentityFor(userId, github) {
+  const u = userId ? await one(`SELECT git_name, git_email, git_branch FROM users WHERE id = $1`, [userId]) : null;
+  if (!u || !(u.git_name || u.git_email || u.git_branch)) return github;
+  return {
+    ...github,
+    as: { name: u.git_name || github.userName, email: u.git_email || github.userEmail },
+    ...(u.git_branch ? { pushBranch: u.git_branch } : {}),
+  };
 }
 
 export async function gitInfo(dir) {
@@ -235,14 +250,31 @@ async function sync(project, message, settings, opts) {
   const hasStaged = !(await git(dir, 'diff', '--cached', '--quiet')).ok;
   if (hasStaged) {
     const text = typeof message === 'function' ? await buildMessage(dir, message, staged.filter((f) => !tooBig.includes(f)), steps) : message;
-    // Message goes through stdin so its content can never be parsed as an argument or option.
-    const c = await step('git commit', run('git', ['commit', '-F', '-'], dir, 60000, { input: String(text ?? '') }));
+    // Message goes through stdin so its content can never be parsed as an argument or option. A user's identity
+    // (gitIdentityFor) is the author and committer of this commit only; the repo config keeps the global one.
+    const as = settings.as ? { GIT_AUTHOR_NAME: settings.as.name, GIT_AUTHOR_EMAIL: settings.as.email, GIT_COMMITTER_NAME: settings.as.name, GIT_COMMITTER_EMAIL: settings.as.email } : {};
+    const c = await step(settings.as ? `git commit (as ${settings.as.name})` : 'git commit', run('git', ['commit', '-F', '-'], dir, 60000, { input: String(text ?? ''), env: as }));
     if (!c.ok) return log('error', null, 'Commit failed');
     commit = (await git(dir, 'rev-parse', '--short', 'HEAD')).stdout;
     commitMessage = (await git(dir, 'log', '-1', '--format=%B')).stdout || text;
   }
 
   if (!project.github_url) return log(commit ? 'committed' : 'noop', commit, commit ? 'Committed locally' : 'Nothing to commit');
+
+  // A user's branch (gitIdentityFor): the working tree stays on the default branch (other missions edit it), and HEAD
+  // is pushed to the user's branch, which the push creates from the default branch's history when it is missing.
+  const userBranch = settings.pushBranch;
+  if (userBranch && userBranch !== (await git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).stdout) {
+    const ahead = await git(dir, 'rev-list', '--count', `origin/${userBranch}..HEAD`);
+    if (!commit && ahead.ok && ahead.stdout === '0') return log('noop', null, `Already up to date on ${userBranch}`);
+    const push = await step(`git push origin HEAD:${userBranch}`, run('git', [...(await credentialArgs()), 'push', 'origin', `HEAD:refs/heads/${userBranch}`], dir, 120000));
+    if (!push.ok) {
+      const row = await log('error', commit, `Push to ${userBranch} failed`);
+      await notify({ source_type: 'system', source_name: 'GitHub', project_id: project.id, level: 'error', title: `GitHub push failed · ${project.name} · ${userBranch}`, body: push.out.slice(-400) });
+      return row;
+    }
+    return log('pushed', commit, commit ? `Pushed ${commit} to ${userBranch}` : `Pushed pending commits to ${userBranch}`);
+  }
 
   const branch = (await git(dir, 'rev-parse', '--abbrev-ref', 'HEAD')).stdout || branchName;
   const ahead = await git(dir, 'rev-list', '--count', `origin/${branch}..HEAD`);

@@ -6,7 +6,7 @@ export const CAPABILITIES = {
   createProjects: 'Create projects (a project they create is granted to them)',
   runMissions: 'Run missions in granted projects: orders, stop, stand-ups, sync, proposals, topics, team and preview',
   manageAgents: 'Agent registry and evolution: view, create, edit, clone, merge and archive agents',
-  manageSettings: 'Settings, models and GitHub: view and change',
+  manageSettings: 'Models: view and change (the other settings are for administrators only)',
 };
 
 // Protected projects (the AgentForge platform itself) are never visible to a non-admin, even when granted.
@@ -53,7 +53,8 @@ const PROJECT_BY_ID = new Set(['project:update', 'project:delete']);
 const PROJECT_EVENTS = new Set(['project:members', 'message:new', 'message:update', 'task:update', 'mission:update', 'run:start', 'run:event', 'run:end',
   'topic:new', 'topic:update', 'topic:delete', 'topic:moved', 'preview:log', 'preview:update', 'sync:log', 'notification:new']);
 const AGENT_EVENTS = new Set(['agent:new', 'agent:update', 'agent:delete', 'evolution:event']);
-const SETTINGS_EVENTS = new Set(['settings:update', 'models:update']);
+// 'settings:update' is not listed: settings are admin-only (a non-admin's Settings page is browser preferences only).
+const SETTINGS_EVENTS = new Set(['models:update']);
 
 /** Whether a broadcast event may go to this user. Anything not listed is admin-only. */
 export function eventVisibleTo(u, type, payload) {

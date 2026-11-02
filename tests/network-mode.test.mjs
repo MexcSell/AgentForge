@@ -127,7 +127,7 @@ test('the setting is admin only: a user with manageSettings can neither read nor
   assert.equal((await call(local, 'POST', `/api/users/${bobId}/approve`, { cookie: admin })).status, 200);
   assert.equal((await call(local, 'PUT', `/api/users/${bobId}/permissions`, { cookie: admin, body: { manageSettings: true } })).status, 200);
   const bob = cookieOf(await signIn(local, BOB));
-  assert.equal((await call(local, 'GET', '/api/settings', { cookie: bob })).status, 200, 'other settings are his');
+  assert.equal((await call(local, 'GET', '/api/settings', { cookie: bob })).status, 403, 'settings are admin-only (his Settings page is browser preferences)');
   assert.equal((await call(local, 'GET', '/api/system/network', { cookie: bob })).status, 403);
   assert.equal((await call(local, 'PUT', '/api/system/network', { cookie: bob, body: { https: false } })).status, 403);
   assert.equal((await call(local, 'PUT', '/api/settings/network', { cookie: admin, body: { https: true } })).status, 400, 'not through the generic settings route');

@@ -1,0 +1,32 @@
+# systemd unit: starts AgentForge (scripts/supervisor.js) at boot and keeps it up.
+# Install:  sudo cp deploy/agentforge.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#           sudo systemctl enable --now agentforge
+# Adjust WorkingDirectory, the log path and User if the checkout lives elsewhere.
+[Unit]
+Description=AgentForge control room (supervisor + web server)
+Wants=network-online.target postgresql.service
+After=network-online.target postgresql.service
+# Give up instead of looping when it keeps exiting at once (e.g. "already running" beside a manual `npm start`).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/luca/AgentForge
+# A service gets no login shell: claude/codex live in ~/.local/bin, which only .bashrc adds to PATH.
+Environment=HOME=/root
+Environment=SHELL=/bin/bash
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/bin/node scripts/supervisor.js
+# Keep it up even after `npm run stop` (exit 0); use `systemctl stop agentforge` to really stop it.
+Restart=always
+RestartSec=3
+# SIGTERM only the supervisor (it shuts the server down over IPC), then sweep leftover agent processes.
+KillMode=mixed
+TimeoutStopSec=30
+StandardOutput=append:/home/luca/AgentForge/data/logs/agentforge.log
+StandardError=append:/home/luca/AgentForge/data/logs/agentforge.log
+
+[Install]
+WantedBy=multi-user.target

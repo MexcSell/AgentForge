@@ -532,3 +532,67 @@ test('the page-load device check: approved → session; pending, rejected, disab
   const fresh = await signup('gina', browser('Firefox on Linux'));
   assert.deepEqual([fresh.status, fresh.data.user.status, fresh.setCookie], [200, 'pending', null]);
 });
+
+let root, nia; // fresh cookies for the settings and Git identity tests
+
+test('settings are admin-only: even with manageSettings a non-admin can neither read nor write them, over HTTP or WebSocket', async () => {
+  // Earlier tests reset the owner's device and end sessions: fresh ones for the owner and another non-admin.
+  root = `af_session=${await auth.createSession(await userId('owner'))}`;
+  assert.equal((await signup('nia', browser('Chrome on Linux', { screen: '800x600' }))).status, 200);
+  assert.equal((await call('POST', `/api/users/${await userId('nia')}/approve`, { cookie: root })).status, 200);
+  nia = `af_session=${await auth.createSession(await userId('nia'))}`;
+  const dev = browser('Firefox on Linux');
+  assert.equal((await signup('sid', dev)).status, 200);
+  const id = await userId('sid');
+  assert.equal((await call('POST', `/api/users/${id}/approve`, { cookie: root })).status, 200);
+  assert.equal((await call('PUT', `/api/users/${id}/permissions`, { cookie: root, body: { manageSettings: true } })).status, 200);
+  const sid = cookieOf(await deviceLogin(dev));
+  for (const key of ['orchestrator', 'evolution', 'monitor', 'github']) {
+    assert.equal((await call('PUT', `/api/settings/${key}`, { cookie: sid, body: { enabled: false } })).status, 403, key);
+  }
+  assert.equal((await call('GET', '/api/settings', { cookie: sid })).status, 403);
+  assert.equal((await call('GET', '/api/settings', { cookie: root })).status, 200, 'the administrator still reads them');
+  assert.equal((await call('GET', '/api/models', { cookie: sid })).status, 200, 'models stay open to manageSettings');
+  const s = await socket(sid);
+  const a = await socket(root);
+  await tick();
+  s.events.length = 0;
+  a.events.length = 0;
+  emit('settings:update', { key: 'orchestrator', value: { maxParallel: 3 } });
+  emit('models:update', {});
+  await tick();
+  assert.deepEqual(s.events.map((e) => e.type), ['models:update']);
+  assert.deepEqual(a.events.map((e) => e.type), ['settings:update', 'models:update']);
+  s.ws.close();
+  a.ws.close();
+});
+
+test('per-user Git identity: the administrator sets name, email and branch (validated); other non-admins never see them', async () => {
+  const id = await userId('sid');
+  const put = (body, cookie = root) => call('PUT', `/api/users/${id}/git`, { cookie, body });
+  const ok = await put({ git_name: ' Sid Vicious ', git_email: 'sid@example.com', git_branch: 'users/sid' });
+  assert.equal(ok.status, 200);
+  assert.deepEqual([ok.data.git_name, ok.data.git_email, ok.data.git_branch], ['Sid Vicious', 'sid@example.com', 'users/sid']);
+  const listed = (await call('GET', '/api/users', { cookie: root })).data.users.find((u) => u.id === id);
+  assert.equal(listed.git_email, 'sid@example.com', 'the Users page lists it');
+  for (const email of ['sid', 'sid@', '@example.com', 'sid@example', 'a b@example.com', '<sid@example.com>']) {
+    const r = await put({ git_email: email });
+    assert.deepEqual([r.status, r.data.code], [400, 'invalid_git_email'], email);
+    assert.match(r.data.error, /not an email address/);
+  }
+  for (const branch of ['-x', 'a..b', 'a b', 'HEAD', '@{-1}', 'x.lock', 'feat/', 'a~1', 'a:b', '/x', '.hidden']) {
+    const r = await put({ git_branch: branch });
+    assert.deepEqual([r.status, r.data.code], [400, 'invalid_git_branch'], branch);
+    assert.match(r.data.error, /not a valid branch name/);
+  }
+  assert.equal((await put({ git_name: 'x', git_email: 'sid@example.com', git_branch: 'users/sid' }, nia)).status, 403, 'non-admins can not set it');
+  assert.equal((await one(`SELECT git_name FROM users WHERE id = $1`, [id])).git_name, 'Sid Vicious', 'refused changes are not stored');
+  // nia sees nobody else's account (Users is admin-only), and their own has no identity set.
+  assert.equal((await call('GET', '/api/users', { cookie: nia })).status, 403);
+  const me = await call('GET', '/api/auth/me', { cookie: nia });
+  assert.deepEqual([me.data.user.git_email, me.data.user.git_branch], [null, null]);
+  assert.ok(!JSON.stringify(me.data).includes('sid@example.com'));
+  // Empty fields clear it: the global identity applies again.
+  const cleared = await put({ git_name: '', git_email: '  ', git_branch: null });
+  assert.deepEqual([cleared.status, cleared.data.git_name, cleared.data.git_email, cleared.data.git_branch], [200, null, null, null]);
+});

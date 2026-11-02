@@ -9,7 +9,7 @@ import { getProject, publishProject, setProjectStatus } from '../services/projec
 import { getTopic, createTopic, updateTopic, touchTopic, ensureTopic, publishTopic } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
 import { ensureMembers, memberStanding } from '../services/members.js';
-import { syncProject, touchedFiles, repoPaths } from '../services/git.js';
+import { syncProject, touchedFiles, repoPaths, gitIdentityFor } from '../services/git.js';
 import { PROVIDERS, resolveModel, runModel, recordRunUsage, publishModels } from '../models/index.js';
 import { heuristicPlan, topicTitle, topicSummary } from './heuristics.js';
 import { planPrompt, taskPrompt, retryPrompt, commitPrompt, digestPrompt, triagePrompt, parseJson, topicContext, inflightContext } from './prompts.js';
@@ -184,7 +184,7 @@ async function bumpAgentStats(agentId, out) {
 
 // ---- commands ------------------------------------------------------------
 
-export async function submitCommand(projectId, { content, attachments = [], topicId = null }) {
+export async function submitCommand(projectId, { content, attachments = [], topicId = null, userId = null }) {
   const project = await getProject(projectId);
   if (!project) throw new Error('project not found');
   const topic = await ensureTopic(projectId, topicId);
@@ -196,7 +196,7 @@ export async function submitCommand(projectId, { content, attachments = [], topi
   if (slash === 'standup') { await standup(projectId, topic.id); return userMsg; }
   if (slash === 'sync') { await syncNow(projectId, 'Manual sync', topic.id); return userMsg; }
 
-  const mission = await one(`INSERT INTO missions(project_id, command, topic_id) VALUES ($1,$2,$3) RETURNING *`, [projectId, text, topic.id]);
+  const mission = await one(`INSERT INTO missions(project_id, command, topic_id, ordered_by) VALUES ($1,$2,$3,$4) RETURNING *`, [projectId, text, topic.id, userId]);
   await query(`UPDATE messages SET mission_id = $2 WHERE id = $1`, [userMsg.id, mission.id]);
   mission.attachments = attachments;
   queues.set(projectId, [...(queues.get(projectId) || []), mission]);
@@ -684,10 +684,12 @@ function syncMission({ project, mission, wrote, tasks, final, settings, message 
   return withAgentLock('sync', project.id, async () => {
     const self = active.get(mission.id);
     try {
+      // The identity and branch of the user who ordered the mission; the global ones when unset (gitIdentityFor).
+      const github = await gitIdentityFor(mission.ordered_by, settings.github);
       const others = activeIn(project.id).filter((a) => a.mission.id !== mission.id && a.phase !== 'done');
       if (!others.length) {
         if (!wrote && !sweeps.has(project.id)) return null;
-        const log = await syncProject(project, message, settings.github);
+        const log = await syncProject(project, message, github);
         if (log.status !== 'error') sweeps.delete(project.id);
         return log;
       }
@@ -695,7 +697,7 @@ function syncMission({ project, mission, wrote, tasks, final, settings, message 
       const done = new Set(final.filter((t) => t.status === 'done').map((t) => t.key));
       const declared = tasks.filter((t) => done.has(t.key)).flatMap((t) => t.files || []);
       const only = [...new Set([...(await touchedFiles(mission.id, project.path)), ...declared])];
-      const log = await syncProject(project, message, settings.github, { only, exclude: await filesOf(project, others) });
+      const log = await syncProject(project, message, github, { only, exclude: await filesOf(project, others) });
       if (log.deferred?.length) sweeps.add(project.id);
       return log;
     } finally {

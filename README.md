@@ -15,6 +15,18 @@ npm run db:check     # PostgreSQL connectivity check
 
 Requirements: Node.js ≥ 20, PostgreSQL (defaults: `localhost:5432`, db `agentapp`, user/password `agentuser`), and the `claude` CLI logged in. `gh` is used for push credentials when it is authenticated. Override settings in `.env` (see `.env.example`).
 
+### Start at boot
+
+`npm start` from a shell does not survive a reboot. [deploy/agentforge.service](deploy/agentforge.service) runs the supervisor as a systemd service after PostgreSQL, restarts it if it exits, and appends its output to `data/logs/agentforge.log` (so `npm run logs` still works). Edit the paths in it if the checkout is not `/home/luca/AgentForge`, then:
+
+```bash
+sudo cp deploy/agentforge.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now agentforge
+```
+
+Then manage it with `systemctl restart|stop|status agentforge`. `npm run stop` only restarts it, since systemd brings it back; `npm start` beside the service just reports "already running". The service has no login shell, so variables exported in `.bashrc` do not reach it: put them in `.env`.
+
 ### Remote access
 
 With **HTTPS mode** off (the default, Settings → Network · HTTPS mode, administrators only) the server listens on all interfaces over plain HTTP with no proxy hop, so other computers can open `http://<server IP or hostname>:4800` (the startup log lists the URLs). Every page and API still needs a signed-in account, and WebSockets only accept the app's own origin. To keep it local, set `HOST=127.0.0.1` in `.env` (another address binds just that interface); the change applies on the next restart. The administrator can sign in from any computer; other accounts are bound to the computer they registered from, so a teammate signs up from their own computer and the administrator approves it (or uses **Reset device** to move an account). If it does not load from outside, open TCP port 4800 in the host firewall and any cloud security group / router port forward. Traffic on port 4800 is plain HTTP, and the app includes a shell terminal (admin only). Over the internet, serve it over HTTPS (below) and keep 4800 private.
@@ -29,7 +41,7 @@ Static files are served precompressed (the build writes `.br`/`.gz` next to each
 2. **Install Caddy** ([install docs](https://caddyserver.com/docs/install); Debian/Ubuntu: the `caddy` apt package, which runs as a systemd service). Copy the config with `sudo cp deploy/Caddyfile /etc/caddy/Caddyfile`. Then either replace `{$AF_DOMAIN}` in it with your domain, or run `sudo systemctl edit caddy` and add `Environment=AF_DOMAIN=agentforge.example.com` under `[Service]`. Check it with `AF_DOMAIN=agentforge.example.com caddy validate --config /etc/caddy/Caddyfile` (the variable is needed in the shell unless you replaced the placeholder), then `sudo systemctl reload caddy`. Open `https://<domain>` and sign in while the old address still works.
 3. **Switch HTTPS mode on**: open Settings → **Network · HTTPS mode** *through* `https://<domain>`, turn it on and save. That trusts the proxy and closes the plain port (steps 4 and 5 below in one), applied by a safe restart; it is refused from a direct `http://<IP>:4800` connection, which would lock you out. Then remove any firewall rule that opened 4800. Turning it off again (plain HTTP on all interfaces) works from either address. The rest of this list is the same by hand, in `.env`; `HOST` and `TRUST_PROXY` set there always win over the setting, and Settings shows which ones do.
 4. **Trust the proxy**: set `TRUST_PROXY=1` in `.env`. The app then believes `X-Forwarded-*` only from a proxy on this host (loopback), so the session cookie is `Secure` over https, WebSockets accept the `https://<domain>` origin, and the request IP is the real client's. For a proxy on another machine, list its addresses instead (`TRUST_PROXY=10.0.0.5` or a CIDR). Without `TRUST_PROXY`, forwarded headers are ignored, so direct clients can not fake them.
-5. **Close the plain port**: set `HOST=127.0.0.1` in `.env` so only the proxy can reach 4800, and restart (**Safe restart** or `npm run stop && npm start`). Then remove any firewall rule that opened 4800. Do this only after `https://<domain>` works, or remote users lose access.
+5. **Close the plain port**: set `HOST=127.0.0.1` in `.env` so only the proxy can reach 4800, and restart (**Safe restart**, `sudo systemctl restart agentforge`, or `npm run stop && npm start` without the service). Then remove any firewall rule that opened 4800. Do this only after `https://<domain>` works, or remote users lose access.
 
 **No domain?** Use Caddy's own certificate authority on the IP or LAN name: in the Caddyfile, comment out the `{$AF_DOMAIN}` block and enable the `tls internal` block with your address (e.g. `https://192.168.1.20`). Browsers warn until they trust Caddy's root certificate: `caddy trust` on the server, and on other computers import `root.crt` from Caddy's data directory (`/var/lib/caddy/.local/share/caddy/pki/authorities/local/` for the apt package). Steps 3 to 5 stay the same.
 

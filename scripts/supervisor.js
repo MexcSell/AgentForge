@@ -19,9 +19,14 @@ const DIST = path.join(ROOT, 'client', 'dist');
 const log = (...a) => console.log(new Date().toISOString(), '[supervisor]', ...a);
 
 // ---- single instance -------------------------------------------------------
+// After a reboot the old pid can belong to an unrelated process, so only a live supervisor counts.
+const isSupervisor = (pid) => {
+  try { return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('supervisor.js'); }
+  catch { try { process.kill(pid, 0); return true; } catch { return false; } } // no /proc: alive = running
+};
 if (fs.existsSync(PID_FILE)) {
   const pid = Number(fs.readFileSync(PID_FILE, 'utf8'));
-  try { process.kill(pid, 0); log(`already running (pid ${pid})`); process.exit(1); } catch { /* stale */ }
+  if (pid && pid !== process.pid && isSupervisor(pid)) { log(`already running (pid ${pid})`); process.exit(1); }
 }
 fs.mkdirSync(path.dirname(PID_FILE), { recursive: true });
 fs.writeFileSync(PID_FILE, String(process.pid));

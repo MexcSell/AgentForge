@@ -144,7 +144,7 @@ export default async function apiRoutes(app, opts = {}) {
   app.post('/api/projects/:id/command', async (req, reply) => {
     const { content, attachments, topic_id } = req.body || {};
     if (!content?.trim() && !attachments?.length) return err(reply, 400, 'Empty command');
-    return submitCommand(req.params.id, { content: content || '(see attached images)', attachments: attachments || [], topicId: topic_id || null });
+    return submitCommand(req.params.id, { content: content || '(see attached images)', attachments: attachments || [], topicId: topic_id || null, userId: req.user?.id || null });
   });
   // Optional { topic_id } stops only that topic's mission and queued orders; without it everything stops.
   app.post('/api/projects/:id/cancel', async (req, reply) => {

@@ -420,6 +420,13 @@ ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS device_secret_hash text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS device_info jsonb;
 CREATE UNIQUE INDEX IF NOT EXISTS users_device_secret_key ON users (device_secret_hash);
+-- GitHub identity of the missions a user orders (services/git.js gitIdentityFor): commit author/committer and the
+-- branch pushed to. NULL = the global github settings (userName, userEmail, branch). Set by an administrator only.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS git_name text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS git_email text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS git_branch text;
+-- Who typed the order (POST /api/projects/:id/command); NULL for proposals, recovered and older missions.
+ALTER TABLE missions ADD COLUMN IF NOT EXISTS ordered_by uuid REFERENCES users(id) ON DELETE SET NULL;
 -- Signed-in browsers: the httpOnly cookie holds a random token, only its SHA-256 is stored. Survives restarts.
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash    text PRIMARY KEY,
