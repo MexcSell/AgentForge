@@ -1,6 +1,7 @@
 import { one, many } from '../db/pool.js';
 import { emit } from '../events.js';
 import { audit } from './notify.js';
+import { cloneAgent } from './agents.js';
 
 /**
  * Project membership (project_members): the agents on a project, added by a human ('user') or when the GM staffs them
@@ -47,13 +48,21 @@ async function projectOf(projectId) {
 
 /**
  * Add an agent to the project, or re-activate a released member. by: 'user' or 'auto'. Archived agents are refused (409).
- * Returns { changed, agent, members }; changed is false when it was an active member already (nothing is published).
+ * An original never joins a project itself (only the executive does): its clone already on the project (the oldest
+ * live one) is (re-)activated, else a new complete clone of it joins. Returns { changed, agent, members }; agent is
+ * the one that joined; changed is false when it was an active member already (nothing is published).
  */
 export async function addMember(projectId, agentId, by = 'user') {
   const p = await projectOf(projectId);
-  const a = await one(`SELECT id, name, archived FROM agents WHERE id = $1`, [agentId]);
+  let a = await one(`SELECT id, name, archived, origin, role FROM agents WHERE id = $1`, [agentId]);
   if (!a) throw httpError(404, 'Agent not found');
   if (a.archived) throw httpError(409, `${a.name} is archived and can't be added to a project`);
+  if (a.origin !== 'cloned' && a.role !== 'executive') {
+    a = await one(
+      `SELECT a.id, a.name FROM agents a JOIN project_members pm ON pm.agent_id = a.id AND pm.project_id = $1
+       WHERE a.cloned_from = $2 AND a.origin = 'cloned' AND NOT a.archived ORDER BY pm.status = 'active' DESC, a.created_at, a.id LIMIT 1`, [p.id, a.id])
+      || await cloneAgent(a.id, `member of ${p.name}`);
+  }
   const changed = !!(await one(
     `INSERT INTO project_members(project_id, agent_id, status, added_by) VALUES ($1, $2, 'active', $3)
      ON CONFLICT (project_id, agent_id) DO UPDATE SET status = 'active', added_by = EXCLUDED.added_by, added_at = now(), released_at = NULL

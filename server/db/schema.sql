@@ -83,9 +83,15 @@ CREATE TABLE IF NOT EXISTS missions (
   finished_at  timestamptz
 );
 
--- A clone made for one mission (engine staffing): merged back into its original when that mission ends. NULL for
--- originals, manual clones and clones made before leases existed.
+-- A clone made for one mission (engine staffing): retired when that mission ends (it keeps what it learned; the
+-- original is never changed by project work). NULL for originals, manual and member clones, and clones made before
+-- leases existed.
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS lease_mission_id uuid REFERENCES missions(id) ON DELETE SET NULL;
+
+-- Names are unique among live agents only: an archived (retired or merged) agent keeps its name in history, but the
+-- name is free again, so clone numbering fills the gaps it leaves (services/agents.js allocateName).
+ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_name_key;
+CREATE UNIQUE INDEX IF NOT EXISTS agents_live_name_key ON agents(name) WHERE NOT archived;
 
 CREATE TABLE IF NOT EXISTS tasks (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -1,5 +1,5 @@
-// Clone names (server/services/agents.js cloneAgent): "<base>-N" with the lowest free N from 1, no stacked suffixes,
-// unique under concurrent cloning. Runs against session temp tables (search_path=pg_temp), never the live tables.
+// Clone names (server/services/agents.js cloneAgent): "<base>-N" with the smallest N from 1 no live agent holds, no stacked
+// suffixes, unique under concurrent cloning; archived agents free their names. Runs against session temp tables (search_path=pg_temp), never the live tables.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -39,11 +39,24 @@ test('cloning a numbered clone does not stack suffixes', async () => {
   assert.equal((await cloneAgent(two.id)).name, 'Pixel-3');
 });
 
-test('a gap left by a deleted clone is reused; an archived clone keeps its name (agents.name is UNIQUE)', async () => {
+test('gaps left by deleted and archived clones are reused; the archived row keeps its name in history', async () => {
   await pool.query(`DELETE FROM agents WHERE name = 'Pixel-1'`);
   await pool.query(`UPDATE agents SET archived = true WHERE name = 'Pixel-2'`);
   assert.equal((await cloneAgent(pixel.id)).name, 'Pixel-1');
+  assert.equal((await cloneAgent(pixel.id)).name, 'Pixel-2');
   assert.equal((await cloneAgent(pixel.id)).name, 'Pixel-4');
+  assert.deepEqual((await pool.query(`SELECT archived FROM agents WHERE name = 'Pixel-2' ORDER BY archived`)).rows.map((r) => r.archived), [false, true]);
+});
+
+test('with Aria-1 and Aria-4 live (Aria-2, Aria-3 archived), the next clones are Aria-2, Aria-3, then Aria-5', async () => {
+  const aria = await createAgent({ role: 'manager', name: 'Aria' });
+  for (let i = 0; i < 4; i++) await cloneAgent(aria.id);
+  await pool.query(`UPDATE agents SET archived = true WHERE name IN ('Aria-2', 'Aria-3')`);
+  assert.deepEqual([(await cloneAgent(aria.id)).name, (await cloneAgent(aria.id)).name, (await cloneAgent(aria.id)).name], ['Aria-2', 'Aria-3', 'Aria-5']);
+});
+
+test('a live name stays unique: a second live agent can not take it', async () => {
+  await assert.rejects(createAgent({ role: 'manager', name: 'Aria-5' }), { code: '23505', constraint: 'agents_live_name_key' });
 });
 
 test('concurrent clones get unique, gap-free names', async () => {
@@ -52,4 +65,10 @@ test('concurrent clones get unique, gap-free names', async () => {
   // before any insert: they all pick the same number and every one but the first has to retry.
   const made = await Promise.all(Array.from({ length: 6 }, () => cloneAgent(pixel.id, 'parallel work')));
   assert.deepEqual(made.map((a) => a.name).sort(), ['Pixel-1', 'Pixel-2', 'Pixel-3', 'Pixel-4', 'Pixel-5', 'Pixel-6']);
+});
+
+test('concurrent clones fill the smallest free gaps first', async () => {
+  await pool.query(`UPDATE agents SET archived = true WHERE name IN ('Pixel-2', 'Pixel-3', 'Pixel-5')`);
+  const made = await Promise.all(Array.from({ length: 4 }, () => cloneAgent(pixel.id, 'parallel work')));
+  assert.deepEqual(made.map((a) => a.name).sort(), ['Pixel-2', 'Pixel-3', 'Pixel-5', 'Pixel-7']);
 });

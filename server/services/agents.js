@@ -92,14 +92,16 @@ export async function refreshAgentStatus(id) {
 }
 
 // Agent names are system-assigned and immutable.
-// A clone is "<base>-N" with the lowest N >= 1 that no agent row holds. Archived (removed or merged) agents keep their
-// names and still block them: agents.name is UNIQUE across all rows, and an archived agent stays visible in history.
+// A clone is "<base>-N" with the smallest N >= 1 that no live agent holds: with Aria-1 and Aria-4 live, the next clones
+// are Aria-2, Aria-3, then Aria-5. Archived (retired or merged) agents do not count as used: leased clones retire after
+// every mission, so counting them would push numbers up forever. An archived row keeps its name in history; uniqueness
+// holds among live agents only (schema.sql agents_live_name_key).
 function cloneName(base, taken) {
   for (let i = 1; ; i++) if (!taken.has(`${base}-${i}`)) return `${base}-${i}`;
 }
 
 async function allocateName(base) {
-  const taken = new Set((await many(`SELECT name FROM agents`)).map((r) => r.name));
+  const taken = new Set((await many(`SELECT name FROM agents WHERE NOT archived`)).map((r) => r.name));
   if (base) return cloneName(base, taken);
   const free = CODENAMES.filter((n) => !taken.has(n));
   if (free.length) return free[Math.floor(Math.random() * free.length)];
@@ -115,7 +117,7 @@ async function insertNamed(base, insert) {
     try {
       return await insert(await allocateName(base));
     } catch (e) {
-      if (e.code !== '23505' || e.constraint !== 'agents_name_key' || attempt >= 20) throw e;
+      if (e.code !== '23505' || e.constraint !== 'agents_live_name_key' || attempt >= 20) throw e;
     }
   }
 }
@@ -157,16 +159,17 @@ export async function createAgent({ role, title, skills, supervisor_id, mission,
   return agent;
 }
 
-// Duplicate an agent (same role, skills, playbook) so work can run in parallel. leaseMissionId: the mission the clone
-// is made for; mergeMissionClones() folds it back into its original when that mission ends.
+// A complete copy of an agent (role, title, level, XP, skills, mission/purpose, playbook and its version, model) that
+// does project work in its place, so the original is never assigned nor changed by it. leaseMissionId: the mission the
+// clone is made for; retireMissionClones() retires it when that mission ends (what it learned stays with it).
 export async function cloneAgent(sourceId, reason = 'parallel work', { leaseMissionId = null } = {}) {
   const src = await getAgent(sourceId);
   if (!src) throw new Error('agent not found');
   const base = src.name.replace(/-\d+$/, '');
   const row = await insertNamed(base, (name) => one(
     `INSERT INTO agents(name, role, title, tier, department, skills, supervisor_id, mission, purpose, playbook, prompt_version, model_id, origin, cloned_from, xp, level, clone_base, lease_mission_id)
-     SELECT $2, role, title, tier, department, skills, supervisor_id, mission, purpose, playbook, prompt_version, model_id, 'cloned', id, xp / 2, GREATEST(1, level - 1),
-       jsonb_build_object('xp', xp / 2, 'skills', skills), $3
+     SELECT $2, role, title, tier, department, skills, supervisor_id, mission, purpose, playbook, prompt_version, model_id, 'cloned', id, xp, level,
+       jsonb_build_object('xp', xp, 'skills', skills), $3
      FROM agents WHERE id = $1 RETURNING id`,
     [sourceId, name, leaseMissionId],
   ));
@@ -200,20 +203,36 @@ export function pickReplacement(gone, task = {}, agents = [], { exclude = [] } =
 }
 
 /**
+ * An agent fit to work a task of missionId: a clone as is, else (an original) a new clone of it leased to that mission,
+ * so an original is never assigned project work. The executive is the exception: it is never cloned and works itself.
+ */
+export async function staffable(agent, missionId, reason = 'take over work') {
+  if (!agent || agent.origin === 'cloned' || agent.role === 'executive') return agent;
+  return cloneAgent(agent.id, reason, { leaseMissionId: missionId || null });
+}
+
+/**
  * A live agent to take over a task from one that is gone (a merged clone, a removed agent, or null when the task has
  * none). A merged clone's merge target comes first. Otherwise pickReplacement() over the live agents; with nobody of
- * that role left, an agent is recruited with the gone one's role, title and skills. One pick per role at a time, so
- * picks made at the same moment reuse a recruit instead of recruiting twice. Returns { agent, merged, recruited }.
+ * that role left, an agent is recruited with the gone one's role, title and skills (kept in reserve). One pick per role
+ * at a time, so picks made at the same moment reuse a recruit instead of recruiting twice. An original picked (or
+ * recruited) is never assigned itself: a clone of it leased to the task's mission takes over (staffable()).
+ * Returns { agent, merged, recruited, src }; src is the original when agent is a new clone of it, else null.
  */
 export async function replacementFor(gone, task = {}) {
   const into = gone?.merged_into ? await mergeTarget(gone) : null;
-  if (into) return { agent: into, merged: true, recruited: false };
-  const role = gone?.role || task.role;
+  const role = into?.role || gone?.role || task.role;
   return withAgentLock('replace', role, async () => {
-    const best = pickReplacement(gone, task, await listAgents());
-    if (best) return { agent: best, merged: false, recruited: false };
-    const skills = gone?.skills?.length ? gone.skills.map((s) => s.name) : task.skills;
-    return { agent: await createAgent({ role, title: gone?.title, skills }), merged: false, recruited: true };
+    let src = into;
+    let recruited = false;
+    if (!src) src = pickReplacement(gone, task, await listAgents());
+    if (!src) {
+      const skills = gone?.skills?.length ? gone.skills.map((s) => s.name) : task.skills;
+      src = await createAgent({ role, title: gone?.title, skills });
+      recruited = true;
+    }
+    const agent = await staffable(src, task.mission_id, `takes over ${task.key || 'work'} (leased to its mission)`);
+    return { agent, merged: !!into, recruited, src: agent.id === src.id ? null : src };
   });
 }
 
@@ -283,48 +302,49 @@ export async function mergeAgent(cloneId, { actor = 'user', why = '' } = {}) {
   return { agent: await publishAgent(target.id), merged, projects };
 }
 
-const mergeWaits = new Map(); // missionId -> retry timer while a leased clone still runs a task
+const retireWaits = new Map(); // missionId -> retry timer while a leased clone still runs a task
 
 /**
- * The mission is over: merge each live clone leased to it (lease_mission_id) into its original with mergeAgent(), and
- * call onMerged(cloneId, result) after each merge (the engine hands the clone's pending work over and publishes its
- * projects). A clone that still runs a task (or reads 'working') is retried every retryMs until it is idle, merged or
- * archived; it is never merged while a task runs (mergeAgent re-checks in the clone's 'claim' lane). Executive clones,
- * clones without a lease and clones with no live original are left alone. ids: clones
- * leased to it whose lease_mission_id may be gone (its project was deleted). Returns { merged: [ids], waiting: [ids] }.
+ * The mission is over: retire each live clone leased to it (lease_mission_id). It is archived with what it learned (its
+ * XP, skills and experiences stay on it) and its original is left exactly as it was: project work never changes an
+ * original. Calls onRetired(cloneId) after each (the engine hands the clone's pending work elsewhere over). A clone that
+ * still runs a task (or reads 'working') is retried every retryMs until it is idle or archived; it is never retired
+ * while a task runs (checked in the clone's 'claim' lane). Executive clones and clones without a lease are left alone.
+ * ids: clones leased to it whose lease_mission_id may be gone (its project was deleted). Returns { retired, waiting }.
  */
-export async function mergeMissionClones(missionId, { ids = [], onMerged = async () => {}, retryMs = 2000 } = {}) {
-  clearTimeout(mergeWaits.get(missionId));
-  mergeWaits.delete(missionId);
+export async function retireMissionClones(missionId, { ids = [], onRetired = async () => {}, retryMs = 2000 } = {}) {
+  clearTimeout(retireWaits.get(missionId));
+  retireWaits.delete(missionId);
   const clones = await many(
-    `SELECT a.id, a.name, EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running') AS running
+    `SELECT a.id, a.name, a.supervisor_id, EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = a.id AND t.status = 'running') AS running
      FROM agents a WHERE (a.lease_mission_id = $1 OR a.id = ANY($2::uuid[])) AND a.origin = 'cloned' AND NOT a.archived AND a.role <> 'executive' ORDER BY a.created_at, a.id`, [missionId, ids]);
-  const merged = [];
+  const retired = [];
   const waiting = [];
   for (const c of clones) {
     if (c.running) { waiting.push(c.id); continue; }
-    try {
-      const out = await mergeAgent(c.id, { actor: 'system', why: 'Mission finished · ' });
-      merged.push(c.id);
-      await onMerged(c.id, out);
-    } catch (e) {
-      if (e.status === 409 && e.message === 'Agent is working') {
-        await refreshAgentStatus(c.id); // a stale 'working' with no running task clears here
-        waiting.push(c.id);
-      } else if (e.status) console.error('[lease-merge]', c.name, e.message); // archived, or no live original: leave it
-      else throw e;
+    const done = await retireAgent(c.id, c.supervisor_id, async () =>
+      !(await one(`SELECT 1 FROM agents b WHERE b.id = $1 AND (b.archived OR b.status = 'working' OR EXISTS (SELECT 1 FROM tasks t WHERE t.agent_id = b.id AND t.status = 'running'))`, [c.id])));
+    if (done) {
+      retired.push(c.id);
+      emit('agent:delete', { id: c.id });
+      await audit('system', 'agent.retire', c.name, { missionId, reason: 'Mission finished' });
+      for (const { project_id: pid } of await many(`SELECT project_id FROM project_members WHERE agent_id = $1`, [c.id])) await publishMembers(pid).catch(() => {});
+      await onRetired(c.id);
+    } else if (!(await one(`SELECT archived FROM agents WHERE id = $1`, [c.id]))?.archived) {
+      await refreshAgentStatus(c.id); // a stale 'working' with no running task clears here
+      waiting.push(c.id);
     }
   }
   if (waiting.length) {
     const timer = setTimeout(() => {
-      if (mergeWaits.get(missionId) !== timer) return;
-      mergeWaits.delete(missionId);
-      mergeMissionClones(missionId, { ids, onMerged, retryMs }).catch((e) => console.error('[lease-merge]', e.message));
+      if (retireWaits.get(missionId) !== timer) return;
+      retireWaits.delete(missionId);
+      retireMissionClones(missionId, { ids, onRetired, retryMs }).catch((e) => console.error('[lease-retire]', e.message));
     }, retryMs);
     timer.unref?.();
-    mergeWaits.set(missionId, timer);
+    retireWaits.set(missionId, timer);
   }
-  return { merged, waiting };
+  return { retired, waiting };
 }
 
 // One transaction: the target gains the source's learning, experiences, reports and GM projects, and the source is retired.
@@ -343,6 +363,11 @@ async function absorb(sourceId, targetId) {
     if (source.role !== target.role) throw httpError(409, 'Only agents of the same role can be merged');
     // Only a clone of the executive may fold back into it; the executive itself is never merged away.
     if (source.role === 'executive' && source.origin !== 'cloned') throw httpError(409, 'The executive agent cannot be merged');
+    // A project's General Manager is always a clone (or the executive): an original never takes a GM clone's projects over.
+    if (target.origin !== 'cloned' && target.role !== 'executive'
+      && (await db.query(`SELECT 1 FROM projects WHERE manager_id = $1 LIMIT 1`, [source.id])).rowCount) {
+      throw httpError(409, `${source.name} manages a project; its original can't take over as General Manager`);
+    }
     const m = combineLearning(target, source);
     gained = m.gained;
     await db.query(`UPDATE agents SET xp=$2, level=$3, skills=$4, stats=stats || $5, updated_at=now() WHERE id=$1`, [target.id, m.xp, m.level, JSON.stringify(m.skills), m.stats]);

@@ -116,7 +116,7 @@ async function learnMissionLocked({ gm, mission, project, status, tasks }) {
   const ok = status === 'done';
   const xp = a.xp + (ok ? 20 + 2 * Math.min(5, tasks.length) : 6);
   const level = levelFor(xp);
-  // Skills its own tasks here credited: on the GM itself or on a clone of it (whose gains merge back into it).
+  // Skills its own tasks here credited: on the GM itself or on a clone of it.
   const own = await many(
     `SELECT t.skills FROM tasks t JOIN agents x ON x.id = t.agent_id
      WHERE t.mission_id = $1 AND t.origin <> 'proposal' AND (x.id = $2 OR x.cloned_from = $2 OR x.merged_into = $2)`, [mission.id, a.id]);

@@ -4,7 +4,7 @@ import { config } from '../config.js';
 import { emit } from '../events.js';
 import { getSettings } from '../db/seed.js';
 import { normalizeRole, roleInfo } from '../roles.js';
-import { getAgent, listAgents, createAgent, cloneAgent, publishAgent, refreshAgentStatus, withAgentLock, replacementFor, pickReplacement, mergeTarget, originalOf, mergeMissionClones } from '../services/agents.js';
+import { getAgent, listAgents, createAgent, cloneAgent, publishAgent, refreshAgentStatus, withAgentLock, replacementFor, pickReplacement, mergeTarget, originalOf, retireMissionClones } from '../services/agents.js';
 import { getProject, publishProject, setProjectStatus } from '../services/projects.js';
 import { getTopic, createTopic, updateTopic, touchTopic, ensureTopic, publishTopic } from '../services/topics.js';
 import { notify, audit } from '../services/notify.js';
@@ -468,24 +468,24 @@ async function leaseClone(t, project, mission, from = null, standing = null) {
   return { agent, src, recruited };
 }
 
-// The staffing note for a leased clone: which case it was (the role's originals busy, or none of the role at all).
+// The staffing note for a leased clone: cloned from the role's best original, or from one recruited because none existed.
 const leaseNote = ({ agent, src, recruited }, t) => (recruited
-  ? `Recruited ${src.name} as a new ${roleInfo(t.role).title} (kept in reserve) and cloned ${agent.name} for ${t.key}; the clone merges back when the mission ends`
-  : `Cloned ${src.name} → ${agent.name} for ${t.key}: every ${roleInfo(t.role).title} is busy; the clone merges back into ${src.name} when the mission ends`);
+  ? `Recruited ${src.name} as a new ${roleInfo(t.role).title} (kept in reserve) and cloned ${agent.name} for ${t.key}; the clone retires when the mission ends`
+  : `Cloned ${src.name} → ${agent.name} for ${t.key}; ${src.name} stays untouched and the clone retires when the mission ends`);
 
 async function notifyLease(lease, t, project, mission) {
   const { agent, src, recruited } = lease;
   await notify(recruited
-    ? { source_type: 'manager', source_name: project.manager_name, project_id: project.id, agent_id: agent.id, level: 'success', title: `New agent ${src.name} · ${src.title} + clone ${agent.name}`, body: `No ${src.title} existed for "${t.title}": ${src.name} stays in reserve, ${agent.name} does the work and merges back when the mission ends` }
-    : { source_type: 'manager', source_name: project.manager_name, project_id: project.id, agent_id: agent.id, title: `${agent.name} cloned from ${src.name}`, body: `Every ${src.title} is busy — for "${t.title}"; merges back into ${src.name} when the mission ends` });
+    ? { source_type: 'manager', source_name: project.manager_name, project_id: project.id, agent_id: agent.id, level: 'success', title: `New agent ${src.name} · ${src.title} + clone ${agent.name}`, body: `No ${src.title} existed for "${t.title}": ${src.name} stays in reserve, ${agent.name} does the work and retires when the mission ends` }
+    : { source_type: 'manager', source_name: project.manager_name, project_id: project.id, agent_id: agent.id, title: `${agent.name} cloned from ${src.name}`, body: `For "${t.title}"; ${src.name} stays untouched and the clone retires when the mission ends` });
 }
 
 /**
- * Pick, clone or recruit an agent for every task. (1) A live, idle original of the role (or a clone already leased to
- * this mission) that holds no unrelated task of this plan. (2) Else a clone of the role's best original, leased to the
- * mission. (3) With nobody of the role, a new original plus a leased clone of it. The executive is never cloned or
- * recruited here: its task waits for it. Agents released from the project are never picked (a clone of one may be);
- * active members win over comparable outsiders. Returns staffing notes for the chat.
+ * Pick, clone or recruit an agent for every task. Originals never work themselves: (1) a clone already leased to this
+ * mission that holds no unrelated task of this plan; (2) else a clone of the role's best original, leased to the
+ * mission; (3) with nobody of the role, a new original kept in reserve plus a leased clone of it. The executive is the
+ * one exception: it is never cloned or recruited here, its task waits for it. Agents released from the project are never
+ * picked (a clone of one may be); active members win over comparable outsiders. Returns staffing notes for the chat.
  */
 async function staff(tasks, project, mission) {
   const notes = [];
@@ -495,7 +495,7 @@ async function staff(tasks, project, mission) {
   for (const t of tasks) {
     const all = (await listAgents()).filter((a) => a.role === t.role);
     const pool = all.filter((a) => standing.get(a.id) !== 'released').sort((a, b) => staffScore(b, t, standing) - staffScore(a, t, standing));
-    let chosen = pool.find((a) => (a.origin !== 'cloned' || a.lease_mission_id === mission.id)
+    let chosen = pool.find((a) => a.origin === 'cloned' && a.lease_mission_id === mission.id
       && (owned.get(a.id) || []).every((k) => related(k, t.key)) && a.status !== 'working');
     // The executive is never recruited a second time: one released from this project still takes its own task.
     if (!chosen && t.role === 'executive') chosen = pool.find((a) => a.origin !== 'cloned') || pool[0] || all.find((a) => a.origin !== 'cloned') || all[0];
@@ -517,19 +517,21 @@ async function staff(tasks, project, mission) {
 }
 
 /**
- * Mission over (done, failed, cancelled, or found finished on boot): merge its leased clones into their originals. A
- * merged clone's pending work elsewhere is handed over and the projects it managed are republished.
+ * Mission over (done, failed, cancelled, or found finished on boot): retire its leased clones. Each keeps what it
+ * learned; the originals they were copied from stay untouched. A retired clone's pending work elsewhere is handed over.
  */
-function mergeLeases(missionId) {
+function retireLeases(missionId) {
   const ids = [...(leasedClones.get(missionId) || [])];
   leasedClones.delete(missionId);
-  return mergeMissionClones(missionId, {
+  return retireMissionClones(missionId, {
     ids,
-    onMerged: async (cloneId, out) => {
-      for (const id of out.projects) await publishProject(id).catch(() => {});
-      await handOver(cloneId).catch((e) => console.error('[handover]', e.message));
-    },
-  }).catch((e) => console.error('[lease-merge]', e.message));
+    onRetired: (cloneId) => handOver(cloneId).catch((e) => console.error('[handover]', e.message)),
+  }).catch((e) => console.error('[lease-retire]', e.message));
+}
+
+// A hand-over that cloned an original (replacementFor) leased the clone to the task's mission: track it like staff() does.
+function trackLease(pick, missionId) {
+  if (pick.src && missionId) leasedClones.set(missionId, (leasedClones.get(missionId) || new Set()).add(pick.agent.id));
 }
 
 // ---- mission -------------------------------------------------------------
@@ -664,7 +666,7 @@ async function runMission(mission, signal) {
   } finally {
     // Stays 'working' while another mission of a project it manages is still planning or running.
     await refreshAgentStatus(gm.id);
-    await mergeLeases(mission.id);
+    await retireLeases(mission.id);
     await publishProject(project.id).catch(() => {});
     await publishTopic(mission.topic_id).catch(() => {});
   }
@@ -772,17 +774,19 @@ function claim(task, agentId) {
   });
 }
 
-// '<X> was merged into <Y> — <Y> takes over T2' / '<X> was removed — <Z> (similar Backend Engineer) takes over T2, T3'.
+// '<X> was merged into <Y> — <Y-1> (clone of Y) takes over T2' / '<X> was removed — <Z-1> (similar Backend Engineer)
+// takes over T2, T3'. A pick's src is the original its new clone was copied from.
 function handOverText(gone, moves) {
   const takers = new Map(); // agentId -> { agent, merged, recruited, keys }
   for (const m of moves) {
     const t = takers.get(m.agent.id);
     takers.set(m.agent.id, t ? { ...t, keys: [...t.keys, m.key] } : { ...m, keys: [m.key] }); // the first pick says whether it was recruited
   }
-  const merged = moves.find((m) => m.merged)?.agent;
+  const mergedMove = moves.find((m) => m.merged);
+  const merged = mergedMove && (mergedMove.src || mergedMove.agent);
   const lead = !gone ? `No agent was left on ${moves.map((m) => m.key).join(', ')}`
     : merged ? `${gone.name} was merged into ${merged.name}` : `${gone.name} was ${gone.merged_into ? 'merged' : 'removed'}`;
-  const parts = [...takers.values()].map((t) => `${t.agent.name}${t.merged ? '' : ` (${t.recruited ? 'new' : 'similar'} ${roleInfo(t.agent.role).title})`} takes over ${t.keys.join(', ')}`);
+  const parts = [...takers.values()].map((t) => `${t.agent.name}${t.merged ? (t.src ? ` (clone of ${t.src.name})` : '') : ` (${t.recruited ? 'new' : 'similar'} ${roleInfo(t.agent.role).title})`} takes over ${t.keys.join(', ')}`);
   return `${lead} — ${parts.join('; ')}`;
 }
 
@@ -801,7 +805,8 @@ async function liveAgent({ task, project, gm, mission, signal }) {
     const id = row.agent_id;
     const assigned = id && (await getAgent(id));
     if (assigned && !assigned.archived) return assigned;
-    const pick = await replacementFor(assigned || null, task);
+    const pick = await replacementFor(assigned || null, { ...task, mission_id: mission.id });
+    trackLease(pick, mission.id);
     if (signal.aborted) return null;
     if (!(await one(`UPDATE tasks SET agent_id = $2 WHERE id = $1 AND agent_id IS NOT DISTINCT FROM $3::uuid RETURNING id`, [task.id, pick.agent.id, id]))) continue;
     task.agent_id = pick.agent.id;
@@ -828,6 +833,7 @@ export async function handOver(agentId) {
   const byMission = new Map(); // missionId -> [{ agent, merged, recruited, key, task }]
   for (const t of pending) {
     const pick = await replacementFor(gone, t);
+    trackLease(pick, t.mission_id);
     // Conditional: a task that started meanwhile (or was picked up by runTask) keeps what it has.
     if (!(await one(`UPDATE tasks SET agent_id = $2 WHERE id = $1 AND agent_id = $3 AND status = 'pending' RETURNING id`, [t.id, pick.agent.id, agentId]))) continue;
     byMission.set(t.mission_id, [...(byMission.get(t.mission_id) || []), { ...pick, key: t.key, task: t }]);
@@ -940,29 +946,19 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
       continue;
     }
     if (claimed === false) {
-      // The assigned agent is busy elsewhere (or released): an idle original of the role takes the task, else a clone
-      // leased to this mission (of the busy agent's original, or of a new original when the role has none left).
+      // The assigned agent is busy elsewhere (or released): a clone leased to this mission takes the task (of the busy
+      // agent's original, or of a new original when the role has none left). Originals never take it themselves.
       const busy = agent;
       const why = released ? 'was released from this project' : 'is busy';
-      let content = null;
-      const standing = await memberStanding(project.id); // never an agent released from this project
-      for (const a of (await listAgents()).filter((x) => x.role === busy.role && x.origin !== 'cloned' && x.id !== busy.id && x.status !== 'working' && !x.active_tasks && standing.get(x.id) !== 'released')) {
-        if (!(await claim(task, a.id))) continue;
-        agent = a;
-        content = `${busy.name} ${why} — ${a.name} (idle ${roleInfo(a.role).title}) takes ${task.key}.`;
-        break;
-      }
-      if (!content) {
-        let lease;
-        do {
-          lease = await leaseClone(task, project, mission, busy);
-          agent = lease.agent;
-        } while (!(await claim(task, agent.id)));
-        content = lease.recruited
-          ? `${busy.name} ${why} and no ${roleInfo(busy.role).title} original is left — recruited ${lease.src.name} (kept in reserve) and cloned ${agent.name} for ${task.key}; the clone merges back when the mission ends.`
-          : `${busy.name} ${why} — cloned ${agent.name} from ${lease.src.name} for ${task.key}; it merges back into ${lease.src.name} when the mission ends.`;
-        await notifyLease(lease, task, project, mission);
-      }
+      let lease;
+      do {
+        lease = await leaseClone(task, project, mission, busy);
+        agent = lease.agent;
+      } while (!(await claim(task, agent.id)));
+      const content = lease.recruited
+        ? `${busy.name} ${why} and no ${roleInfo(busy.role).title} original is left — recruited ${lease.src.name} (kept in reserve) and cloned ${agent.name} for ${task.key}; the clone retires when the mission ends.`
+        : `${busy.name} ${why} — cloned ${agent.name} from ${lease.src.name} for ${task.key}; it retires when the mission ends.`;
+      await notifyLease(lease, task, project, mission);
       await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: 'status', content, meta: { detail: true } });
       claimed = true;
     }
@@ -1376,7 +1372,7 @@ export async function recoverInterrupted() {
   const ended = await many(
     `SELECT DISTINCT a.lease_mission_id AS id FROM agents a JOIN missions m ON m.id = a.lease_mission_id
      WHERE NOT a.archived AND a.origin = 'cloned' AND m.status NOT IN ('planning', 'running')`);
-  for (const m of ended) await mergeLeases(m.id);
+  for (const m of ended) await retireLeases(m.id);
 }
 
 export { publishAgent };
