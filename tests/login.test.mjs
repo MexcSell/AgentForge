@@ -26,6 +26,8 @@ globalThis.fetch = async (url, opts = {}) => {
   if (u.pathname === '/api/auth/state') return json({ setup: server.setup });
   if (u.pathname === '/api/auth/signup') {
     if (!/^[\w-]{43}$/.test(body.device?.secret || '')) return json({ error: 'no device key', code: 'device_required' }, 400);
+    const owner = server.accounts[body.device.secret];
+    if (owner) return json({ error: `This computer is already registered as ${owner.username}.`, code: 'device_taken' }, 409);
     const user = { ...PENDING, username: body.username, ...(server.setup ? { role: 'admin', status: 'active' } : {}) };
     server.accounts[body.device.secret] = user;
     if (user.status === 'active') { server.me = user; return json({ user }); }
@@ -33,10 +35,12 @@ globalThis.fetch = async (url, opts = {}) => {
   }
   if (u.pathname === '/api/auth/device') {
     if (server.hold) await server.hold;
+    if (server.down) throw new TypeError('Failed to fetch'); // network error / server restarting
+    if (server.fail) return json({ error: 'Internal Server Error' }, server.fail);
     const user = server.accounts[body.device?.secret];
     if (!user) return json({ error: 'This computer is not registered. Sign up with a username first.', code: 'unknown_device' }, 401);
     if (user.status !== 'active') return json({ error: `status ${user.status}`, code: user.status, user: { username: user.username } }, 403);
-    server.me = user;
+    if (!server.noCookie) server.me = user; // noCookie: the browser drops the Set-Cookie, so /api/auth/me stays 401
     return json({ user });
   }
   if (u.pathname === '/api/auth/logout') { server.me = null; return json({ ok: true }); }
@@ -236,6 +240,65 @@ test('page load on a pending device shows the waiting screen, not the registrati
   assert.equal(inputs().length, 0);
   assert.equal(server.me, null);
   assert.equal(localStorage.getItem('agentforge.device'), secret, 'a known secret is kept');
+});
+
+test('page load on an approved device whose session cookie is not kept: a clear message, never the sign-up form, secret kept', async () => {
+  const secret = 'C'.repeat(43);
+  server.accounts[secret] = { ...PENDING, status: 'active' };
+  server.noCookie = true;
+  localStorage.setItem('agentforge.device', secret);
+  await act(async () => root.render(h(App)));
+  await settle();
+  assert.ok(calls.some((c) => c.url === '/api/auth/device'), 'device sign-in was tried');
+  assert.ok(text().includes('Session not kept') && text().includes('did not keep the session cookie'), text().slice(0, 200));
+  assert.ok(!text().includes('not registered'), 'not told it is unregistered');
+  assert.equal(button('Register'), undefined, 'no sign-up form');
+  assert.equal(inputs().length, 0);
+  assert.equal(localStorage.getItem('agentforge.device'), secret, 'a valid secret is kept');
+  // Cookies allowed again: "Check again" signs in.
+  server.noCookie = false;
+  await click(button('Check again'));
+  await settle();
+  assert.ok(signedInView());
+});
+
+for (const [what, set] of [['a 500', (s) => { s.fail = 500; }], ['a 502 from a proxy', (s) => { s.fail = 502; }], ['a network error', (s) => { s.down = true; }]]) {
+  test(`page load on an approved device during ${what}: keeps the secret and the loading screen, then signs in`, async () => {
+    const secret = 'T'.repeat(43);
+    server.accounts[secret] = { ...PENDING, status: 'active' };
+    set(server);
+    localStorage.setItem('agentforge.device', secret);
+    await act(async () => root.render(h(App)));
+    await settle();
+    assert.equal(localStorage.getItem('agentforge.device'), secret, 'a transient error never drops the secret');
+    assert.equal(button('Register'), undefined, 'no sign-up form');
+    assert.ok(text().includes('Connecting to AgentForge'));
+    Object.assign(server, { fail: 0, down: false });
+    await reload();
+    assert.ok(signedInView());
+  });
+}
+
+test('registering on a browser whose device is already approved signs it in instead of a dead-end error', async () => {
+  const secret = 'R'.repeat(43);
+  server.accounts[secret] = { ...PENDING, username: 'monalisa', status: 'active' };
+  localStorage.setItem('agentforge.device', secret);
+  localStorage.setItem('af.signedOut', '1'); // logged out here: the homepage shows the form
+  await act(async () => root.render(h(App)));
+  await settle();
+  assert.ok(button('Register'));
+  await typeInto(inputs()[0], 'luca');
+  await submit();
+  await settle();
+  assert.ok(signedInView(), text().slice(0, 200));
+  assert.equal(server.me.username, 'monalisa');
+  assert.equal(localStorage.getItem('agentforge.device'), secret);
+});
+
+test('a browser with no device key is told, on the sign-up form, why a registered computer may not be recognised', async () => {
+  await act(async () => root.render(h(App)));
+  await settle();
+  assert.ok(text().includes('Registered before?') && text().includes(w.location.host));
 });
 
 for (const [status, title] of [['rejected', 'Registration rejected'], ['disabled', 'Account disabled']]) {

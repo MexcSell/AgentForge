@@ -250,6 +250,8 @@ test('sign-up is refused for a registered device, a taken or invalid username, a
   const taken = await signup('BOB', CAROL_DEV);
   assert.deepEqual([taken.status, taken.data.code], [409, 'username_taken']);
   assert.match(taken.data.error, /username/);
+  // bob's key lives in another browser (or another address: localStorage is per origin): say how to get back in.
+  assert.match(taken.data.error, /address and in the browser profile you registered with/);
   for (const name of ['x', '', '-bob', 'a b c', 'x'.repeat(33), '../etc']) {
     const r = await signup(name, CAROL_DEV);
     assert.deepEqual([r.status, r.data.code], [400, 'invalid_username'], name);

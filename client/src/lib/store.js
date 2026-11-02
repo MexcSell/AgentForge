@@ -7,6 +7,7 @@ import { deviceCredential, forgetDeviceSecret, storedDeviceSecret } from './devi
 const PREF_KEY = 'af.prefs';
 // Set by Log out so the homepage does not sign this browser straight back in with its device; any session clears it.
 const SIGNED_OUT_KEY = 'af.signedOut';
+const NO_SESSION = 'This computer is registered and was signed in, but the browser did not keep the session cookie. Allow cookies for this site (and do not open it inside another page), then try again.';
 const storage = (fn) => { try { return fn(globalThis.localStorage); } catch { return null; } };
 const PREFS = ['theme', 'accent', 'layoutId', 'view', 'activeProjectId', 'activeTopic', 'filePanes', 'activePane', 'showHidden', 'notifFilter', 'orgTree'];
 
@@ -140,15 +141,12 @@ export const useStore = create((set, get) => ({
   /**
    * Signs in with this browser's device secret (no password). Sets me and returns it; when refused, sets device to the
    * reason (pending, rejected, disabled) or null for an unknown computer, and returns null. An unknown secret (its
-   * account or device was deleted or reset) is forgotten, so this browser registers again with a fresh one.
+   * account or device was deleted or reset) is forgotten, so this browser registers again with a fresh one; nothing
+   * else ever drops it. Accepted but no session afterwards (the browser did not keep the cookie) → code no_session.
    */
   async deviceSignIn() {
     try {
       await api.post('/api/auth/device', { device: deviceCredential() }, { quiet: true });
-      const { user, capabilities } = await api.get('/api/auth/me', { quiet: true });
-      storage((s) => s.removeItem(SIGNED_OUT_KEY));
-      set({ me: user, capabilities, device: null });
-      return user;
     } catch (e) {
       if (e.status === 403 && e.code) set({ me: null, device: { code: e.code, message: e.message, username: e.user?.username, team: e.user?.team || null } });
       else if (e.status === 400 || e.status === 401) {
@@ -156,6 +154,17 @@ export const useStore = create((set, get) => ({
         set({ device: null });
       }
       else throw e;
+      return null;
+    }
+    try {
+      const { user, capabilities } = await api.get('/api/auth/me', { quiet: true });
+      storage((s) => s.removeItem(SIGNED_OUT_KEY));
+      set({ me: user, capabilities, device: null });
+      return user;
+    } catch (e) {
+      if (e.status !== 401) throw e; // server unreachable: the caller retries
+      // The device was accepted, so the secret is good: the session cookie it was given did not come back.
+      set({ me: null, device: { code: 'no_session', message: NO_SESSION } });
       return null;
     }
   },

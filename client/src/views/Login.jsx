@@ -57,7 +57,12 @@ export function Login() {
   };
 
   const register = run('signup', async () => {
-    const r = await api.post('/api/auth/signup', { username: f.username.trim(), device: deviceCredential() }, { quiet: true });
+    const r = await api.post('/api/auth/signup', { username: f.username.trim(), device: deviceCredential() }, { quiet: true }).catch(async (e) => {
+      // This browser's secret already belongs to an account: sign that in (or show why not) instead of a dead end.
+      if (e.code === 'device_taken' && (await deviceSignIn() || useStore.getState().device)) return null;
+      throw e;
+    });
+    if (!r) return;
     if (r.pending) useStore.setState({ device: { code: 'pending', username: r.user.username, team: r.user.team } });
     else await loadMe(); // the first account: the administrator, signed in
   });
@@ -75,7 +80,7 @@ export function Login() {
       <Card>
         <div className="flex flex-col items-center text-center gap-3 py-2">
           <span className="size-11 rounded-full bg-bad-soft text-bad flex items-center justify-center"><Ban size={20} /></span>
-          <h1 className="font-semibold text-[1.02rem]">{refused.code === 'disabled' ? 'Account disabled' : refused.code === 'rejected' ? 'Registration rejected' : 'Sign-in refused'}</h1>
+          <h1 className="font-semibold text-[1.02rem]">{refused.code === 'disabled' ? 'Account disabled' : refused.code === 'rejected' ? 'Registration rejected' : refused.code === 'no_session' ? 'Session not kept' : 'Sign-in refused'}</h1>
           <p role="alert" className="text-xs text-subtle">{refused.username ? <><b className="text-fg">{refused.username}</b>: </> : null}{refused.message}</p>
         </div>
         {error && <div role="alert" className="text-xs text-bad bg-bad-soft rounded-md px-2.5 py-2">{error}</div>}
@@ -98,6 +103,12 @@ export function Login() {
             : mode === 'password' ? 'For accounts that have a password. Your account is then bound to this computer.'
               : 'Choose a username. Your account is bound to this computer and becomes usable once the administrator approves it.'}
         </p>
+        {!setup && !known && mode === 'signup' && (
+          <p className="text-xs text-subtle">
+            Registered before? This browser has no device key for <b className="text-fg">{globalThis.location?.host}</b>: open AgentForge at the
+            address and in the browser profile you registered with, or ask the administrator to reset your device.
+          </p>
+        )}
       </div>
       {refused && <div role="alert" className="text-xs text-bad bg-bad-soft rounded-md px-2.5 py-2">{refused.username ? <><b>{refused.username}</b>: </> : null}{refused.message}</div>}
       <form onSubmit={mode === 'password' ? passwordLogin : register} className="flex flex-col gap-3">

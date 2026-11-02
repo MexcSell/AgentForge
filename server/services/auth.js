@@ -143,7 +143,10 @@ export function signup({ username, device, team } = {}) {
     if (owner) throw fail(409, `This computer is already registered as ${owner.username}.`, { code: 'device_taken' });
     const existing = await byName(username);
     if (existing && !(existing.role !== 'admin' && !existing.password_hash && !existing.device_secret_hash && !existing.device && existing.status !== 'disabled')) {
-      throw fail(409, 'That username is already registered', { code: 'username_taken' });
+      // Usually the owner on another address or browser profile, whose device key (localStorage) is per origin.
+      throw fail(409, existing.device_secret_hash
+        ? 'That username is already registered on another computer or browser. If it is yours, open AgentForge at the address and in the browser profile you registered with, or ask the administrator to reset your device.'
+        : 'That username is already registered', { code: 'username_taken' });
     }
     if (existing) { // re-registration after a device reset
       await query(`DELETE FROM sessions WHERE user_id = $1`, [existing.id]);
