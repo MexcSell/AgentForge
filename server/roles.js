@@ -22,6 +22,8 @@ export const ROLES = {
   ai: { title: 'AI Engineer', tier: 3, department: 'Engineering', access: 'write', skills: ['llm', 'prompting', 'agents'] },
   devops: { title: 'DevOps Engineer', tier: 3, department: 'Operations', access: 'write', skills: ['linux', 'git', 'ci', 'docker'] },
   research: { title: 'Research Analyst', tier: 3, department: 'Research', access: 'read', skills: ['research', 'analysis', 'comparison'] },
+  // Created automatically for each new Bittensor competition (server/services/bittensor.js); the user calls it "Mino".
+  miner: { title: 'Mino', tier: 3, department: 'Bittensor', access: 'write', skills: ['bittensor', 'python', 'machine-learning'] },
   docs: { title: 'Technical Writer', tier: 3, department: 'Product', access: 'write', skills: ['markdown', 'documentation'] },
   qa: { title: 'QA Engineer', tier: 4, department: 'Verification', access: 'write', skills: ['testing', 'e2e', 'regression'] },
   security: { title: 'Security Auditor', tier: 4, department: 'Verification', access: 'read', skills: ['owasp', 'threat-modeling', 'secrets'] },
@@ -44,6 +46,7 @@ const ALIASES = [
   [/\bml\b|\bai\b|llm|prompt eng/i, 'ai'],
   [/devops|deploy|infra|\bops\b|\bci\b|release/i, 'devops'],
   [/research|investigat/i, 'research'],
+  [/\bmin(er|o)\b|bittensor/i, 'miner'],
   [/\bdocs?\b|documentation|writer|readme/i, 'docs'],
   [/architect|\bcto\b/i, 'architect'],
   [/manag|\bpm\b|coordinat/i, 'manager'],

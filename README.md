@@ -49,6 +49,26 @@ Command-window slash commands: `/standup` (coordination meeting), `/sync` (push 
 
 The AgentForge project itself is registered as a protected, undeletable project, so agents can develop this platform. Their changes are pushed and the service restarts itself safely.
 
+## Bittensor competitions
+
+The server can watch a Bittensor network for new subnets (competitions). For each new one it shows a notification, lists the competition on the Dashboard (**Bittensor competitions**), creates one agent with role `miner` (title **Mino**) and a task describing the competition, and then runs the submission step. The watcher stays off until you configure it. With no config file, an empty one or `"enabled": false`, it only logs `[bittensor] watcher inert: …`. Nothing from these files is committed: `config/bittensor.json` and `config/bittensor.secrets.json` are in `.gitignore`.
+
+1. **Settings:** `cp config/bittensor.example.json config/bittensor.json`, then set `"enabled": true`.
+   - `network`: `finney`, `test` or `local`. `endpoint` defaults to the network's public entrypoint (`ws://` and `wss://` URLs are also accepted).
+   - `sources`: any of `rpc` (chain state over JSON-RPC, the default), `sdk` (`scripts/bittensor/list_subnets.py`, which needs `pip install bittensor`), `feed` (`feed.url` returning a JSON array of `{ id?, netuid?, name?, registered_block? }`) and `file` (the same JSON from `file.path`).
+   - `pollIntervalSec`: at least 30.
+   - `subnets.include` / `subnets.exclude`: lists of netuids.
+   - `baselineOnFirstRun`: when true (the default), the subnets that already exist on the first poll are recorded without starting agents.
+   The file is re-read on every poll, so you don't need to restart the server after editing it.
+2. **Keys:** `cp config/bittensor.secrets.example.json config/bittensor.secrets.json`, then fill in `wallet.name` and `wallet.hotkey`. These two are required to submit. You can also set `wallet.path`, `coldkeyPath`, `coldkeyPassword` and `coldkeyMnemonic`, plus `apiKeys.feed`, which is sent as a Bearer token to the feed. Secret values are passed to the submit command only through `BT_*` environment variables, and they are redacted from stored output.
+3. **Auto-submit:** set `"autoSubmit": true` **and** `"dryRun": false` in `config/bittensor.json`.
+   - Submission runs only when enabled, autoSubmit, !dryRun and keys are all in place. Otherwise each competition records `would submit (dry-run)` together with the reason.
+   - The command is `submit.command`. The default, `scripts/bittensor/submit.sh`, registers the hotkey with `btcli subnets register`. **Registration burns TAO.** Check the cost before you arm it.
+   - Each competition gets one run. A run cut short by a restart is recorded as failed and is not retried automatically.
+   - The result (`dry-run`, `submitted` or `failed`, with the output) is shown on the Dashboard card.
+
+The API is `GET /api/bittensor` (watcher status and competitions; the status never includes secrets) and `POST /api/bittensor/poll` (poll now).
+
 ## Layout
 
 ```
@@ -63,5 +83,6 @@ client/src/
   views/                Dashboard, projects (command window, agent rail), agents, files, Models, GitHub, Settings
   components/           shell, split panes, modal, context menu, charts, markdown
   lib/                  store (zustand), live events, 22 screen-format presets, dynamic favicon
-scripts/                supervisor.js, dev.js
+config/                 *.example.json templates (real bittensor config/keys are gitignored)
+scripts/                supervisor.js, dev.js, bittensor/ (SDK subnet lister, submit placeholder)
 ```

@@ -93,6 +93,7 @@ export const useStore = create((set, get) => ({
   loadedRuns: {}, // { [topicId]: true } — already running when loadTopics fetched it; no mission:update seen since
   live: {},
   previews: {}, // { [projectId]: { status, mode, command, port, url, startedAt, exitCode, error, log: string[] } }
+  bittensor: null, // { status, competitions } — GET /api/bittensor, kept live by bittensor:status / bittensor:competition
   syncTick: 0,
   evolutionTick: 0,
   clientUpdate: null,
@@ -118,6 +119,11 @@ export const useStore = create((set, get) => ({
     if (!projects.some((p) => p.id === get().activeProjectId)) s.activeProjectId = projects[0]?.id || null;
     set(s);
     savePrefs(get());
+  },
+
+  async loadBittensor() {
+    const data = await api.get('/api/bittensor', { quiet: true });
+    set({ bittensor: data });
   },
 
   /** Loads the project's topics (and tasks) and picks the active topic: the saved one if it still exists, else the first. */
@@ -355,6 +361,15 @@ export const useStore = create((set, get) => ({
         set({ notifications: st.notifications.map((n) => (p.ids === 'all' || p.ids.includes(n.id) ? { ...n, read: true } : n)) });
         break;
       case 'notification:delete': set({ notifications: st.notifications.filter((n) => n.id !== p.id) }); break;
+      case 'bittensor:status':
+        set({ bittensor: { competitions: [], ...st.bittensor, status: p } });
+        break;
+      case 'bittensor:competition': {
+        const list = st.bittensor?.competitions || [];
+        const next = list.some((c) => c.id === p.id) ? list.map((c) => (c.id === p.id ? p : c)) : [p, ...list];
+        set({ bittensor: { status: null, ...st.bittensor, competitions: p.status === 'baseline' ? list : next } });
+        break;
+      }
       case 'models:update': set({ models: p }); break;
       case 'settings:update': set({ settings: { ...st.settings, [p.key]: p.value } }); break;
       case 'preview:update': {

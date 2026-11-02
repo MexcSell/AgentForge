@@ -18,6 +18,8 @@ import { busyState, recoverInterrupted } from './orchestrator/engine.js';
 import apiRoutes from './routes/api.js';
 import filesRoutes from './routes/files.js';
 import previewRoutes, { previewHook } from './routes/preview.js';
+import bittensorRoutes from './routes/bittensor.js';
+import { createWatcher } from './services/bittensor.js';
 
 const startedAt = new Date();
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
@@ -122,6 +124,9 @@ await app.register(apiRoutes, {
 });
 await app.register(filesRoutes);
 await app.register(previewRoutes);
+// Bittensor competition watcher: inert until config/bittensor.json enables it; only the real server polls.
+const btWatcher = createWatcher();
+await app.register(bittensorRoutes, { watcher: btWatcher });
 
 await app.register(fastifyStatic, { root: config.uploadsDir, prefix: '/uploads/', decorateReply: false });
 if (fs.existsSync(config.clientDist)) {
@@ -149,6 +154,7 @@ const pushStatus = async () => emit('system:status', await systemStatus());
 if (!config.candidate) {
   setInterval(() => pushStatus().catch(() => {}), 15000).unref();
   if (config.supervised) process.send({ type: 'ready', port: config.port });
+  btWatcher.start().catch((e) => console.warn('[bittensor] watcher failed to start:', e.message));
 }
 
 process.on('message', async (msg) => {
@@ -181,6 +187,7 @@ async function shutdown(reason) {
   syncMetrics();
   killAllTerminals();
   await killAllPreviews();
+  await btWatcher.stop();
   await app.close().catch(() => {});
   await pool.end().catch(() => {});
   process.exit(0);

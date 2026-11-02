@@ -356,3 +356,36 @@ BEGIN
   GET DIAGNOSTICS n = ROW_COUNT;
   INSERT INTO audit_logs(actor, action, target, detail) VALUES ('system', 'migrate.project-members', 'project_members', jsonb_build_object('members', n));
 END $$;
+
+-- Bittensor competition watcher (server/services/bittensor.js). One row per competition (a subnet registration, or a
+-- feed entry) the watcher has seen on a network; the unique key makes detection idempotent across restarts.
+-- status: baseline (already there on the first poll, never acted on) | ignored (outside the subnet filter) |
+-- detected → staffing → staffed (its miner agent and task exist). submit_status: pending → running → dry-run |
+-- submitted | failed; NULL when no submission applies.
+CREATE TABLE IF NOT EXISTS bt_competitions (
+  id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  network           text NOT NULL,
+  source            text NOT NULL,
+  external_id       text NOT NULL,
+  netuid            int,
+  name              text,
+  registered_block  bigint,
+  detail            jsonb NOT NULL DEFAULT '{}',
+  status            text NOT NULL DEFAULT 'detected',
+  agent_id          uuid REFERENCES agents(id) ON DELETE SET NULL,
+  task_id           uuid REFERENCES tasks(id) ON DELETE SET NULL,
+  submit_status     text,
+  submit_output     text,
+  submitted_at      timestamptz,
+  detected_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at        timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (network, external_id)
+);
+CREATE INDEX IF NOT EXISTS bt_competitions_detected_idx ON bt_competitions(detected_at DESC);
+-- (network, source) pairs whose existing competitions were recorded as baseline on their first successful poll.
+CREATE TABLE IF NOT EXISTS bt_watch_state (
+  network       text NOT NULL,
+  source        text NOT NULL,
+  baselined_at  timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (network, source)
+);

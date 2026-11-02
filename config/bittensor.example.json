@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "network": "finney",
+  "endpoint": "",
+  "pollIntervalSec": 300,
+  "sources": ["rpc"],
+  "feed": { "url": "" },
+  "file": { "path": "" },
+  "sdk": { "python": "python3", "script": "scripts/bittensor/list_subnets.py" },
+  "subnets": { "include": [], "exclude": [] },
+  "baselineOnFirstRun": true,
+  "autoSubmit": false,
+  "dryRun": true,
+  "submit": { "command": ["bash", "scripts/bittensor/submit.sh"], "timeoutSec": 900 }
+}

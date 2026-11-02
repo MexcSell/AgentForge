@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   Bell, BellRing, CheckCheck, FolderKanban, Bot, ListChecks, Coins, Activity, Megaphone, Send, Trash2, Server, Crown, Workflow,
-  CircleCheck, CircleX, TriangleAlert, Info, Trophy, Cpu, HeartPulse, RefreshCw, Clock, Zap, ShieldCheck, Hammer,
+  CircleCheck, CircleX, TriangleAlert, Info, Trophy, Cpu, HeartPulse, RefreshCw, Clock, Zap, ShieldCheck, Hammer, Pickaxe,
 } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { useStore, selectUnread } from '../lib/store.js';
 import { timeAgo, compact, usd, duration, bytes, dateTime } from '../lib/format.js';
 import { Split } from '../components/Split.jsx';
+import { BittensorCompetitions, BittensorState } from './Bittensor.jsx';
 import { ThroughputChart, Sparkline, StatusBar as TaskStatusBar } from '../components/charts.jsx';
 import { cx, Badge, Button, IconButton, Input, PanelHeader, Tabs, StatusDot, AgentAvatar, Empty, Select, Meter, STATUS_TONE } from '../components/ui.jsx';
 
@@ -201,6 +202,10 @@ export default function Dashboard({ layout }) {
             </Card>
           </div>
         </div>
+
+        <Card title="Bittensor competitions" icon={Pickaxe} right={<BittensorState />}>
+          <BittensorCompetitions />
+        </Card>
       </div>
     </div>
   );

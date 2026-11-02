@@ -23,6 +23,7 @@ export function connectEvents() {
     for (const pid of Object.keys(st.topics)) reloadProject(pid).catch(() => {});
     for (const pid of Object.keys(st.previews)) st.loadPreview(pid).catch(() => {});
     for (const pid of Object.keys(st.members)) st.loadMembers(pid).catch(() => {});
+    if (st.bittensor) st.loadBittensor().catch(() => {});
   };
   socket.onmessage = (e) => {
     try {

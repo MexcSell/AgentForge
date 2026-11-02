@@ -18,3 +18,9 @@ coverage/
 
 # added by AgentForge (source-only uploads)
 build/
+
+# Bittensor watcher: real config and keys stay local (commit only the *.example.json templates)
+config/bittensor.json
+config/bittensor.secrets.json
+config/*.secrets.json
+!config/*.example.json
