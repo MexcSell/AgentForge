@@ -89,6 +89,7 @@ before(async () => {
   ({ AgentRail } = await loader.load('/src/views/projects/AgentRail.jsx'));
   ({ Toasts: ToastsHost } = await loader.load('/src/components/Shell.jsx'));
   INIT = { ...useStore.getState() };
+  useStore.setState({ me: { id: 'u-admin', username: 'owner', role: 'admin', status: 'active', permissions: {} } }); // ws.js connects only when signed in
   globalThis.__connect();
 });
 

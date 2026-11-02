@@ -389,3 +389,34 @@ CREATE TABLE IF NOT EXISTS bt_watch_state (
   baselined_at  timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (network, source)
 );
+
+-- User accounts (services/auth.js, docs/users.md). status: pending (signed up, waiting for the administrator) → active,
+-- or rejected; active ↔ disabled. role 'admin' is the owner: the first account when none exists, or AF_ADMIN_USERNAME.
+-- permissions: { projects: uuid[], createProjects, runMissions, manageAgents, manageSettings } (services/access.js).
+-- device: SHA-256 hashes of the sign-up computer's characteristics, one per component (never an IP address);
+-- NULL once the administrator resets it, and bound again at the next login.
+CREATE TABLE IF NOT EXISTS users (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  username        text NOT NULL,
+  password_hash   text NOT NULL,
+  role            text NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
+  status          text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'active', 'disabled', 'rejected')),
+  team            text,
+  permissions     jsonb NOT NULL DEFAULT '{}',
+  device          jsonb,
+  device_bound_at timestamptz,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  updated_at      timestamptz NOT NULL DEFAULT now(),
+  approved_at     timestamptz,
+  last_login_at   timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_key ON users (lower(username));
+-- Signed-in browsers: the httpOnly cookie holds a random token, only its SHA-256 is stored. Survives restarts.
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash    text PRIMARY KEY,
+  user_id       uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  last_seen_at  timestamptz NOT NULL DEFAULT now(),
+  expires_at    timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);

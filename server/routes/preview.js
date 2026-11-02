@@ -54,7 +54,7 @@ export default async function previewRoutes(app) {
  * (/assets/app.js, /favicon.ico…, recognised by the Referer) to that preview. Anything else falls through.
  */
 export function previewHook(req, reply, done) {
-  const target = previewTarget(req.raw);
+  const target = req.raw.afPreview !== undefined ? req.raw.afPreview : previewTarget(req.raw); // the auth hook resolved it already
   if (!target) return done();
   reply.hijack();
   done();
@@ -66,7 +66,7 @@ export function previewHook(req, reply, done) {
   });
 }
 
-function previewTarget(raw) {
+export function previewTarget(raw) {
   const m = PREVIEW_URL.exec(raw.url);
   if (m) return { id: m[1], rest: m[2], query: m[3] || '' };
   const id = refererPreview(raw);

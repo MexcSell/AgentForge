@@ -162,7 +162,7 @@ async function executeRun({ kind, agent, project, mission, task, model, prompt, 
     throw err;
   } finally {
     liveRuns.delete(run.id);
-    emit('run:end', { id: run.id, agent_id: agent.id });
+    emit('run:end', { id: run.id, agent_id: agent.id, project_id: project.id });
     publishModels().catch(() => {});
   }
 }

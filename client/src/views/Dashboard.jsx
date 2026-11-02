@@ -8,6 +8,7 @@ import { useStore, selectUnread } from '../lib/store.js';
 import { timeAgo, compact, usd, duration, bytes, dateTime } from '../lib/format.js';
 import { Split } from '../components/Split.jsx';
 import { BittensorCompetitions, BittensorState } from './Bittensor.jsx';
+import { isAdmin } from '../lib/access.js';
 import { ThroughputChart, Sparkline, StatusBar as TaskStatusBar } from '../components/charts.jsx';
 import { cx, Badge, Button, IconButton, Input, PanelHeader, Tabs, StatusDot, AgentAvatar, Empty, Select, Meter, STATUS_TONE } from '../components/ui.jsx';
 
@@ -89,13 +90,13 @@ function Notifications() {
           );
         })}
       </div>
-      <div className="p-2.5 border-t border-line flex gap-2">
+      {isAdmin(st.me) && <div className="p-2.5 border-t border-line flex gap-2">
         <Select value={level} onChange={(e) => setLevel(e.target.value)} className="w-24 shrink-0" aria-label="Level">
           <option value="info">Info</option><option value="success">Success</option><option value="warning">Warning</option><option value="error">Critical</option>
         </Select>
         <Input className="flex-1" icon={Megaphone} placeholder="Post a notice as admin…" value={compose} onChange={(e) => setCompose(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && post()} />
         <IconButton icon={Send} label="Post" onClick={post} disabled={!compose.trim()} />
-      </div>
+      </div>}
     </div>
   );
 }
@@ -203,9 +204,11 @@ export default function Dashboard({ layout }) {
           </div>
         </div>
 
-        <Card title="Bittensor competitions" icon={Pickaxe} right={<BittensorState />}>
-          <BittensorCompetitions />
-        </Card>
+        {isAdmin(st.me) && (
+          <Card title="Bittensor competitions" icon={Pickaxe} right={<BittensorState />}>
+            <BittensorCompetitions />
+          </Card>
+        )}
       </div>
     </div>
   );

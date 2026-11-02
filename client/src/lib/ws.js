@@ -12,7 +12,11 @@ async function reloadProject(pid) {
   await Promise.all((st.topics[pid] || []).filter((t) => t.id === active || st.messages[t.id]).map((t) => st.loadMessages(pid, t.id)));
 }
 
+// Only while signed in to an active account: the server refuses the socket otherwise (401 / 403).
+const signedIn = () => useStore.getState().me?.status === 'active';
+
 export function connectEvents() {
+  if (!signedIn() || (socket && socket.readyState <= 1)) return;
   const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`;
   socket = new WebSocket(url);
   socket.onopen = () => {
@@ -31,9 +35,22 @@ export function connectEvents() {
       useStore.getState().applyEvent(type, payload);
     } catch { /* ignore */ }
   };
-  socket.onclose = () => {
+  socket.onclose = (e) => {
     useStore.getState().set({ connected: false });
-    setTimeout(connectEvents, RETRY_MS);
+    socket = null;
+    // 4401: the account was disabled, rejected or deleted. A refused reconnect (session expired) finds out via the API.
+    if (e.code === 4401) return useStore.getState().signedOut();
+    setTimeout(() => {
+      if (!signedIn()) return;
+      useStore.getState().loadMe().then(() => connectEvents()).catch(() => connectEvents());
+    }, RETRY_MS);
   };
-  socket.onerror = () => socket.close();
+  socket.onerror = () => socket?.close();
+}
+
+export function disconnectEvents() {
+  const s = socket;
+  socket = null;
+  if (s) { s.onclose = null; s.close(); }
+  useStore.getState().set({ connected: false });
 }

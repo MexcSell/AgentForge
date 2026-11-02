@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { FolderKanban, Plus, Lock, Trash2, Pencil, FolderOpen, Copy, Bot, X, CheckSquare, Square, Loader2 } from 'lucide-react';
 import { api } from '../../lib/api.js';
 import { useStore, selectWorkingAgents } from '../../lib/store.js';
+import { can } from '../../lib/access.js';
 import { toast } from '../../lib/toast.js';
 import { copyText, timeAgo } from '../../lib/format.js';
 import { GithubMark } from '../../lib/icons.jsx';
@@ -119,7 +120,7 @@ function ProjectList() {
         <span className="text-[0.72rem] font-semibold uppercase tracking-wider text-muted">Projects</span>
         <div className="ml-auto flex items-center gap-0.5">
           <IconButton icon={selectMode ? CheckSquare : Square} label="Multi-select" active={selectMode} onClick={() => { setSelectMode(!selectMode); setSel(new Set()); }} />
-          <IconButton icon={Plus} label="New project" onClick={() => st.set({ createProject: true })} />
+          {can(st.me, 'createProjects') && <IconButton icon={Plus} label="New project" onClick={() => st.set({ createProject: true })} />}
         </div>
       </div>
       <div className="grid grid-cols-2 gap-2 p-2.5 border-b border-line shrink-0">
@@ -177,7 +178,7 @@ function ProjectList() {
             </div>
           );
         })}
-        {!st.projects.length && <Empty icon={FolderKanban} title="No projects" action={<Button variant="primary" icon={Plus} onClick={() => st.set({ createProject: true })}>New project</Button>} />}
+        {!st.projects.length && <Empty icon={FolderKanban} title="No projects" action={can(st.me, 'createProjects') && <Button variant="primary" icon={Plus} onClick={() => st.set({ createProject: true })}>New project</Button>} />}
       </div>
       <div className="px-3 py-2 border-t border-line text-[0.66rem] text-subtle shrink-0">Ctrl/⇧-click to multi-select · F2 rename · Del delete</div>
       <Confirm open={!!confirm} {...confirm} danger confirmLabel="Delete" onClose={() => setConfirm(null)} />
@@ -200,7 +201,7 @@ export default function Projects({ layout }) {
   const L = layout.project;
   const nodes = {
     list: { id: 'list', size: L.sizes.list ?? 20, min: 12, node: <ProjectList /> },
-    chat: { id: 'chat', size: L.sizes.chat ?? 55, min: 25, node: project ? <CommandWindow project={project} /> : <Empty icon={FolderKanban} title="Select or create a project" action={<Button variant="primary" icon={Plus} onClick={() => st.set({ createProject: true })}>New project</Button>} /> },
+    chat: { id: 'chat', size: L.sizes.chat ?? 55, min: 25, node: project ? <CommandWindow project={project} /> : <Empty icon={FolderKanban} title="Select or create a project" action={can(st.me, 'createProjects') && <Button variant="primary" icon={Plus} onClick={() => st.set({ createProject: true })}>New project</Button>} /> },
     agents: { id: 'agents', size: L.sizes.agents ?? 25, min: 14, node: project ? <AgentRail project={project} /> : <div /> },
   };
   return (

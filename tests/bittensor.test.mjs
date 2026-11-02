@@ -18,7 +18,7 @@ pool.query = (text, params) => client.query(text, params);
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'af-bt-test-'));
 const events = [];
-addClient({ readyState: 1, send: (m) => events.push(JSON.parse(m)), on() {} });
+addClient({ readyState: 1, send: (m) => events.push(JSON.parse(m)), on() {} }, { role: 'admin', status: 'active' }); // an admin socket sees every event
 const logs = [];
 const log = { log: (m) => logs.push(m), warn: (m) => logs.push(m) };
 

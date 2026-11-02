@@ -18,6 +18,8 @@ import { disposePreview } from '../services/runner.js';
 import { listModels, publishModels, PROVIDERS, runModel, recordRunUsage } from '../models/index.js';
 import { submitCommand, cancelMission, standup, syncNow, approveProposal, rejectProposal, handOver, previewHandOver } from '../orchestrator/engine.js';
 import { evolutionOverview, analyzeMission } from '../orchestrator/evolution.js';
+import { can, canSeeProject, grantedProjects } from '../services/access.js';
+import { grantProject } from '../services/auth.js';
 
 const err = (reply, code, message) => reply.code(code).send({ error: message });
 
@@ -37,7 +39,8 @@ const gmMergeTarget = async (p) => (p.merge_id ? liveAncestor(await getAgent(p.m
 // opts.onSettingsChange(key, value) lets the server react to a saved setting without a restart.
 export default async function apiRoutes(app, opts = {}) {
   // ---- projects ----------------------------------------------------------
-  app.get('/api/projects', () => listProjects());
+  // Every route is behind routes/auth.js POLICY; lists here are narrowed to what req.user may see.
+  app.get('/api/projects', async (req) => (await listProjects()).filter((p) => canSeeProject(req.user, p.id)));
 
   // Read-only preview of POST /api/projects/delete: where the pending work its GMs have in other projects' missions
   // would go. ?ids=<uuid>,<uuid>; protected and unknown projects are skipped, as the delete refuses or ignores them.
@@ -66,7 +69,8 @@ export default async function apiRoutes(app, opts = {}) {
     if (github_url && !/^(https:\/\/|git@)[\w.@:/~-]+$/.test(github_url.trim())) return err(reply, 400, 'GitHub URL looks invalid');
     const p = await createProjectRecord({ name: name.trim(), path: dir.trim().replace(/^~(?=$|\/)/, process.env.HOME || '/root'), github_url: github_url?.trim(), description: description?.trim() });
     await notify({ source_type: 'admin', source_name: 'Admin', project_id: p.id, level: 'success', title: `Project created · ${p.name}`, body: `${p.manager_name} assigned as General Manager` });
-    await audit('user', 'project.create', p.name);
+    await audit(req.user?.username || 'user', 'project.create', p.name);
+    if (req.user) await grantProject(req.user, p.id);
     return p;
   });
 
@@ -218,7 +222,14 @@ export default async function apiRoutes(app, opts = {}) {
 
   // ---- agents ------------------------------------------------------------
   app.get('/api/roles', () => ({ roles: ROLES, tiers: TIERS }));
-  app.get('/api/agents', () => listAgents());
+  // Without the agent registry permission: only the agents on the user's projects (members and GMs), for the Team views.
+  app.get('/api/agents', async (req) => {
+    const all = await listAgents();
+    if (!req.user || can(req.user, 'manageAgents')) return all;
+    const ids = new Set((await many(`SELECT agent_id AS id FROM project_members WHERE project_id = ANY($1)
+      UNION SELECT manager_id FROM projects WHERE id = ANY($1) AND manager_id IS NOT NULL`, [grantedProjects(req.user)])).map((r) => r.id));
+    return all.filter((a) => ids.has(a.id));
+  });
 
   app.get('/api/agents/:id', async (req, reply) => {
     const a = await getAgent(req.params.id);
@@ -400,9 +411,11 @@ export default async function apiRoutes(app, opts = {}) {
   });
 
   // ---- notifications -----------------------------------------------------
+  // Non-admins see only notifications of their projects ($2: their grants; NULL for an admin = all).
   app.get('/api/notifications', async (req) => many(
-    `SELECT n.*, p.name AS project_name FROM notifications n LEFT JOIN projects p ON p.id = n.project_id ORDER BY n.created_at DESC LIMIT $1`,
-    [Math.min(500, Number(req.query.limit) || 150)]));
+    `SELECT n.*, p.name AS project_name FROM notifications n LEFT JOIN projects p ON p.id = n.project_id
+     WHERE $2::uuid[] IS NULL OR n.project_id = ANY($2) ORDER BY n.created_at DESC LIMIT $1`,
+    [Math.min(500, Number(req.query.limit) || 150), req.user ? grantedProjects(req.user) : null]));
   app.post('/api/notifications', async (req, reply) => {
     const { title, body, level = 'info', project_id = null } = req.body || {};
     if (!title?.trim()) return err(reply, 400, 'Title is required');
@@ -410,6 +423,14 @@ export default async function apiRoutes(app, opts = {}) {
   });
   app.post('/api/notifications/read', async (req) => {
     const ids = req.body?.ids;
+    const grants = req.user ? grantedProjects(req.user) : null;
+    if (grants) {
+      // A non-admin marks only notifications it can see; the event names exactly those.
+      const rows = await many(`UPDATE notifications SET read = true WHERE NOT read AND project_id = ANY($1)${ids?.length ? ' AND id = ANY($2)' : ''} RETURNING id`,
+        ids?.length ? [grants, ids] : [grants]);
+      emit('notification:read', { ids: rows.map((r) => r.id) });
+      return { ok: true };
+    }
     if (ids?.length) await query(`UPDATE notifications SET read = true WHERE id = ANY($1)`, [ids]);
     else await query(`UPDATE notifications SET read = true WHERE NOT read`);
     emit('notification:read', { ids: ids || 'all' });
@@ -467,31 +488,35 @@ export default async function apiRoutes(app, opts = {}) {
   });
 
   // ---- dashboard ---------------------------------------------------------
-  app.get('/api/dashboard', async () => {
+  // $1: the user's granted projects (NULL for an admin = everything); agents count when on one of them.
+  app.get('/api/dashboard', async (req) => {
+    const g = [req.user ? grantedProjects(req.user) : null];
+    const inP = (col) => `($1::uuid[] IS NULL OR ${col} = ANY($1))`;
+    const inA = (col) => `($1::uuid[] IS NULL OR ${col} IN (SELECT agent_id FROM project_members WHERE project_id = ANY($1) UNION SELECT manager_id FROM projects WHERE id = ANY($1)))`;
     const [counts, activity, leaders, throughput, statusDist] = await Promise.all([
       one(`SELECT
-        (SELECT count(*)::int FROM projects) AS projects,
-        (SELECT count(*)::int FROM projects WHERE status = 'running') AS projects_running,
-        (SELECT count(*)::int FROM agents WHERE NOT archived) AS agents,
-        (SELECT count(*)::int FROM agents WHERE status = 'working') AS agents_working,
-        (SELECT count(*)::int FROM tasks WHERE status = 'done' AND finished_at >= date_trunc('day', now())) AS tasks_done_today,
-        (SELECT count(*)::int FROM tasks WHERE status = 'failed' AND finished_at >= date_trunc('day', now())) AS tasks_failed_today,
-        (SELECT count(*)::int FROM tasks WHERE status = 'running') AS tasks_running,
-        (SELECT count(*)::int FROM tasks WHERE status = 'proposed') AS proposals,
-        (SELECT coalesce(sum(input_tokens + output_tokens),0) FROM runs WHERE created_at >= date_trunc('day', now())) AS tokens_today,
-        (SELECT coalesce(sum(cost_usd),0) FROM runs WHERE created_at >= now() - interval '7 days') AS cost_week,
-        (SELECT count(*)::int FROM notifications WHERE NOT read) AS unread`),
+        (SELECT count(*)::int FROM projects WHERE ${inP('id')}) AS projects,
+        (SELECT count(*)::int FROM projects WHERE status = 'running' AND ${inP('id')}) AS projects_running,
+        (SELECT count(*)::int FROM agents WHERE NOT archived AND ${inA('id')}) AS agents,
+        (SELECT count(*)::int FROM agents WHERE status = 'working' AND ${inA('id')}) AS agents_working,
+        (SELECT count(*)::int FROM tasks WHERE status = 'done' AND finished_at >= date_trunc('day', now()) AND ${inP('project_id')}) AS tasks_done_today,
+        (SELECT count(*)::int FROM tasks WHERE status = 'failed' AND finished_at >= date_trunc('day', now()) AND ${inP('project_id')}) AS tasks_failed_today,
+        (SELECT count(*)::int FROM tasks WHERE status = 'running' AND ${inP('project_id')}) AS tasks_running,
+        (SELECT count(*)::int FROM tasks WHERE status = 'proposed' AND ${inP('project_id')}) AS proposals,
+        (SELECT coalesce(sum(input_tokens + output_tokens),0) FROM runs WHERE created_at >= date_trunc('day', now()) AND ${inP('project_id')}) AS tokens_today,
+        (SELECT coalesce(sum(cost_usd),0) FROM runs WHERE created_at >= now() - interval '7 days' AND ${inP('project_id')}) AS cost_week,
+        (SELECT count(*)::int FROM notifications WHERE NOT read AND ${inP('project_id')}) AS unread`, g),
       many(`SELECT m.id, m.command, m.status, m.created_at, m.finished_at, p.name AS project_name, p.id AS project_id,
               (SELECT count(*)::int FROM tasks t WHERE t.mission_id = m.id) AS tasks,
               (SELECT count(*)::int FROM tasks t WHERE t.mission_id = m.id AND t.status = 'done') AS done
-            FROM missions m JOIN projects p ON p.id = m.project_id ORDER BY m.created_at DESC LIMIT 12`),
-      many(`SELECT id, name, role, title, level, xp, status, stats FROM agents WHERE NOT archived ORDER BY xp DESC, level DESC LIMIT 6`),
+            FROM missions m JOIN projects p ON p.id = m.project_id WHERE ${inP('p.id')} ORDER BY m.created_at DESC LIMIT 12`, g),
+      many(`SELECT id, name, role, title, level, xp, status, stats FROM agents WHERE NOT archived AND ${inA('id')} ORDER BY xp DESC, level DESC LIMIT 6`, g),
       many(`SELECT to_char(d, 'MM-DD') AS day,
-              (SELECT count(*)::int FROM tasks t WHERE t.status='done' AND t.finished_at >= d AND t.finished_at < d + interval '1 day') AS done,
-              (SELECT count(*)::int FROM tasks t WHERE t.status='failed' AND t.finished_at >= d AND t.finished_at < d + interval '1 day') AS failed,
-              (SELECT coalesce(sum(input_tokens + output_tokens),0) FROM runs r WHERE r.created_at >= d AND r.created_at < d + interval '1 day') AS tokens
-            FROM generate_series(date_trunc('day', now()) - interval '13 days', date_trunc('day', now()), interval '1 day') d ORDER BY d`),
-      many(`SELECT status, count(*)::int AS n FROM tasks GROUP BY status`),
+              (SELECT count(*)::int FROM tasks t WHERE t.status='done' AND t.finished_at >= d AND t.finished_at < d + interval '1 day' AND ${inP('t.project_id')}) AS done,
+              (SELECT count(*)::int FROM tasks t WHERE t.status='failed' AND t.finished_at >= d AND t.finished_at < d + interval '1 day' AND ${inP('t.project_id')}) AS failed,
+              (SELECT coalesce(sum(input_tokens + output_tokens),0) FROM runs r WHERE r.created_at >= d AND r.created_at < d + interval '1 day' AND ${inP('r.project_id')}) AS tokens
+            FROM generate_series(date_trunc('day', now()) - interval '13 days', date_trunc('day', now()), interval '1 day') d ORDER BY d`, g),
+      many(`SELECT status, count(*)::int AS n FROM tasks WHERE ${inP('project_id')} GROUP BY status`, g),
     ]);
     return { counts, activity, leaders, throughput, statusDist };
   });

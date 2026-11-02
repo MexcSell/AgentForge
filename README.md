@@ -15,7 +15,11 @@ npm run db:check     # PostgreSQL connectivity check
 
 Requirements: Node.js ≥ 20, PostgreSQL (defaults: `localhost:5432`, db `agentapp`, user/password `agentuser`), and the `claude` CLI logged in. `gh` is used for push credentials when it is authenticated. Override settings in `.env` (see `.env.example`).
 
-The service binds to `127.0.0.1` only. It has no authentication yet and includes a shell terminal, so do not expose it to a network as-is.
+The service binds to `127.0.0.1` only. It includes a shell terminal (admin only), so put it behind TLS before exposing it to a network.
+
+## Users
+
+Every page and API needs a signed-in account (`GET /api/health` excepted). On a fresh install, or right after the deploy that added accounts, the homepage offers **Create the administrator account**: the first account becomes the administrator (the owner). Later sign-ups (**Sign up**, or the small **Team registration** link) wait for approval on the admin-only **Users** page, where the administrator approves or rejects them, disables, enables or deletes accounts, grants projects and capabilities, and resets a user's device binding. Non-admins never see the AgentForge project. Accounts are bound to the computer they registered from (a hashed browser fingerprint, never an IP address). Break-glass: `AF_ADMIN_USERNAME` / `AF_ADMIN_PASSWORD` in `.env`, or `node scripts/reset-admin.js <user> <password>`. Details: [docs/users.md](docs/users.md).
 
 ## Stack
 

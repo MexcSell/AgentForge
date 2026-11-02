@@ -19,6 +19,8 @@ import apiRoutes from './routes/api.js';
 import filesRoutes from './routes/files.js';
 import previewRoutes, { previewHook } from './routes/preview.js';
 import bittensorRoutes from './routes/bittensor.js';
+import authRoutes, { authHooks } from './routes/auth.js';
+import { loadProtected, ensureAdmin } from './services/auth.js';
 import { createWatcher } from './services/bittensor.js';
 
 const startedAt = new Date();
@@ -32,6 +34,8 @@ let supervisor = { attached: config.supervised, pendingRestart: false, building:
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL || 'warn' }, bodyLimit: 25 * 1024 * 1024 });
 await app.register(websocket);
 await app.register(multipart, { limits: { fileSize: 200 * 1024 * 1024, files: 50 } });
+// Every /api, /uploads and preview request needs a signed-in, active account (routes/auth.js); runs before the preview hook.
+authHooks(app);
 // /preview/<id>/* (and root-absolute requests from a preview page) are served before routing and body parsing.
 app.addHook('onRequest', previewHook);
 
@@ -103,8 +107,8 @@ app.post('/api/system/restart', async (req, reply) => {
 });
 
 app.register(async (scope) => {
-  scope.get('/api/events', { websocket: true }, (socket) => {
-    addClient(socket);
+  scope.get('/api/events', { websocket: true }, (socket, req) => {
+    addClient(socket, req.user);
     socket.on('close', () => syncMetrics());
     systemStatus().then((s) => socket.send(JSON.stringify({ type: 'system:status', payload: s, ts: Date.now() })));
     if (metrics) socket.send(JSON.stringify({ type: 'system:metrics', payload: metrics, ts: Date.now() }));
@@ -115,6 +119,7 @@ app.register(async (scope) => {
   });
 });
 
+await app.register(authRoutes);
 await app.register(apiRoutes, {
   onSettingsChange: (key, value) => {
     if (key !== 'monitor') return;
@@ -144,6 +149,8 @@ if (fs.existsSync(config.clientDist)) {
 // ---- boot ----------------------------------------------------------------
 await migrate();
 await seed();
+await loadProtected();
+if (!config.candidate) await ensureAdmin();
 monitor = sanitizeMonitor((await getSettings()).monitor);
 if (!config.candidate) await recoverInterrupted();
 

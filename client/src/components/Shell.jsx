@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   LayoutDashboard, FolderKanban, Bot, FolderTree, Cpu, Settings, Bell, Sun, Moon, Monitor, Search, Command, GitBranch, Activity,
-  CircleCheck, CircleX, TriangleAlert, Info, X, RefreshCw, Zap, WifiOff, Layers, Plus, Users, Dna, MemoryStick, HardDrive, Network,
+  CircleCheck, CircleX, TriangleAlert, Info, X, RefreshCw, Zap, WifiOff, Layers, Plus, Users, Dna, MemoryStick, HardDrive, Network, UserCog, LogOut,
 } from 'lucide-react';
 import { useStore, selectUnread, selectWorkingAgents, selectRunningProjects } from '../lib/store.js';
 import { useToasts } from '../lib/toast.js';
@@ -9,6 +9,7 @@ import { LAYOUTS, getLayout } from '../lib/layouts.js';
 import { GithubMark } from '../lib/icons.jsx';
 import { compact, duration } from '../lib/format.js';
 import { cx, Kbd, StatusDot, AgentAvatar } from './ui.jsx';
+import { can, canView } from '../lib/access.js';
 
 const GithubIcon = (p) => <GithubMark size={p.size || 18} />;
 
@@ -20,6 +21,11 @@ export const VIEWS = [
   { id: 'models', label: 'Models', icon: Cpu, key: '5' },
   { id: 'github', label: 'GitHub', icon: GithubIcon, key: '6' },
 ];
+// Below the main views in the activity bar; Users only for the administrator (canView).
+export const SYSTEM_VIEWS = [
+  { id: 'settings', label: 'Settings', icon: Settings, key: '7' },
+  { id: 'users', label: 'Users', icon: UserCog, key: '8' },
+];
 
 export function ActivityBar({ layout }) {
   const view = useStore((s) => s.view);
@@ -27,6 +33,9 @@ export function ActivityBar({ layout }) {
   const unread = useStore(selectUnread);
   const working = useStore((s) => selectWorkingAgents(s).length);
   const running = useStore((s) => selectRunningProjects(s).length);
+  const me = useStore((s) => s.me);
+  const views = VIEWS.filter((v) => canView(me, v.id));
+  const system = SYSTEM_VIEWS.filter((v) => canView(me, v.id));
   const badges = { dashboard: unread, projects: running, agents: working };
   const bottom = layout.activity === 'bottom';
   const labels = layout.activityLabels && !bottom;
@@ -53,15 +62,15 @@ export function ActivityBar({ layout }) {
   if (bottom) {
     return (
       <nav className="flex items-center justify-around gap-1 px-2 border-t border-line bg-panel shrink-0" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
-        {[...VIEWS, { id: 'settings', label: 'Settings', icon: Settings, key: '7' }].map(item)}
+        {[...views, ...system].map(item)}
       </nav>
     );
   }
   return (
     <nav className={cx('flex flex-col items-center gap-1 py-2 bg-panel shrink-0', labels ? 'w-44 px-2.5 items-stretch' : 'w-[52px]', layout.activity === 'right' ? 'border-l border-line order-last' : 'border-r border-line')}>
-      {VIEWS.map(item)}
+      {views.map(item)}
       <div className="flex-1" />
-      {item({ id: 'settings', label: 'Settings', icon: Settings, key: '7' })}
+      {system.map(item)}
     </nav>
   );
 }
@@ -72,7 +81,7 @@ export function TitleBar({ layout }) {
   const working = useStore((s) => selectWorkingAgents(s).length);
   const running = useStore((s) => selectRunningProjects(s).length);
   const [layoutOpen, setLayoutOpen] = useState(false);
-  const view = VIEWS.find((v) => v.id === st.view) || { label: 'Settings' };
+  const view = [...VIEWS, ...SYSTEM_VIEWS].find((v) => v.id === st.view) || { label: 'Settings' };
   const project = st.projects.find((p) => p.id === st.activeProjectId);
   const ThemeIcon = st.theme === 'dark' ? Moon : st.theme === 'light' ? Sun : Monitor;
   const nextTheme = { dark: 'light', light: 'system', system: 'dark' }[st.theme];
@@ -106,6 +115,11 @@ export function TitleBar({ layout }) {
         <Bell size={16} />
         {unread > 0 && <span className="absolute top-0.5 right-0.5 size-2 rounded-full bg-bad ring-2 ring-[var(--af-panel)]" />}
       </button>
+      {st.me && (
+        <button onClick={() => st.logout()} className="flex items-center gap-1.5 h-7 px-1.5 rounded-md text-muted hover:text-fg hover:bg-hover text-[0.78rem]" title={`Signed in as ${st.me.username}${st.me.role === 'admin' ? ' (administrator)' : ''} · click to log out`}>
+          <span className="hidden md:inline max-w-28 truncate">{st.me.username}</span><LogOut size={15} />
+        </button>
+      )}
     </header>
   );
 }
@@ -295,19 +309,20 @@ export function CommandPalette() {
   const items = useMemo(() => {
     const go = (view, extra = {}) => () => st.set({ view, palette: false, ...extra });
     const list = [
-      ...VIEWS.map((v) => ({ group: 'Go to', label: v.label, icon: v.icon, run: go(v.id), hint: `Alt+${v.key}` })),
-      { group: 'Go to', label: 'Settings', icon: Settings, run: go('settings') },
-      { group: 'Actions', label: 'New project…', icon: Plus, run: () => st.set({ palette: false, view: 'projects', createProject: true }) },
+      ...[...VIEWS, ...SYSTEM_VIEWS].filter((v) => canView(st.me, v.id)).map((v) => ({ group: 'Go to', label: v.label, icon: v.icon, run: go(v.id), hint: `Alt+${v.key}` })),
+      ...(can(st.me, 'createProjects') ? [{ group: 'Actions', label: 'New project…', icon: Plus, run: () => st.set({ palette: false, view: 'projects', createProject: true }) }] : []),
       { group: 'Actions', label: 'Toggle light / dark', icon: st.theme === 'dark' ? Sun : Moon, run: () => st.set({ palette: false, theme: st.theme === 'dark' ? 'light' : 'dark' }) },
-      { group: 'Actions', label: 'Org chart', icon: Users, run: go('agents') },
-      { group: 'Actions', label: 'Evolution engine', icon: Dna, run: go('agents') },
+      ...(can(st.me, 'manageAgents') ? [
+        { group: 'Actions', label: 'Org chart', icon: Users, run: go('agents') },
+        { group: 'Actions', label: 'Evolution engine', icon: Dna, run: go('agents') },
+      ] : []),
       ...st.projects.map((p) => ({ group: 'Projects', label: p.name, sub: p.path, icon: FolderKanban, run: go('projects', { activeProjectId: p.id }) })),
-      ...st.agents.map((a) => ({ group: 'Agents', label: a.name, sub: a.title, agent: a, run: () => st.set({ palette: false, agentModal: a.id }) })),
+      ...(can(st.me, 'manageAgents') ? st.agents : []).map((a) => ({ group: 'Agents', label: a.name, sub: a.title, agent: a, run: () => st.set({ palette: false, agentModal: a.id }) })),
       ...LAYOUTS.map((l) => ({ group: 'Screen format', label: l.name, sub: l.hint, icon: l.icon || Layers, run: () => st.set({ palette: false, layoutId: l.id }) })),
     ];
     const s = q.trim().toLowerCase();
     return s ? list.filter((x) => `${x.label} ${x.sub || ''} ${x.group}`.toLowerCase().includes(s)) : list;
-  }, [q, st.projects, st.agents, st.theme]);
+  }, [q, st.projects, st.agents, st.theme, st.me]);
 
   if (!st.palette) return null;
   const pick = (x) => x?.run();

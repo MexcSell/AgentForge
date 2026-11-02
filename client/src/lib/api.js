@@ -1,5 +1,9 @@
 import { toast } from './toast.js';
 
+// Called when the session is gone (401 outside /api/auth): the store goes back to the sign-in homepage.
+let signedOut = null;
+export const onSignedOut = (fn) => { signedOut = fn; };
+
 async function request(method, url, body, { quiet } = {}) {
   const res = await fetch(url, {
     method,
@@ -10,9 +14,13 @@ async function request(method, url, body, { quiet } = {}) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!res.ok) {
+    if (res.status === 401 && !url.startsWith('/api/auth/')) {
+      signedOut?.();
+      throw Object.assign(new Error('Sign in required'), { status: 401 });
+    }
     const msg = data?.error || data?.message || res.statusText || 'Request failed';
     if (!quiet) toast.error(msg);
-    throw new Error(msg);
+    throw Object.assign(new Error(msg), { status: res.status, code: data?.code });
   }
   return data;
 }

@@ -1,6 +1,7 @@
 import { create } from 'zustand';
-import { api } from './api.js';
+import { api, onSignedOut } from './api.js';
 import { toast } from './toast.js';
+import { can, canView } from './access.js';
 
 const PREF_KEY = 'af.prefs';
 const PREFS = ['theme', 'accent', 'layoutId', 'view', 'activeProjectId', 'activeTopic', 'filePanes', 'activePane', 'showHidden', 'notifFilter', 'orgTree'];
@@ -69,6 +70,11 @@ export const useStore = create((set, get) => ({
   notifFilter: prefs.notifFilter || 'all',
   orgTree: prefs.orgTree ?? true, // project Team tab: hierarchy tree (true) or flat list
 
+  // account: undefined while checking, null when signed out (the homepage shows), else { id, username, role, status, permissions }
+  me: undefined,
+  capabilities: {}, // permission flag → description, from /api/auth/me
+  setup: false, // no administrator yet: the homepage creates it
+
   // server data
   connected: false,
   loaded: false,
@@ -110,13 +116,38 @@ export const useStore = create((set, get) => ({
     if (Object.keys(patch).some((k) => PREFS.includes(k))) savePrefs(get());
   },
 
+  /** The signed-in account (or null), and whether the homepage should offer to create the administrator. */
+  async loadMe() {
+    try {
+      const { user, capabilities } = await api.get('/api/auth/me', { quiet: true });
+      set({ me: user, capabilities });
+    } catch (e) {
+      if (e.status !== 401) throw e; // server unreachable (restarting): keep the account, the caller retries
+      const { setup } = await api.get('/api/auth/state', { quiet: true }).catch(() => ({ setup: false }));
+      set({ me: null, setup });
+    }
+    return get().me;
+  },
+
+  async logout() {
+    await api.post('/api/auth/logout', {}, { quiet: true }).catch(() => {});
+    get().signedOut();
+  },
+
+  // Back to the homepage, dropping everything the account could see.
+  signedOut() {
+    set({ me: null, loaded: false, projects: [], agents: [], notifications: [], settings: null, topics: {}, messages: {}, tasks: {}, members: {}, previews: {}, live: {}, bittensor: null });
+  },
+
   async loadAll() {
+    const me = get().me;
     const [projects, agents, models, notifications, settings, roles, system] = await Promise.all([
       api.get('/api/projects'), api.get('/api/agents'), api.get('/api/models'), api.get('/api/notifications'),
-      api.get('/api/settings'), api.get('/api/roles'), api.get('/api/system/status'),
+      can(me, 'manageSettings') ? api.get('/api/settings') : null, api.get('/api/roles'), api.get('/api/system/status'),
     ]);
     const s = { projects, agents, models, notifications, settings, roles, system, loaded: true };
     if (!projects.some((p) => p.id === get().activeProjectId)) s.activeProjectId = projects[0]?.id || null;
+    if (!canView(me, get().view)) s.view = 'dashboard';
     set(s);
     savePrefs(get());
   },
@@ -371,6 +402,10 @@ export const useStore = create((set, get) => ({
         break;
       }
       case 'models:update': set({ models: p }); break;
+      case 'auth:update': // the administrator changed this account: reload what it may see
+        set({ me: p });
+        get().loadAll().catch(() => {});
+        break;
       case 'settings:update': set({ settings: { ...st.settings, [p.key]: p.value } }); break;
       case 'preview:update': {
         // Session snapshot. A snapshot without `log` keeps the lines streamed so far.
@@ -423,3 +458,5 @@ export function selectRuns(s, project) {
   }
   return runs;
 }
+
+onSignedOut(() => { if (useStore.getState().me) useStore.getState().signedOut(); });
