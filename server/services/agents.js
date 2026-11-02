@@ -92,16 +92,31 @@ export async function refreshAgentStatus(id) {
 }
 
 // Agent names are system-assigned and immutable.
+// A clone is "<base>-N" with the lowest N >= 1 that no agent row holds. Archived (removed or merged) agents keep their
+// names and still block them: agents.name is UNIQUE across all rows, and an archived agent stays visible in history.
+function cloneName(base, taken) {
+  for (let i = 1; ; i++) if (!taken.has(`${base}-${i}`)) return `${base}-${i}`;
+}
+
 async function allocateName(base) {
   const taken = new Set((await many(`SELECT name FROM agents`)).map((r) => r.name));
-  if (base) {
-    for (let i = 2; i < 1000; i++) if (!taken.has(`${base}-${i}`)) return `${base}-${i}`;
-  }
+  if (base) return cloneName(base, taken);
   const free = CODENAMES.filter((n) => !taken.has(n));
   if (free.length) return free[Math.floor(Math.random() * free.length)];
   for (let i = 2; ; i++) {
     const n = `${CODENAMES[i % CODENAMES.length]}-${i}`;
     if (!taken.has(n)) return n;
+  }
+}
+
+// insert(name) with a freshly allocated name, retried when an insert made at the same moment took that name first.
+async function insertNamed(base, insert) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await insert(await allocateName(base));
+    } catch (e) {
+      if (e.code !== '23505' || e.constraint !== 'agents_name_key' || attempt >= 20) throw e;
+    }
   }
 }
 
@@ -126,15 +141,17 @@ export async function createAgent({ role, title, skills, supervisor_id, mission,
   role = normalizeRole(role);
   const info = roleInfo(role);
   const skillList = (skills?.length ? skills : info.skills).map((s) => (typeof s === 'string' ? { name: s.toLowerCase(), level: 35 } : s));
-  const row = await one(
+  const supervisor = supervisor_id === undefined ? await defaultSupervisorFor(role) : supervisor_id;
+  const insert = (n) => one(
     `INSERT INTO agents(name, role, title, tier, department, skills, supervisor_id, mission, purpose, model_id, origin, cloned_from)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
-    [name || (await allocateName()), role, title || info.title, info.tier, info.department, JSON.stringify(skillList),
-      supervisor_id === undefined ? await defaultSupervisorFor(role) : supervisor_id,
+    [n, role, title || info.title, info.tier, info.department, JSON.stringify(skillList),
+      supervisor,
       mission || `Deliver ${info.title.toLowerCase()} work with verifiable evidence.`,
       purpose || `Raise the quality bar of ${info.department.toLowerCase()} across projects.`,
       model_id || null, origin, cloned_from],
   );
+  const row = name ? await insert(name) : await insertNamed(null, insert);
   const agent = await getAgent(row.id);
   emit('agent:new', agent);
   return agent;
@@ -146,13 +163,13 @@ export async function cloneAgent(sourceId, reason = 'parallel work', { leaseMiss
   const src = await getAgent(sourceId);
   if (!src) throw new Error('agent not found');
   const base = src.name.replace(/-\d+$/, '');
-  const row = await one(
+  const row = await insertNamed(base, (name) => one(
     `INSERT INTO agents(name, role, title, tier, department, skills, supervisor_id, mission, purpose, playbook, prompt_version, model_id, origin, cloned_from, xp, level, clone_base, lease_mission_id)
      SELECT $2, role, title, tier, department, skills, supervisor_id, mission, purpose, playbook, prompt_version, model_id, 'cloned', id, xp / 2, GREATEST(1, level - 1),
        jsonb_build_object('xp', xp / 2, 'skills', skills), $3
      FROM agents WHERE id = $1 RETURNING id`,
-    [sourceId, await allocateName(base), leaseMissionId],
-  );
+    [sourceId, name, leaseMissionId],
+  ));
   const agent = await getAgent(row.id);
   emit('agent:new', { ...agent, reason });
   return agent;
