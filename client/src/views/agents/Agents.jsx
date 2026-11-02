@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Bot, Plus, Search, Network, LayoutGrid, Dna, GitFork, Eye, Stethoscope, Lightbulb, FlaskConical, Scale, Rocket, GitMerge, ChevronDown, ChevronRight,
   ZoomIn, ZoomOut, RefreshCw, Sparkles, CircleX, Lock, X,
@@ -84,42 +84,64 @@ function Registry() {
   );
 }
 
-function OrgNode({ node, collapsed, toggle }) {
+function OrgCard({ a, className }) {
   const set = useStore((s) => s.set);
-  const a = node.agent;
-  const closed = collapsed.has(a.id);
   const R = roleStyle(a.role);
   return (
-    <li>
-      <div className="relative inline-flex flex-col items-center">
-        <button onClick={() => set({ agentModal: a.id })} className="flex items-center gap-2.5 pl-2 pr-3 py-2 rounded-xl border border-line bg-panel hover:border-accent/60 hover:shadow-af transition-all text-left min-w-44"
-          style={{ boxShadow: a.status === 'working' ? `0 0 0 2px ${R.from}55` : undefined }}>
-          <AgentAvatar agent={a} size={30} />
-          <span className="min-w-0"><span className="block text-[0.8rem] font-semibold truncate">{a.name}</span><span className="block text-[0.66rem] text-subtle truncate max-w-36">{a.title}</span><ExecBadge agent={a} className="mt-0.5 max-w-36" /></span>
-          <span className="ml-auto text-[0.64rem] text-accent font-semibold tabular">L{a.level}</span>
+    <button onClick={() => set({ agentModal: a.id })} className={cx('flex items-center gap-2.5 pl-2 pr-3 py-2 rounded-xl border border-line bg-panel hover:border-accent/60 hover:shadow-af transition-all text-left w-full min-w-0', className)}
+      style={{ boxShadow: a.status === 'working' ? `0 0 0 2px ${R.from}55` : undefined }}>
+      <AgentAvatar agent={a} size={30} />
+      <span className="min-w-0"><span className="block text-[0.8rem] font-semibold truncate">{a.name}</span><span className="block text-[0.66rem] text-subtle truncate max-w-36">{a.title}</span><ExecBadge agent={a} className="mt-0.5 max-w-36" /></span>
+      <span className="ml-auto text-[0.64rem] text-accent font-semibold tabular">L{a.level}</span>
+    </button>
+  );
+}
+
+/** A node with reports: its card, then (unless collapsed) all its reports in one framed group hung from the card. */
+function OrgNode({ node, collapsed, toggle }) {
+  const a = node.agent;
+  const closed = collapsed.has(a.id);
+  return (
+    <div className="flex flex-col items-center min-w-0">
+      <div className="relative w-full max-w-60 flex flex-col items-center">
+        <OrgCard a={a} />
+        <button onClick={() => toggle(a.id)} className="absolute -bottom-2.5 size-5 rounded-full border border-line bg-raised flex items-center justify-center text-subtle hover:text-fg z-10" title={closed ? `Expand ${node.children.length}` : 'Collapse'}>
+          {closed ? <span className="text-[9px] font-bold">{node.children.length}</span> : <ChevronDown size={11} />}
         </button>
-        {node.children.length > 0 && (
-          <button onClick={() => toggle(a.id)} className="absolute -bottom-2.5 size-5 rounded-full border border-line bg-raised flex items-center justify-center text-subtle hover:text-fg z-10" title={closed ? `Expand ${node.children.length}` : 'Collapse'}>
-            {closed ? <span className="text-[9px] font-bold">{node.children.length}</span> : <ChevronDown size={11} />}
-          </button>
-        )}
       </div>
-      {node.children.length > 0 && !closed && <ul>{node.children.map((c) => <OrgNode key={c.agent.id} node={c} collapsed={collapsed} toggle={toggle} />)}</ul>}
-    </li>
+      {!closed && <div className="org-kids"><OrgGroup nodes={node.children} collapsed={collapsed} toggle={toggle} /></div>}
+    </div>
+  );
+}
+
+// A group block's flex share: it grows by its column count and starts at that many card columns (at most 4), never past the row.
+const COL = 11; // rem: a 10.5rem grid column plus its gap
+const share = (cols, extra = 0) => ({ flex: `${cols} 1 min(100%, ${cols * COL + extra}rem)` });
+
+/**
+ * Siblings: each one with reports is a block (card + its framed group), the ones without sit together in a compact grid;
+ * the blocks wrap to the pane width.
+ */
+function OrgGroup({ nodes, collapsed, toggle }) {
+  const leaves = nodes.filter((n) => !n.children.length);
+  const branches = nodes.filter((n) => n.children.length);
+  const grid = (list) => <ul className="org-grid">{list.map((n) => <li key={n.agent.id} className="min-w-0"><OrgCard a={n.agent} /></li>)}</ul>;
+  if (!branches.length) return grid(leaves);
+  return (
+    <ul className="flex flex-wrap justify-center items-start gap-3 min-w-0">
+      {branches.map((n) => (
+        <li key={n.agent.id} className="min-w-0" style={share(Math.min(collapsed.has(n.agent.id) ? 1 : n.children.length, 4), 2)}>
+          <OrgNode node={n} collapsed={collapsed} toggle={toggle} />
+        </li>
+      ))}
+      {leaves.length > 0 && <li className="min-w-0" style={share(Math.min(leaves.length, 4))}>{grid(leaves)}</li>}
+    </ul>
   );
 }
 
 function OrgChart() {
   const agents = useStore((s) => s.agents);
   const [zoom, setZoom] = useState(1);
-  const wrap = useRef(null);
-  const chart = useRef(null);
-  const fit = () => {
-    const w = wrap.current?.clientWidth;
-    const c = chart.current ? chart.current.getBoundingClientRect().width / (Number(chart.current.style.zoom) || 1) : 0;
-    if (w && c) setZoom(Math.max(0.4, Math.min(1, Math.floor(((w - 16) / c) * 20) / 20)));
-  };
-  useEffect(() => { requestAnimationFrame(fit); }, [agents.length]);
   const [collapsed, setCollapsed] = useState(new Set());
   const roots = useMemo(() => {
     const map = new Map(agents.map((a) => [a.id, { agent: a, children: [] }]));
@@ -141,13 +163,13 @@ function OrgChart() {
           <IconButton icon={ZoomOut} label="Zoom out" onClick={() => setZoom(Math.max(0.4, zoom - 0.1))} />
           <span className="text-xs tabular w-10 text-center text-muted">{Math.round(zoom * 100)}%</span>
           <IconButton icon={ZoomIn} label="Zoom in" onClick={() => setZoom(Math.min(1.6, zoom + 0.1))} />
-          <Button size="sm" variant="ghost" onClick={fit}>Fit</Button>
+          <Button size="sm" variant="ghost" onClick={() => setZoom(1)}>Fit</Button>
           <Button size="sm" variant="ghost" onClick={() => setCollapsed(new Set())}>Expand all</Button>
         </div>
       </div>
-      <div ref={wrap} className="flex-1 min-h-0 overflow-auto dotgrid">
-        <div ref={chart} className="org p-8 w-max mx-auto" style={{ zoom }}>
-          <ul>{roots.map((r) => <OrgNode key={r.agent.id} node={r} collapsed={collapsed} toggle={toggle} />)}</ul>
+      <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden dotgrid">
+        <div className="org p-4 min-w-0" style={{ zoom }}>
+          <OrgGroup nodes={roots} collapsed={collapsed} toggle={toggle} />
         </div>
       </div>
     </div>
