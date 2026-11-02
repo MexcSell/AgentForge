@@ -56,7 +56,7 @@ export default async function previewRoutes(app) {
 export function previewHook(req, reply, done) {
   const target = req.raw.afPreview !== undefined ? req.raw.afPreview : previewTarget(req.raw); // the auth hook resolved it already
   if (!target) return done();
-  // What the upstream gets as X-Forwarded-*: the client's own values only from a trusted proxy (config.trustProxy).
+  // What the upstream gets as X-Forwarded-*: the client's own values only from a trusted proxy (config.network.trustProxy).
   req.raw.afForwarded = { for: (req.ips ? [...req.ips].reverse() : [req.ip]).join(', '), host: req.host, proto: req.protocol };
   reply.hijack();
   done();

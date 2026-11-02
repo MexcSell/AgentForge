@@ -236,7 +236,7 @@ if (clientIsStale()) {
   else state.lastBuildAt = new Date().toISOString();
 }
 server = startServer();
-log(`supervising server on http://${config.host}:${PORT} (pid ${process.pid})`);
+log(`supervising server on port ${PORT} (pid ${process.pid})`);
 
 const ignored = (p) => /node_modules|\/dist(-next|-prev)?\/|\.git\//.test(p);
 chokidar.watch([path.join(ROOT, 'server'), path.join(ROOT, 'package.json')], { ignoreInitial: true, ignored, awaitWriteFinish: { stabilityThreshold: 400 } })

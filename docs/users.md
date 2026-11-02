@@ -14,7 +14,7 @@ There is a single administrator role. It is set up in one of these ways:
 
 An administrator with a password is never bound to a device: **Log in with a password** works from any computer (it binds that browser only if the account has no device yet, and never takes over another account's device). An administrator without a password can not have its device reset. It cannot disable, reject or delete its own account or another administrator account, so it cannot lock itself out from the Users page. Sessions are stored in the database (`sessions`), so a restart or redeploy does not sign anyone out. The schema changes are additive (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, `password_hash` made nullable), so migrating the live database touches no existing data; see *Migration* below.
 
-**Exposure warning:** until the administrator account exists, whoever opens the homepage first can create it. The server listens on all interfaces by default (`HOST=127.0.0.1` keeps it local), so it is reachable from the network: create the account right after deploying, or set `AF_ADMIN_USERNAME`/`AF_ADMIN_PASSWORD` before the restart.
+**Exposure warning:** until the administrator account exists, whoever opens the homepage first can create it. The server listens on all interfaces by default (HTTPS mode off; `HOST=127.0.0.1` keeps it local), so it is reachable from the network: create the account right after deploying, or set `AF_ADMIN_USERNAME`/`AF_ADMIN_PASSWORD` before the restart.
 
 ## Sign-up and approval
 
@@ -43,7 +43,7 @@ With it the browser sends **computer info** for the administrator: a label such 
 
 ## Sessions
 
-- A session is a random 256-bit token held in the `af_session` cookie, set with `HttpOnly; SameSite=Lax; Path=/`, plus `Secure` when the request came over https (`X-Forwarded-Proto: https` from a TLS proxy counts only with `TRUST_PROXY` set, see the README's HTTPS section). The database stores only the token's SHA-256. Sessions last 30 days. **Log out** (the user name in the title bar) deletes the session.
+- A session is a random 256-bit token held in the `af_session` cookie, set with `HttpOnly; SameSite=Lax; Path=/`, plus `Secure` when the request came over https (`X-Forwarded-Proto: https` from a TLS proxy counts only when the proxy is trusted: HTTPS mode on, or `TRUST_PROXY` set, see the README's HTTPS section). The database stores only the token's SHA-256. Sessions last 30 days. **Log out** (the user name in the title bar) deletes the session.
 
 ## Migration
 

@@ -274,7 +274,7 @@ export function parseCookies(header) {
 
 export const tokenOf = (req) => parseCookies(req.headers.cookie)[SESSION_COOKIE] || null;
 
-// Secure only behind https: req.protocol follows X-Forwarded-Proto only from a trusted proxy (config.trustProxy).
+// Secure only behind https: req.protocol follows X-Forwarded-Proto only from a trusted proxy (config.network.trustProxy).
 const secure = (req) => req.protocol === 'https';
 export const sessionCookie = (req, token) =>
   `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}${secure(req) ? '; Secure' : ''}`;

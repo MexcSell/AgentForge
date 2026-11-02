@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
-import { Settings as SettingsIcon, Sun, Moon, Monitor, Palette, Layers, Workflow, Dna, Server, RefreshCw, Check, Database, Boxes, Layout, Cpu, Zap, ShieldCheck, Gauge } from 'lucide-react';
+import { Settings as SettingsIcon, Sun, Moon, Monitor, Palette, Layers, Workflow, Dna, Server, RefreshCw, Check, Database, Boxes, Layout, Cpu, Zap, ShieldCheck, Gauge, Lock, TriangleAlert } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { useStore } from '../lib/store.js';
 import { toast } from '../lib/toast.js';
 import { LAYOUTS } from '../lib/layouts.js';
+import { isAdmin } from '../lib/access.js';
 import { duration, bytes, dateTime } from '../lib/format.js';
 import { cx, Button, Field, Input, Toggle, StatusDot } from '../components/ui.jsx';
 
@@ -36,6 +37,56 @@ function LayoutThumb({ l }) {
         {order.map((k) => <div key={k} className={cx('rounded-[2px]', color[k])} style={{ flex: P.sizes[k] || 20 }} />)}
       </div>
     </div>
+  );
+}
+
+/** HTTPS mode (admin only): TLS proxy in front with the plain port on loopback, or plain HTTP on all interfaces. */
+function NetworkSection({ startedAt }) {
+  const [net, setNet] = useState(null); // GET /api/system/network
+  const [https, setHttps] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const load = () => api.get('/api/system/network', { quiet: true }).then((n) => { setNet(n); setHttps(n.https); }).catch(() => {});
+  useEffect(() => { load(); }, [startedAt]); // the server restarted: show what it runs with now
+  if (!net) return null;
+  const overridden = [net.env.HOST && 'HOST', net.env.TRUST_PROXY && 'TRUST_PROXY'].filter(Boolean);
+  const r = net.running;
+  const plainUrl = `http://${location.hostname}:${r.port}`; // an IPv6 hostname comes bracketed
+  const save = async () => {
+    setSaving(true);
+    try {
+      const n = await api.put('/api/system/network', { https });
+      setNet(n);
+      if (n.restarting) toast.info('Safe restart scheduled', https ? 'Then open AgentForge through its https:// address' : `Then open ${plainUrl} from any computer`);
+      else toast.success('Settings saved', n.restartNeeded ? 'Restart AgentForge to apply' : undefined);
+    } catch { /* api showed the error */ } finally { setSaving(false); }
+  };
+  return (
+    <Section icon={Lock} title="Network · HTTPS mode" desc="Administrators only">
+      <div className="flex flex-col gap-3 text-xs">
+        <Toggle checked={https} onChange={setHttps} label="HTTPS mode: serve through the TLS reverse proxy (deploy/Caddyfile)" />
+        <p className="text-muted leading-relaxed">
+          {https
+            ? 'On: the plain port listens on this machine only (127.0.0.1) and the proxy in front adds TLS; forwarded headers are trusted from it, so sign-in cookies are Secure. Switch it on from the https:// address, otherwise this computer is locked out.'
+            : 'Off: AgentForge serves plain HTTP directly on all interfaces (no proxy hop), so other computers open ' + plainUrl + '. Sign-in and permissions still apply.'}
+        </p>
+        {!https && (
+          <div className="flex gap-2 p-2.5 rounded-lg border border-line bg-warn-soft text-fg">
+            <TriangleAlert size={14} className="text-warn shrink-0 mt-0.5" />
+            <span>Unencrypted: with HTTPS off, usernames, device secrets and session cookies, everything shown in the app and every keystroke in the admin terminal cross the network in cleartext. Use it only on a network you trust.</span>
+          </div>
+        )}
+        {overridden.length > 0 && (
+          <div className="text-warn">Set in the environment: {overridden.join(' and ')} {overridden.length > 1 ? 'win' : 'wins'} over this setting{overridden.length > 1 ? ', so it has no effect' : ''}. Remove {overridden.length > 1 ? 'them' : 'it'} from .env to control this here.</div>
+        )}
+        <div className="text-subtle">
+          Now running: {r.trustProxy ? `behind a TLS proxy (trusting ${r.trustProxy}), ` : 'plain HTTP, no proxy trusted, '}listening on {r.host}.{' '}
+          {net.restartNeeded
+            ? <span className="text-warn">{net.supervised ? 'A restart is needed to apply the saved mode: saving schedules the safe restart (it waits for running agents).' : 'A restart is needed to apply the saved mode (not running under the supervisor: restart it yourself).'}</span>
+            : 'Changing the mode needs a restart, done automatically through the safe restart.'}
+        </div>
+      </div>
+      <Button className="mt-4" variant="primary" disabled={saving || (https === net.https && !net.restartNeeded)} onClick={save}>Save network settings</Button>
+    </Section>
   );
 }
 
@@ -131,6 +182,8 @@ export default function Settings() {
           </Section>
         )}
 
+        {isAdmin(st.me) && <NetworkSection startedAt={sys?.startedAt} />}
+
         <Section icon={Server} title="Service" desc="Self-restart is guarded: syntax check → candidate health check → wait for idle agents → swap">
           {sys && (
             <div className="grid gap-4 md:grid-cols-[1fr_auto] items-start">
@@ -154,7 +207,7 @@ export default function Settings() {
               [Database, 'Database · PostgreSQL', 'Relational integrity for projects, tasks, runs and audit history; JSONB for flexible agent skills, plans and reports.'],
               [Cpu, 'Agent runtime · Claude Code CLI', 'Gives agents real tools (read, edit, run) inside each project directory, with streamed usage and rate-limit data.'],
               [Zap, 'Not used yet · Redis, Qdrant', 'A single node needs no external queue or cache; agent memory starts in PostgreSQL. Both can be added when scaling out.'],
-              [ShieldCheck, 'Not used yet · Better Auth, Cloudflare', 'Built-in accounts guard every page and API. The service listens on all interfaces over plain HTTP; put it behind TLS on untrusted networks.'],
+              [ShieldCheck, 'Not used yet · Better Auth, Cloudflare', 'Built-in accounts guard every page and API. Plain HTTP on all interfaces, or HTTPS through a TLS proxy (Network · HTTPS mode).'],
             ].map(([I, t, d]) => (
               <div key={t} className="flex gap-3 p-3 rounded-lg bg-sunken border border-line">
                 <I size={16} className="text-accent shrink-0 mt-0.5" />

@@ -15,15 +15,31 @@ if (fs.existsSync(envFile)) {
 
 const env = process.env;
 
+const parseTrustProxy = (v) => /^(|0|false|no|off)$/i.test(v || '') ? false : /^(1|true|yes|on)$/i.test(v) ? 'loopback' : v;
+const isSet = (v) => v !== undefined && String(v).trim() !== '';
+
+/**
+ * Where the server listens and which proxies it trusts, from the admin's HTTPS mode setting (settings.network.https)
+ * unless HOST / TRUST_PROXY are set in the environment, which always win.
+ * - HTTPS on: TLS proxy in front (deploy/Caddyfile). The plain port stays on loopback and X-Forwarded-Proto/Host/For are
+ *   honoured from loopback only, so cookies are Secure over https.
+ * - HTTPS off (the default): plain HTTP straight on all interfaces, forwarded headers ignored (direct clients can not
+ *   spoof them).
+ * TRUST_PROXY: unset/0/false = ignored; 1/true = loopback; otherwise IPs/CIDRs, comma-separated. The supervisor's
+ * health-check candidate (side port) stays on loopback unless HOST is set.
+ */
+export function networkMode(https = false, e = process.env) {
+  const host = isSet(e.HOST) ? e.HOST.trim() : e.AF_CANDIDATE === '1' || https ? '127.0.0.1' : '0.0.0.0';
+  const trustProxy = isSet(e.TRUST_PROXY) ? parseTrustProxy(e.TRUST_PROXY.trim()) : https ? 'loopback' : false;
+  return { https: !!https, host, trustProxy, env: { HOST: isSet(e.HOST), TRUST_PROXY: isSet(e.TRUST_PROXY) } };
+}
+
 export const config = {
   root: ROOT,
   port: Number(env.PORT || 4800),
-  // Bind address: all interfaces by default so other computers can reach the UI; HOST=127.0.0.1 keeps it local.
-  // The supervisor's health-check candidate (side port) stays on loopback unless HOST is set.
-  host: env.HOST || (env.AF_CANDIDATE === '1' ? '127.0.0.1' : '0.0.0.0'),
-  // Behind a TLS reverse proxy (deploy/Caddyfile): honour X-Forwarded-Proto/Host/For only from these peers. Unset/0/false =
-  // ignored (direct clients can not spoof them); 1/true = a proxy on this host (loopback); otherwise IPs/CIDRs, comma-separated.
-  trustProxy: /^(|0|false|no|off)$/i.test(env.TRUST_PROXY || '') ? false : /^(1|true|yes|on)$/i.test(env.TRUST_PROXY) ? 'loopback' : env.TRUST_PROXY,
+  // Bind address and trusted proxies from the environment alone (networkMode above); server/index.js resolves them
+  // again with the saved HTTPS mode before it creates the app.
+  network: networkMode(),
   candidate: env.AF_CANDIDATE === '1', // health-check instance spawned by the supervisor
   supervised: typeof process.send === 'function',
   dataDir: path.join(ROOT, 'data'),

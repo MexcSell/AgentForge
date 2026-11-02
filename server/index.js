@@ -2,11 +2,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import zlib from 'node:zlib';
+import { promisify } from 'node:util';
 import Fastify from 'fastify';
 import websocket from '@fastify/websocket';
 import fastifyStatic from '@fastify/static';
 import multipart from '@fastify/multipart';
-import { config, ROOT } from './config.js';
+import { config, ROOT, networkMode } from './config.js';
 import { pool, migrate, one } from './db/pool.js';
 import { seed, getSettings, sanitizeMonitor } from './db/seed.js';
 import { addClient, emit, clientCount } from './events.js';
@@ -20,6 +22,7 @@ import filesRoutes from './routes/files.js';
 import previewRoutes, { previewHook } from './routes/preview.js';
 import bittensorRoutes from './routes/bittensor.js';
 import authRoutes, { authHooks } from './routes/auth.js';
+import networkRoutes from './routes/network.js';
 import { loadProtected, ensureAdmin } from './services/auth.js';
 import { createWatcher } from './services/bittensor.js';
 
@@ -31,11 +34,30 @@ try { commit = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: ROOT
 // State reported by scripts/supervisor.js over IPC.
 let supervisor = { attached: config.supervised, pendingRestart: false, building: false, lastRestartAt: null, lastBuildAt: null, lastError: null, clientVersion: null };
 
-const app = Fastify({ logger: { level: process.env.LOG_LEVEL || 'warn' }, bodyLimit: 25 * 1024 * 1024, trustProxy: config.trustProxy });
+// The HTTPS mode (Settings → Network) decides the bind address and trusted proxies, unless HOST / TRUST_PROXY are set:
+// read before the app is created, since Fastify takes trustProxy at construction. Changing it needs a restart.
+await migrate();
+const net = networkMode((await getSettings()).network?.https === true);
+
+const app = Fastify({ logger: { level: process.env.LOG_LEVEL || 'warn' }, bodyLimit: 25 * 1024 * 1024, trustProxy: net.trustProxy });
 await app.register(websocket);
 await app.register(multipart, { limits: { fileSize: 200 * 1024 * 1024, files: 50 } });
 // Every /api, /uploads and preview request needs a signed-in, active account (routes/auth.js); runs before the preview hook.
 authHooks(app);
+// JSON API responses compressed (the startup load of agents, runs and notifications is hundreds of KB): brotli when the
+// browser offers it (https only in Chrome), else gzip. Static files come precompressed from the build instead.
+const brotli = promisify(zlib.brotliCompress);
+const gzip = promisify(zlib.gzip);
+app.addHook('onSend', async (req, reply, payload) => {
+  if ((typeof payload !== 'string' && !Buffer.isBuffer(payload)) || Buffer.byteLength(payload) < 1024) return payload;
+  if (reply.getHeader('content-encoding') || !/json/i.test(String(reply.getHeader('content-type') || ''))) return payload;
+  const accept = String(req.headers['accept-encoding'] || '');
+  const enc = /\bbr\b/.test(accept) ? 'br' : /\bgzip\b/.test(accept) ? 'gzip' : null;
+  if (!enc) return payload;
+  const out = enc === 'br' ? await brotli(payload, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 } }) : await gzip(payload, { level: 6 });
+  reply.header('content-encoding', enc).header('vary', 'accept-encoding').removeHeader('content-length');
+  return out;
+});
 // /preview/<id>/* (and root-absolute requests from a preview page) are served before routing and body parsing.
 app.addHook('onRequest', previewHook);
 
@@ -106,6 +128,7 @@ app.post('/api/system/restart', async (req, reply) => {
   return { ok: true };
 });
 
+
 app.register(async (scope) => {
   scope.get('/api/events', { websocket: true }, (socket, req) => {
     addClient(socket, req.user);
@@ -120,6 +143,8 @@ app.register(async (scope) => {
 });
 
 await app.register(authRoutes);
+// HTTPS mode: changes go through the guarded supervisor restart (candidate health check, waits for idle agents).
+await app.register(networkRoutes, { net, supervised: config.supervised, restart: () => process.send({ type: 'restart-request', force: false }) });
 await app.register(apiRoutes, {
   onSettingsChange: (key, value) => {
     if (key !== 'monitor') return;
@@ -136,7 +161,12 @@ await app.register(bittensorRoutes, { watcher: btWatcher });
 await app.register(fastifyStatic, { root: config.uploadsDir, prefix: '/uploads/', decorateReply: false });
 if (fs.existsSync(config.clientDist)) {
   // Wildcard serving: hashed bundles from a hot client rebuild are picked up without a restart.
-  await app.register(fastifyStatic, { root: config.clientDist, prefix: '/' });
+  // Precompressed (.br/.gz written by vite.config.js) and hashed assets cached for good: a reload over a slow link only
+  // revalidates index.html instead of every chunk.
+  await app.register(fastifyStatic, {
+    root: config.clientDist, prefix: '/', preCompressed: true, cacheControl: false,
+    setHeaders: (reply, file) => reply.header('cache-control', file.includes(`${path.sep}assets${path.sep}`) ? 'public, max-age=31536000, immutable' : 'no-cache'),
+  });
   app.setNotFoundHandler((req, reply) => {
     if (req.url.startsWith('/api/') || req.url.startsWith('/uploads/')) return reply.code(404).send({ error: 'Not found' });
     const index = path.join(config.clientDist, 'index.html');
@@ -147,16 +177,15 @@ if (fs.existsSync(config.clientDist)) {
 }
 
 // ---- boot ----------------------------------------------------------------
-await migrate();
 await seed();
 await loadProtected();
 if (!config.candidate) await ensureAdmin();
 monitor = sanitizeMonitor((await getSettings()).monitor);
 if (!config.candidate) await recoverInterrupted();
 
-await app.listen({ port: config.port, host: config.host });
-console.log(`[agentforge] ${config.candidate ? 'candidate' : 'server'} listening on http://${config.host}:${config.port}`);
-if (!config.candidate && ['0.0.0.0', '::'].includes(config.host)) {
+await app.listen({ port: config.port, host: net.host });
+console.log(`[agentforge] ${config.candidate ? 'candidate' : 'server'} listening on http://${net.host}:${config.port}${net.trustProxy ? ` (behind a TLS proxy: trusting ${net.trustProxy})` : ''}`);
+if (!config.candidate && ['0.0.0.0', '::'].includes(net.host)) {
   // Wildcard bind: list the addresses other computers can use (container/bridge interfaces skipped).
   const ips = Object.entries(os.networkInterfaces())
     .filter(([name]) => !/^(docker|br-|cni|veth|flannel|virbr)/.test(name))

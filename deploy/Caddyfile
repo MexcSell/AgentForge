@@ -1,5 +1,5 @@
 # AgentForge behind Caddy: TLS on 443, HTTP→HTTPS redirect on 80, everything proxied to the app on loopback.
-# Setup (README "Serving over HTTPS"): run AgentForge with TRUST_PROXY=1 and HOST=127.0.0.1, point DNS at this host,
+# Setup (README "Serving over HTTPS"): turn on Settings → Network · HTTPS mode (or TRUST_PROXY=1 and HOST=127.0.0.1), point DNS at this host,
 # open ports 80 and 443, then:  AF_DOMAIN=agentforge.example.com caddy run --config deploy/Caddyfile
 #
 # What Caddy does without extra lines here:

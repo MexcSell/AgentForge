@@ -103,7 +103,7 @@ export async function refusal(user, method, url, params = {}) {
 
 /**
  * A browser WebSocket upgrade whose Origin is not this server (req.host: Host, or X-Forwarded-Host from a trusted proxy
- * only, see config.trustProxy). SameSite=Lax
+ * only, see config.network). SameSite=Lax
  * still sends the cookie from another port of the same host, so a page there could otherwise open the events socket
  * or the terminal. Clients without an Origin (not browsers) are left to the session check.
  */
@@ -158,7 +158,7 @@ export function rateLimiter({ max, windowMs }) {
 // The sign-in endpoints take a username, a device secret and a few KB of computer info: nothing bigger.
 const AUTH_BODY = { bodyLimit: 16 * 1024 };
 
-/** opts.signupLimit: { max, windowMs } registrations per client address (req.ip, see config.trustProxy). */
+/** opts.signupLimit: { max, windowMs } registrations per client address (req.ip, see config.network). */
 export default async function authRoutes(app, opts = {}) {
   const signupAllowed = rateLimiter(opts.signupLimit || { max: 10, windowMs: 15 * 60_000 });
   const done = async (req, reply, user) => {
