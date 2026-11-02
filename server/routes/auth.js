@@ -4,7 +4,7 @@ import { one } from '../db/pool.js';
 import { isUuid } from '../services/topics.js';
 import { can, canSeeProject, isAdmin, CAPABILITIES } from '../services/access.js';
 import {
-  signup, login, needsSetup, createSession, sessionUser, destroySession, tokenOf, sessionCookie, clearedCookie, publicUser,
+  signup, login, deviceLogin, needsSetup, createSession, sessionUser, destroySession, tokenOf, sessionCookie, clearedCookie, publicUser,
   listUsers, userAction, setPermissions, deleteUser,
 } from '../services/auth.js';
 import { previewTarget } from './preview.js';
@@ -12,7 +12,7 @@ import { previewTarget } from './preview.js';
 const err = (reply, code, message, extra = {}) => reply.code(code).send({ error: message, ...extra });
 
 // Reachable without a session. /api/health is polled by the supervisor; /api/auth/me answers 401 itself.
-const PUBLIC = new Set(['/api/health', '/api/auth/state', '/api/auth/signup', '/api/auth/login', '/api/auth/logout', '/api/auth/me']);
+const PUBLIC = new Set(['/api/health', '/api/auth/state', '/api/auth/signup', '/api/auth/login', '/api/auth/device', '/api/auth/logout', '/api/auth/me']);
 const GATED = /^\/(api|uploads)(\/|$)/;
 
 // 'user': any active account (the handler filters by permission). { cap }: a capability flag. { project, write }:
@@ -116,7 +116,7 @@ function crossOriginSocket(req) {
 
 /**
  * Root hooks. onRequest (registered before the preview hook): /api, /uploads and project previews need an active
- * account → 401 without a session, 403 while pending. preHandler: the route's POLICY.
+ * account → 401 without a session (pending, rejected and disabled accounts have none). preHandler: the route's POLICY.
  */
 export function authHooks(app) {
   app.decorateRequest('user', null);
@@ -141,7 +141,26 @@ export function authHooks(app) {
   });
 }
 
-export default async function authRoutes(app) {
+/** At most max hits per key within windowMs (in memory, per process): false once over. */
+export function rateLimiter({ max, windowMs }) {
+  const hits = new Map();
+  return (key) => {
+    const now = Date.now();
+    const recent = (hits.get(key) || []).filter((t) => now - t < windowMs);
+    const ok = recent.length < max;
+    if (ok) recent.push(now);
+    if (hits.size > 10000) hits.clear(); // never grows without bound
+    hits.set(key, recent);
+    return ok;
+  };
+}
+
+// The sign-in endpoints take a username, a device secret and a few KB of computer info: nothing bigger.
+const AUTH_BODY = { bodyLimit: 16 * 1024 };
+
+/** opts.signupLimit: { max, windowMs } registrations per client address (req.ip, see config.trustProxy). */
+export default async function authRoutes(app, opts = {}) {
+  const signupAllowed = rateLimiter(opts.signupLimit || { max: 10, windowMs: 15 * 60_000 });
   const done = async (req, reply, user) => {
     const token = await createSession(user.id);
     reply.header('set-cookie', sessionCookie(req, token));
@@ -151,20 +170,29 @@ export default async function authRoutes(app) {
     try {
       return await fn(req, reply);
     } catch (e) {
-      if (e.status) return err(reply, e.status, e.message, e.code ? { code: e.code } : {});
+      if (e.status) return err(reply, e.status, e.message, { ...(e.code ? { code: e.code } : {}), ...(e.user ? { user: e.user } : {}) });
       throw e;
     }
   };
 
   // The homepage asks first: setup = no administrator yet, so the first sign-up creates it.
   app.get('/api/auth/state', async () => ({ setup: await needsSetup() }));
+  // A session only for an active account (sessionUser): a pending or rejected one answers 401 here.
   app.get('/api/auth/me', async (req, reply) => {
     const user = await sessionUser(tokenOf(req));
     if (!user) return err(reply, 401, 'Sign in required');
     return { user: publicUser(user), capabilities: CAPABILITIES };
   });
-  app.post('/api/auth/signup', guard(async (req, reply) => done(req, reply, await signup(req.body || {}))));
-  app.post('/api/auth/login', guard(async (req, reply) => done(req, reply, await login(req.body || {}))));
+  // Username + this browser's device (secret and computer info). Only the first account (the administrator) is
+  // signed in at once; any other waits for approval without a session, then signs in through /api/auth/device.
+  app.post('/api/auth/signup', AUTH_BODY, guard(async (req, reply) => {
+    if (!signupAllowed(req.ip)) return err(reply, 429, 'Too many registrations from this address. Try again later.', { code: 'rate_limited' });
+    const user = await signup(req.body || {});
+    if (user.status === 'active') return done(req, reply, user);
+    return { user: publicUser(user), pending: true };
+  }));
+  app.post('/api/auth/device', AUTH_BODY, guard(async (req, reply) => done(req, reply, await deviceLogin(req.body || {}))));
+  app.post('/api/auth/login', AUTH_BODY, guard(async (req, reply) => done(req, reply, await login(req.body || {}))));
   app.post('/api/auth/logout', async (req, reply) => {
     await destroySession(tokenOf(req));
     reply.header('set-cookie', clearedCookie(req));

@@ -20,7 +20,7 @@ async function request(method, url, body, { quiet } = {}) {
     }
     const msg = data?.error || data?.message || res.statusText || 'Request failed';
     if (!quiet) toast.error(msg);
-    throw Object.assign(new Error(msg), { status: res.status, code: data?.code });
+    throw Object.assign(new Error(msg), { status: res.status, code: data?.code, user: data?.user });
   }
   return data;
 }

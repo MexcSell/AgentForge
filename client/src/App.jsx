@@ -34,6 +34,7 @@ function useNarrow() {
 /** Signed out → the login homepage; pending approval → the waiting screen; otherwise the control room. */
 export default function App() {
   const me = useStore((s) => s.me);
+  const waiting = useStore((s) => s.device?.code === 'pending'); // registered from this browser, not approved yet
   const loadMe = useStore((s) => s.loadMe);
   useEffect(() => {
     let alive = true;
@@ -47,7 +48,7 @@ export default function App() {
     else disconnectEvents();
   }, [me?.status, me?.id]);
   if (me === undefined) return <div className="h-full flex items-center justify-center gap-2 text-sm text-muted bg-bg"><Spinner /> Connecting to AgentForge…</div>;
-  if (me === null) return <><Login /><Toasts /></>;
+  if (me === null) return <>{waiting ? <Pending /> : <Login />}<Toasts /></>;
   if (me.status !== 'active') return <><Pending /><Toasts /></>;
   return <ControlRoom />;
 }

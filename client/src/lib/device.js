@@ -1,6 +1,55 @@
-// The device fingerprint sent with sign-up and login (server/services/auth.js hashes and matches it). Only
-// characteristics of the computer and browser, never an IP or other network address, and never the window size, so
-// resizing the browser does not change it. The server tolerates a few soft changes (monitor, language, timezone).
+// This browser's device identity (server/services/auth.js). deviceCredential(): a random 256-bit secret created the
+// first time it is needed and kept in localStorage; it is what signs the account in, and the server stores only its
+// hash. info: what the administrator sees at approval (OS, browser, screen, a label), never trusted for sign-in.
+// deviceFingerprint(): the legacy fingerprint, still sent with a password login so accounts created before device
+// secrets can bind one. None of it holds an IP or other network address, or the window size.
+
+export const DEVICE_KEY = 'agentforge.device';
+
+const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+/** The stored secret, or null when this browser has none yet (or no storage). */
+export function storedDeviceSecret(storage = globalThis.localStorage) {
+  try {
+    const s = storage?.getItem(DEVICE_KEY);
+    return s && /^[A-Za-z0-9_-]{43,128}$/.test(s) ? s : null;
+  } catch {
+    return null;
+  }
+}
+
+/** This browser's secret, created and stored on first use. crypto.getRandomValues works on plain-http origins too. */
+export function deviceSecret(storage = globalThis.localStorage, rand = globalThis.crypto) {
+  const have = storedDeviceSecret(storage);
+  if (have) return have;
+  const secret = b64url(rand.getRandomValues(new Uint8Array(32)));
+  try { storage.setItem(DEVICE_KEY, secret); } catch { /* private mode: lives for this page only */ }
+  return secret;
+}
+
+const OSES = [[/Windows/i, 'Windows'], [/Android/i, 'Android'], [/iPhone|iPad|iPod/i, 'iOS'], [/CrOS/i, 'ChromeOS'], [/Mac OS X|Macintosh/i, 'macOS'], [/Linux/i, 'Linux']];
+const BROWSERS = [[/Edg\//, 'Edge'], [/OPR\//, 'Opera'], [/Firefox\//, 'Firefox'], [/Chrome\//, 'Chrome'], [/Safari\//, 'Safari']];
+const pick = (list, text) => list.find(([re]) => re.test(text))?.[1] || 'Unknown';
+
+/** Descriptive info about this computer, shown to the administrator. label: "Chrome on Linux". */
+export function deviceInfo(nav = globalThis.navigator || {}, scr = globalThis.screen) {
+  const ua = String(nav.userAgent || '');
+  const os = pick(OSES, ua);
+  const browser = pick(BROWSERS, ua);
+  return {
+    label: `${browser} on ${os}`,
+    os,
+    browser,
+    platform: String(nav.userAgentData?.platform || nav.platform || ''),
+    userAgent: ua.slice(0, 400),
+    screen: scr?.width ? `${scr.width}x${scr.height}` : '',
+    language: String(nav.language || ''),
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+  };
+}
+
+/** What sign-up, device sign-in and password login send as `device`. */
+export const deviceCredential = (nav, scr, storage) => ({ secret: deviceSecret(storage), info: deviceInfo(nav, scr) });
 
 // FNV-1a, 32-bit: crypto.subtle is missing on plain-http origins other than localhost.
 function fnv(text) {

@@ -393,12 +393,12 @@ CREATE TABLE IF NOT EXISTS bt_watch_state (
 -- User accounts (services/auth.js, docs/users.md). status: pending (signed up, waiting for the administrator) → active,
 -- or rejected; active ↔ disabled. role 'admin' is the owner: the first account when none exists, or AF_ADMIN_USERNAME.
 -- permissions: { projects: uuid[], createProjects, runMissions, manageAgents, manageSettings } (services/access.js).
--- device: SHA-256 hashes of the sign-up computer's characteristics, one per component (never an IP address);
--- NULL once the administrator resets it, and bound again at the next login.
+-- device: legacy fingerprint (SHA-256 per component) of accounts created before username-only sign-up; still checked
+-- at their password login until they bind a device secret (see device_secret_hash below).
 CREATE TABLE IF NOT EXISTS users (
   id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   username        text NOT NULL,
-  password_hash   text NOT NULL,
+  password_hash   text,
   role            text NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
   status          text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'active', 'disabled', 'rejected')),
   team            text,
@@ -411,6 +411,15 @@ CREATE TABLE IF NOT EXISTS users (
   last_login_at   timestamptz
 );
 CREATE UNIQUE INDEX IF NOT EXISTS users_username_key ON users (lower(username));
+-- Username-only sign-up (docs/users.md): accounts registered from now on have no password and authenticate with a
+-- random device secret the browser keeps; only its SHA-256 is stored (device_secret_hash, one account per secret).
+-- device_info: what the browser says about the computer (OS, browser, screen, label), shown to the administrator at
+-- approval and never used to authenticate. Existing password accounts keep working and bind a secret at their next
+-- password login. Additive only: the old fingerprint column `device` stays, unused.
+ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS device_secret_hash text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS device_info jsonb;
+CREATE UNIQUE INDEX IF NOT EXISTS users_device_secret_key ON users (device_secret_hash);
 -- Signed-in browsers: the httpOnly cookie holds a random token, only its SHA-256 is stored. Survives restarts.
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash    text PRIMARY KEY,

@@ -1,5 +1,7 @@
-// Accounts, sessions and device binding (docs/users.md). Passwords: scrypt with a random salt per user. Sessions: a
-// random token in an httpOnly cookie, stored as its SHA-256. Devices: per-component SHA-256 of what the browser reports.
+// Accounts, sessions and device binding (docs/users.md). Sign-up takes a username only: the account is bound to a random
+// device secret the browser keeps (stored as its SHA-256), which is also how it signs in. Passwords (scrypt, random
+// salt) remain for accounts created before that and for the administrator's break-glass. Sessions: a random token in an
+// httpOnly cookie, stored as its SHA-256.
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import { one, many, query } from '../db/pool.js';
@@ -33,8 +35,37 @@ export async function verifyPassword(password, stored) {
 // Compared against when the username does not exist, so a miss takes as long as a wrong password.
 const DUMMY_HASH = hashPassword(crypto.randomBytes(16).toString('hex'));
 
-// ---- device fingerprint ------------------------------------------------------
-// What the client sends (client/src/lib/device.js). Anything else (an IP address, a window size…) is dropped.
+// ---- device secret -------------------------------------------------------------
+// client/src/lib/device.js: a random 256-bit secret created once per browser (base64url), and descriptive info about
+// the computer. Only the secret authenticates; the info is shown to the administrator and never trusted.
+const DEVICE_SECRET = /^[A-Za-z0-9_-]{43,128}$/;
+export const DEVICE_INFO = ['label', 'os', 'browser', 'platform', 'userAgent', 'screen', 'language', 'timezone'];
+export const DEVICE_INFO_MAX = 4096; // bytes of JSON
+
+/** sha256 of the device secret in body.device.secret, or null when there is none or it is malformed. */
+export function deviceSecretHash(device) {
+  const s = device?.secret;
+  return typeof s === 'string' && DEVICE_SECRET.test(s) ? sha256(`agentforge-device-secret|${s}`) : null;
+}
+
+/** The descriptive computer info to store: known keys only, as short strings. 413 when the payload is oversized. */
+export function deviceInfo(device) {
+  const raw = device?.info;
+  if (raw === undefined || raw === null) return {};
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw fail(400, 'Device information must be an object');
+  if (Buffer.byteLength(JSON.stringify(raw)) > DEVICE_INFO_MAX) throw fail(413, `Device information is too large (at most ${DEVICE_INFO_MAX} bytes)`, { code: 'device_info_too_large' });
+  const out = {};
+  for (const k of DEVICE_INFO) {
+    const v = raw[k];
+    if ((typeof v === 'string' && v.trim()) || typeof v === 'number') out[k] = String(v).trim().slice(0, k === 'userAgent' ? 400 : 120);
+  }
+  return out;
+}
+const NO_SECRET = 'This browser has no device key. Allow JavaScript and site storage (localStorage), then try again.';
+
+// ---- legacy device fingerprint ---------------------------------------------------
+// Accounts created before device secrets were bound to a fingerprint (users.device); their password login still has
+// to match it until it binds a secret. Anything else the client sends (an IP address, a window size…) is dropped.
 // HARDWARE must all match for a login; of the rest at most SOFT_TOLERANCE may differ (another monitor, a browser
 // update changing the canvas, a new language or timezone). The browser window size is not part of it at all.
 export const DEVICE_HARDWARE = ['platform', 'cores', 'memory', 'gpu'];
@@ -63,12 +94,13 @@ export function sameDevice(a, b) {
 // ---- users -------------------------------------------------------------------
 const USERNAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$/;
 
-/** What the API returns for a user: never the password hash or device hashes. */
+/** What the API returns for a user: never the password hash or device hashes (device_info is descriptive only). */
 export function publicUser(u) {
   if (!u) return null;
   return {
     id: u.id, username: u.username, role: u.role, status: u.status, team: u.team || null, permissions: sanitizeStored(u.permissions),
-    device_bound: !!u.device, device_bound_at: u.device_bound_at, created_at: u.created_at, approved_at: u.approved_at, last_login_at: u.last_login_at,
+    device_bound: !!(u.device_secret_hash || u.device), device_bound_at: u.device_bound_at, device_info: u.device_info || null, has_password: !!u.password_hash,
+    created_at: u.created_at, approved_at: u.approved_at, last_login_at: u.last_login_at,
   };
 }
 const sanitizeStored = (p) => ({ projects: [], ...(p || {}) });
@@ -77,11 +109,7 @@ export const getUser = (id) => one(`SELECT * FROM users WHERE id = $1`, [id]);
 const byName = (name) => one(`SELECT * FROM users WHERE lower(username) = lower($1)`, [String(name || '')]);
 export const listUsers = async () => (await many(`SELECT * FROM users ORDER BY (status = 'pending') DESC, created_at`)).map(publicUser);
 
-/** The other account (if any) whose bound device is this one. */
-async function deviceOwner(device, exceptId = null) {
-  const rows = await many(`SELECT id, username, device FROM users WHERE device IS NOT NULL AND id IS DISTINCT FROM $1`, [exceptId]);
-  return rows.find((r) => sameDevice(r.device, device)) || null;
-}
+const byDevice = (hash) => (hash ? one(`SELECT * FROM users WHERE device_secret_hash = $1`, [hash]) : null);
 
 // Sign-ups run one at a time, so two first sign-ups can not both become the administrator.
 let lane = Promise.resolve();
@@ -91,56 +119,98 @@ const serial = (fn) => {
   return run;
 };
 
-/** Creates an account: pending, or the active administrator when there is none yet. */
-export function signup({ username, password, device, team } = {}) {
+/** Why an account can not get a session (403), or null when it is active. */
+function statusRefusal(user) {
+  if (user.status === 'pending') return fail(403, 'Your account is waiting for administrator approval', { code: 'pending', user: { username: user.username, team: user.team || null } });
+  if (user.status === 'rejected') return fail(403, 'Your registration was rejected by the administrator', { code: 'rejected', user: { username: user.username } });
+  if (user.status === 'disabled') return fail(403, 'This account is disabled. Contact the administrator.', { code: 'disabled', user: { username: user.username } });
+  return null;
+}
+
+/**
+ * Registers a username bound to this browser's device secret: pending (no session until approved), or the active
+ * administrator when there is none yet. A username whose device the administrator reset (and that has no password)
+ * is re-bound to the new computer and waits for approval again.
+ */
+export function signup({ username, device, team } = {}) {
   return serial(async () => {
     username = String(username || '').trim();
-    if (!USERNAME.test(username)) throw fail(400, 'Username: 3–32 letters, digits, dots, dashes or underscores, starting with a letter or digit');
-    if (String(password || '').length < 8) throw fail(400, 'Password: at least 8 characters');
-    const dev = hashDevice(device);
-    if (!dev) throw fail(400, 'Could not identify this computer. Enable JavaScript and WebGL, then try again.');
-    if (await byName(username)) throw fail(409, 'That username is already registered');
-    if (await deviceOwner(dev)) throw fail(409, 'This computer is already registered to another username. Sign in with that account instead.', { code: 'device_taken' });
+    if (!USERNAME.test(username)) throw fail(400, 'Username: 3–32 letters, digits, dots, dashes or underscores, starting with a letter or digit', { code: 'invalid_username' });
+    const hash = deviceSecretHash(device);
+    if (!hash) throw fail(400, NO_SECRET, { code: 'device_required' });
+    const info = deviceInfo(device);
+    const owner = await byDevice(hash);
+    if (owner) throw fail(409, `This computer is already registered as ${owner.username}.`, { code: 'device_taken' });
+    const existing = await byName(username);
+    if (existing && !(existing.role !== 'admin' && !existing.password_hash && !existing.device_secret_hash && !existing.device && existing.status !== 'disabled')) {
+      throw fail(409, 'That username is already registered', { code: 'username_taken' });
+    }
+    if (existing) { // re-registration after a device reset
+      await query(`DELETE FROM sessions WHERE user_id = $1`, [existing.id]);
+      const user = await one(`UPDATE users SET device_secret_hash = $2, device_info = $3, device_bound_at = now(), status = 'pending', updated_at = now() WHERE id = $1 RETURNING *`, [existing.id, hash, info]);
+      refreshUserClients(user.id, user, publicUser(user));
+      await audit(username, 'user.rebind-device', username, { device: info.label || null });
+      await notify({ source_type: 'system', source_name: 'Users', level: 'warn', title: `New computer waiting for approval · ${username}`, body: info.label || null }).catch(() => {});
+      return user;
+    }
     const first = !(await one(`SELECT 1 FROM users WHERE role = 'admin'`));
     const user = await one(
-      `INSERT INTO users(username, password_hash, role, status, team, permissions, device, device_bound_at, approved_at)
+      `INSERT INTO users(username, role, status, team, permissions, device_secret_hash, device_info, device_bound_at, approved_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,now(),$8) RETURNING *`,
-      [username, await hashPassword(password), first ? 'admin' : 'user', first ? 'active' : 'pending', String(team || '').trim().slice(0, 80) || null,
-        sanitizePermissions({}), dev, first ? new Date() : null],
+      [username, first ? 'admin' : 'user', first ? 'active' : 'pending', String(team || '').trim().slice(0, 80) || null,
+        sanitizePermissions({}), hash, info, first ? new Date() : null],
     );
-    await audit(username, first ? 'user.bootstrap-admin' : 'user.signup', username, { team: user.team });
-    if (!first) await notify({ source_type: 'system', source_name: 'Users', level: 'warn', title: `Registration waiting for approval · ${username}`, body: user.team ? `Team: ${user.team}` : null }).catch(() => {});
+    await audit(username, first ? 'user.bootstrap-admin' : 'user.signup', username, { team: user.team, device: info.label || null });
+    if (!first) await notify({ source_type: 'system', source_name: 'Users', level: 'warn', title: `Registration waiting for approval · ${username}`, body: [info.label, user.team && `Team: ${user.team}`].filter(Boolean).join(' · ') || null }).catch(() => {});
     return user;
   });
 }
 
+/** Signs in with the device secret alone: unknown 401, pending/rejected/disabled 403 (with code), active → the user. */
+export async function deviceLogin({ device } = {}) {
+  const hash = deviceSecretHash(device);
+  if (!hash) throw fail(400, NO_SECRET, { code: 'device_required' });
+  const user = await byDevice(hash);
+  if (!user) throw fail(401, 'This computer is not registered. Sign up with a username first.', { code: 'unknown_device' });
+  const refused = statusRefusal(user);
+  if (refused) throw refused;
+  return one(`UPDATE users SET last_login_at = now() WHERE id = $1 RETURNING *`, [user.id]);
+}
+
 /**
- * Checks a login. Pending users get a session (they see the waiting screen); rejected and disabled ones do not.
- * A non-admin must sign in from the computer bound to the account; after an administrator reset, the next login binds it.
+ * Password login: accounts created before username-only sign-up, and the administrator (break-glass, any computer).
+ * Only active accounts get a session. A non-admin must come from its bound computer: its device secret, or for a legacy
+ * account its fingerprint. An account without a device secret binds this browser's (the one-time migration path).
  */
-export async function login({ username, password, device } = {}) {
+export async function login({ username, password, device, fingerprint } = {}) {
   const user = await byName(username);
   if (!user) {
     await verifyPassword(String(password || ''), await DUMMY_HASH);
     throw fail(401, 'Invalid username or password');
   }
   if (!(await verifyPassword(String(password || ''), user.password_hash))) throw fail(401, 'Invalid username or password');
-  if (user.status === 'rejected') throw fail(403, 'Your registration was rejected by the administrator', { code: 'rejected' });
-  if (user.status === 'disabled') throw fail(403, 'This account is disabled. Contact the administrator.', { code: 'disabled' });
-  const dev = hashDevice(device);
+  const refused = statusRefusal(user);
+  if (refused) throw refused;
+  const hash = deviceSecretHash(device);
   const admin = user.role === 'admin';
-  if (!admin && !dev) throw fail(400, 'Could not identify this computer. Enable JavaScript and WebGL, then try again.');
-  if (!admin && user.device && !sameDevice(user.device, dev)) {
+  if (!admin && !hash) throw fail(400, NO_SECRET, { code: 'device_required' });
+  const mismatch = () => fail(403, 'This account is registered to another computer. Sign in from that computer, or ask the administrator to reset your device.', { code: 'device_mismatch' });
+  if (!admin && user.device_secret_hash && user.device_secret_hash !== hash) {
     await audit(user.username, 'user.login-device-refused', user.username);
-    throw fail(403, 'This account is registered to another computer. Sign in from that computer, or ask the administrator to reset your device.', { code: 'device_mismatch' });
+    throw mismatch();
   }
-  let bind = !user.device && dev;
-  if (bind && !admin && (await deviceOwner(dev, user.id))) throw fail(409, 'This computer is already registered to another username', { code: 'device_taken' });
-  if (bind && admin && (await deviceOwner(dev, user.id))) bind = false; // the admin may sign in anywhere; it never takes a device over
-  const row = await one(
-    `UPDATE users SET last_login_at = now()${bind ? ', device = $2, device_bound_at = now()' : ''} WHERE id = $1 RETURNING *`,
-    bind ? [user.id, dev] : [user.id]);
-  return row;
+  if (!admin && !user.device_secret_hash && user.device && !sameDevice(user.device, hashDevice(fingerprint))) {
+    await audit(user.username, 'user.login-device-refused', user.username);
+    throw mismatch();
+  }
+  let bind = !user.device_secret_hash && !!hash;
+  if (bind && (await byDevice(hash))) {
+    if (!admin) throw fail(409, 'This computer is already registered to another username', { code: 'device_taken' });
+    bind = false; // the admin may sign in anywhere; it never takes a device over
+  }
+  return one(
+    `UPDATE users SET last_login_at = now()${bind ? ', device_secret_hash = $2, device_info = $3, device_bound_at = now()' : ''} WHERE id = $1 RETURNING *`,
+    bind ? [user.id, hash, deviceInfo(device)] : [user.id]);
 }
 
 /**
@@ -181,7 +251,8 @@ export async function createSession(userId) {
 export async function sessionUser(token) {
   if (!token) return null;
   const h = sha256(token);
-  const u = await one(`SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = $1 AND s.expires_at > now()`, [h]);
+  // Only active accounts have sessions: one left from before (a pending sign-up used to get one) counts as none.
+  const u = await one(`SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = $1 AND s.expires_at > now() AND u.status = 'active'`, [h]);
   if (u) query(`UPDATE sessions SET last_seen_at = now() WHERE token_hash = $1 AND last_seen_at < now() - interval '10 minutes'`, [h]).catch(() => {});
   return u;
 }
@@ -235,7 +306,8 @@ export async function userAction(actor, id, action) {
   const u = await getUser(id);
   if (!u) throw fail(404, 'User not found');
   if (action === 'reset-device') {
-    await query(`UPDATE users SET device = NULL, device_bound_at = NULL, updated_at = now() WHERE id = $1`, [u.id]);
+    if (!u.password_hash && u.role === 'admin') throw fail(400, 'An administrator without a password would be locked out. Set one first: node scripts/reset-admin.js');
+    await query(`UPDATE users SET device = NULL, device_secret_hash = NULL, device_info = NULL, device_bound_at = NULL, updated_at = now() WHERE id = $1`, [u.id]);
     await audit(actor.username, 'user.reset-device', u.username);
     return changed(u.id);
   }

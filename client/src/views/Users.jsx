@@ -47,6 +47,18 @@ function Permissions({ user, projects, capabilities, onSaved }) {
   );
 }
 
+/** The computer the account registered (or bound) from, as its browser described it: for the administrator to judge. */
+function DeviceInfo({ info }) {
+  const parts = [info.os, info.browser, info.platform, info.screen && `screen ${info.screen}`, info.language, info.timezone].filter(Boolean);
+  return (
+    <div className="mt-2 flex flex-col gap-0.5 text-xs text-subtle" data-device-info>
+      <span className="inline-flex items-center gap-1.5 text-fg"><MonitorSmartphone size={12} className="text-subtle" />{info.label || 'Unknown computer'}</span>
+      {parts.length > 0 && <span>{parts.join(' · ')}</span>}
+      {info.userAgent && <span className="font-mono text-[0.7rem] break-all">{info.userAgent}</span>}
+    </div>
+  );
+}
+
 function UserRow({ user, me, projects, capabilities, onChange, onDelete }) {
   const [open, setOpen] = useState(false);
   const self = user.id === me?.id;
@@ -72,12 +84,13 @@ function UserRow({ user, me, projects, capabilities, onChange, onDelete }) {
           {user.status === 'rejected' && <Button size="sm" icon={Check} onClick={act('approve', 'Approved')}>Approve</Button>}
           {!self && !admin && user.status === 'active' && <Button size="sm" icon={Ban} onClick={act('disable', 'Disabled')}>Disable</Button>}
           {user.status === 'disabled' && <Button size="sm" icon={Power} onClick={act('enable', 'Enabled')}>Enable</Button>}
-          {user.device_bound && <Button size="sm" variant="ghost" icon={MonitorSmartphone} title="The next login binds the computer it comes from" onClick={act('reset-device', 'Device binding reset')}>Reset device</Button>}
+          {user.device_bound && <Button size="sm" variant="ghost" icon={MonitorSmartphone} title="The user registers again from their new computer (or a password account logs in from it) and waits for your approval" onClick={act('reset-device', 'Device binding reset')}>Reset device</Button>}
           {!admin && <Button size="sm" variant="ghost" onClick={() => setOpen(!open)}>{open ? 'Hide permissions' : 'Permissions'}</Button>}
           {!self && !admin && <Button size="sm" variant="ghost" icon={Trash2} label="Delete" title="Delete account"
             onClick={async () => { if (!confirm(`Delete the account ${user.username}?`)) return; await api.del(`/api/users/${user.id}`); onDelete(user.id); toast.info(`Deleted · ${user.username}`); }} />}
         </div>
       </div>
+      {user.device_info && <DeviceInfo info={user.device_info} />}
       {open && !admin && <Permissions user={user} projects={projects} capabilities={capabilities} onSaved={onChange} />}
     </div>
   );
@@ -107,8 +120,9 @@ export default function Users() {
           : !data.users.length ? <Empty icon={UsersIcon} title="No users yet" />
             : data.users.map((u) => <UserRow key={u.id} user={u} me={me} projects={projects} capabilities={data.capabilities} onChange={replace} onDelete={remove} />)}
         <p className={cx('text-xs text-subtle')}>
-          New sign-ups wait here until approved. Each account is bound to the computer it registered from; a login from another computer is refused
-          until you reset its device. Administrators are not bound. See docs/users.md.
+          New sign-ups wait here until approved, with the computer they registered from as its browser describes it. Each account signs in with a secret
+          kept by that browser, so another computer is refused until you reset its device; the user then registers again from the new one and waits
+          for your approval. Administrators with a password may sign in anywhere. See docs/users.md.
         </p>
       </div>
     </div>

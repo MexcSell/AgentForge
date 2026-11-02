@@ -1,10 +1,12 @@
-// Accounts and authorization (routes/auth.js, services/auth.js, services/access.js, events.js): sign-up → pending →
-// admin approval, rejected/disabled logins, per-project permissions over REST and WebSocket (the protected AgentForge
-// project stays hidden), and device binding. Runs the real routes in-process against session temp tables
+// Accounts and authorization (routes/auth.js, services/auth.js, services/access.js, events.js): username-only sign-up
+// bound to a device secret → pending (no session) → admin approval → password-less device sign-in, foreign devices
+// refused, rejected/disabled accounts, per-project permissions over REST and WebSocket (the protected AgentForge project
+// stays hidden). Legacy password accounts: tests/auth-migration.test.mjs. Runs the real routes in-process against session temp tables
 // (search_path=pg_temp), never the live tables.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import WebSocket from 'ws';
 
 process.env.PGOPTIONS = '-c search_path=pg_temp';
@@ -21,12 +23,19 @@ const { default: filesRoutes } = await import('../server/routes/files.js');
 const { addClient, emit } = await import('../server/events.js');
 const auth = await import('../server/services/auth.js');
 
-// A computer as client/src/lib/device.js reports it, and variations of it.
+// A browser as client/src/lib/device.js reports it: its random secret and what it says about the computer.
+const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+const browser = (label, info = {}) => ({ secret: crypto.randomBytes(32).toString('base64url'),
+  info: { label, os: 'Linux', browser: 'Chrome', platform: 'Linux x86_64', userAgent: UA, screen: '1920x1080', language: 'en-US', timezone: 'Europe/Berlin', ...info } });
+const OWNER_DEV = browser('Chrome on Linux');
+const BOB_DEV = browser('Chrome on Linux', { screen: '1366x768' });
+const CAROL_DEV = browser('Edge on Windows', { os: 'Windows', browser: 'Edge', platform: 'Win32', timezone: 'Asia/Seoul', language: 'ko-KR' });
+const LAPTOP_DEV = browser('Safari on macOS', { os: 'macOS', browser: 'Safari', platform: 'MacIntel' });
+
+// The legacy fingerprint (password logins of accounts created before device secrets), and variations of it.
 const PC = { platform: 'Linux x86_64', cores: 8, memory: 8, gpu: 'ANGLE (NVIDIA, GeForce GTX 1080)', canvas: 'c0ffee12', touch: 0, screen: '1920x1080', colorDepth: 24, timezone: 'Europe/Berlin', language: 'en-US' };
 const pc = (over = {}) => ({ ...PC, ...over });
 const LAPTOP = pc({ platform: 'MacIntel', cores: 10, memory: 16, gpu: 'Apple M1 Pro', canvas: 'aa11bb22', screen: '1512x982', colorDepth: 30 });
-const BOB_PC = pc({ cores: 4, memory: 4, gpu: 'Mesa Intel(R) UHD Graphics 620', canvas: '5eed5eed', screen: '1366x768' });
-const CAROL_PC = pc({ platform: 'Win32', cores: 12, memory: 32, gpu: 'ANGLE (AMD Radeon RX 6700)', canvas: '0ddba11', timezone: 'Asia/Seoul', language: 'ko-KR' });
 
 let app, base, core, alpha, beta;
 let proxied, proxiedBase; // the same routes with TRUST_PROXY=1 (config.trustProxy 'loopback'), as behind deploy/Caddyfile
@@ -43,8 +52,9 @@ async function call(method, path, { body, cookie, headers = {}, at = base } = {}
   return { status: res.status, data, setCookie: res.headers.get('set-cookie') };
 }
 const cookieOf = (r) => r.setCookie.split(';')[0];
-const signup = (username, device, extra = {}) => call('POST', '/api/auth/signup', { body: { username, password: 'correct horse', device, ...extra } });
-const login = (username, device, password = 'correct horse') => call('POST', '/api/auth/login', { body: { username, password, device } });
+const signup = (username, device, extra = {}) => call('POST', '/api/auth/signup', { body: { username, device, ...extra } });
+const deviceLogin = (device, opts = {}) => call('POST', '/api/auth/device', { body: { device }, ...opts });
+const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const userId = async (name) => (await one(`SELECT id FROM users WHERE username = $1`, [name])).id;
 
 /** Opens /api/events (or path) with the cookie and an optional browser Origin; resolves { ws, events } once open, or { status } when the upgrade is refused. */
@@ -81,7 +91,7 @@ before(async () => {
     scope.get('/api/events', { websocket: true }, (ws, req) => addClient(ws, req.user));
     scope.get('/api/terminal', { websocket: true }, (ws) => ws.close());
   });
-  await app.register(authRoutes);
+  await app.register(authRoutes, { signupLimit: { max: 1000, windowMs: 60_000 } });
   await app.register(apiRoutes);
   await app.register(filesRoutes);
   await app.listen({ port: 0, host: '127.0.0.1' });
@@ -95,7 +105,7 @@ before(async () => {
     scope.get('/api/events', { websocket: true }, (ws, req) => addClient(ws, req.user));
     scope.get('/api/terminal', { websocket: true }, (ws) => ws.close());
   });
-  await proxied.register(authRoutes);
+  await proxied.register(authRoutes, { signupLimit: { max: 2, windowMs: 60_000 } });
   await proxied.listen({ port: 0, host: '127.0.0.1' });
   proxiedBase = `http://127.0.0.1:${proxied.server.address().port}`;
 });
@@ -117,10 +127,13 @@ test('signed out: the API and the event socket answer 401; health and the sign-i
   assert.equal((await call('GET', '/api/health')).status, 200);
   assert.deepEqual((await call('GET', '/api/auth/state')).data, { setup: true });
   assert.equal((await call('GET', '/api/auth/me')).status, 401);
+  const none = await call('POST', '/api/auth/device', { body: {} });
+  assert.deepEqual([none.status, none.data.code], [400, 'device_required']);
+  assert.equal((await deviceLogin(OWNER_DEV)).data.code, 'unknown_device');
 });
 
-test('the first account becomes the active administrator, with a salted scrypt hash and an httpOnly session cookie', async () => {
-  const r = await signup('owner', PC);
+test('the first account becomes the active administrator: username only, bound to its device, with an httpOnly session cookie', async () => {
+  const r = await signup('owner', OWNER_DEV);
   assert.equal(r.status, 200);
   assert.equal(r.data.user.role, 'admin');
   assert.equal(r.data.user.status, 'active');
@@ -128,16 +141,27 @@ test('the first account becomes the active administrator, with a salted scrypt h
   assert.match(r.setCookie, /HttpOnly/);
   assert.match(r.setCookie, /SameSite=Lax/);
   admin = cookieOf(r);
-  const row = await one(`SELECT password_hash FROM users WHERE username = 'owner'`);
-  assert.match(row.password_hash, /^scrypt\$16384\$8\$1\$[A-Za-z0-9+/=]{20,}\$[A-Za-z0-9+/=]{80,}$/);
-  assert.ok(!row.password_hash.includes('correct horse'));
-  assert.notEqual(await auth.hashPassword('correct horse'), await auth.hashPassword('correct horse'), 'random salt');
-  assert.equal(await auth.verifyPassword('correct horse', row.password_hash), true);
-  assert.equal(await auth.verifyPassword('wrong horse', row.password_hash), false);
+  // No password; only a hash of the device secret is stored, never the secret.
+  const row = await one(`SELECT * FROM users WHERE username = 'owner'`);
+  assert.equal(row.password_hash, null);
+  assert.match(row.device_secret_hash, /^[0-9a-f]{64}$/);
+  assert.notEqual(row.device_secret_hash, sha(OWNER_DEV.secret));
+  assert.ok(!JSON.stringify(row).includes(OWNER_DEV.secret));
+  // Signing in again from the same browser needs nothing but its device.
+  const again = await deviceLogin(OWNER_DEV);
+  assert.equal(again.status, 200);
+  assert.equal(again.data.user.username, 'owner');
   // Only the token's SHA-256 is stored.
   assert.equal((await one(`SELECT count(*)::int AS n FROM sessions WHERE token_hash = $1`, [admin.split('=')[1]])).n, 0);
   assert.deepEqual((await call('GET', '/api/auth/state')).data, { setup: false });
   assert.equal((await call('GET', '/api/projects', { cookie: admin })).data.length, 3);
+  // Legacy password hashing (accounts from before, the break-glass administrator).
+  const hash = await auth.hashPassword('correct horse');
+  assert.match(hash, /^scrypt\$16384\$8\$1\$[A-Za-z0-9+/=]{20,}\$[A-Za-z0-9+/=]{80,}$/);
+  assert.notEqual(await auth.hashPassword('correct horse'), hash, 'random salt');
+  assert.equal(await auth.verifyPassword('correct horse', hash), true);
+  assert.equal(await auth.verifyPassword('wrong horse', hash), false);
+  assert.equal(await auth.verifyPassword('', null), false, 'an account without a password never matches');
 });
 
 test('WebSockets accept the app\'s own origin (any host name or IP it is opened by) and refuse other origins', async () => {
@@ -155,38 +179,49 @@ test('WebSockets accept the app\'s own origin (any host name or IP it is opened 
   assert.equal((await socket(undefined, { origin: 'http://evil.example' })).status, 403, 'refused before the session check');
 });
 
-test('a new sign-up is pending: it can see its own state but nothing else until approved', async () => {
-  const r = await signup('bob', BOB_PC, { team: 'Platform' });
+test('a new sign-up is pending and bound to its device: no session over HTTP or WebSocket until approved', async () => {
+  const r = await signup('bob', BOB_DEV, { team: 'Platform' });
   assert.equal(r.status, 200);
+  assert.equal(r.data.pending, true);
   assert.equal(r.data.user.status, 'pending');
   assert.equal(r.data.user.role, 'user');
-  bob = cookieOf(r);
-  assert.equal((await call('GET', '/api/auth/me', { cookie: bob })).data.user.status, 'pending');
-  const p = await call('GET', '/api/projects', { cookie: bob });
-  assert.equal(p.status, 403);
-  assert.equal(p.data.status, 'pending');
-  assert.equal((await socket(bob)).status, 403);
-  // The administrator is told, and sees it first in the list.
+  assert.equal(r.setCookie, null, 'no session cookie while pending');
+  // Its browser signing in is told why, with no session either.
+  const wait = await deviceLogin(BOB_DEV);
+  assert.equal(wait.status, 403);
+  assert.equal(wait.data.code, 'pending');
+  assert.equal(wait.data.user.username, 'bob');
+  assert.equal(wait.setCookie, null);
+  // A session made for it anyway (as the old sign-up did) is worth nothing.
+  const stale = `af_session=${await auth.createSession(await userId('bob'))}`;
+  assert.equal((await call('GET', '/api/auth/me', { cookie: stale })).status, 401);
+  assert.equal((await call('GET', '/api/projects', { cookie: stale })).status, 401);
+  assert.equal((await socket(stale)).status, 401);
+  // The administrator is told, and sees it first in the list, with the computer it registered from.
   const list = await call('GET', '/api/users', { cookie: admin });
-  assert.equal(list.data.users[0].username, 'bob');
-  assert.equal(list.data.users[0].team, 'Platform');
-  assert.ok(!('password_hash' in list.data.users[0]) && !('device' in list.data.users[0]));
-  assert.ok((await one(`SELECT 1 FROM notifications WHERE title LIKE '%bob%'`)));
+  const u = list.data.users[0];
+  assert.equal(u.username, 'bob');
+  assert.equal(u.team, 'Platform');
+  assert.equal(u.device_bound, true);
+  assert.deepEqual(u.device_info, BOB_DEV.info);
+  for (const k of ['password_hash', 'device', 'device_secret_hash']) assert.ok(!(k in u), k);
+  assert.ok(!JSON.stringify(list.data).includes(BOB_DEV.secret));
+  assert.ok((await one(`SELECT 1 FROM notifications WHERE title LIKE '%bob%' AND body LIKE '%Chrome on Linux%'`)));
 });
 
 test('TRUST_PROXY: forwarded https gives Secure cookies, the forwarded origin and the real client IP; never without it', async () => {
   const XF = { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'af.example', 'x-forwarded-for': '203.0.113.9' };
   // Behind the trusted proxy (loopback here).
-  const r = await call('POST', '/api/auth/login', { at: proxiedBase, headers: XF, body: { username: 'owner', password: 'correct horse', device: PC } });
+  const r = await deviceLogin(OWNER_DEV, { at: proxiedBase, headers: XF });
   assert.equal(r.status, 200);
   assert.match(r.setCookie, /; Secure$/);
   const out = await call('POST', '/api/auth/logout', { at: proxiedBase, headers: XF, cookie: cookieOf(r) });
   assert.match(out.setCookie, /Max-Age=0; Secure$/);
-  assert.doesNotMatch((await call('POST', '/api/auth/login', { at: proxiedBase, body: { username: 'owner', password: 'correct horse', device: PC } })).setCookie, /Secure/, 'plain http via the proxy');
+  assert.doesNotMatch((await deviceLogin(OWNER_DEV, { at: proxiedBase })).setCookie, /Secure/, 'plain http via the proxy');
   const who = await call('GET', '/api/whoami', { at: proxiedBase, cookie: admin, headers: { ...XF, 'x-forwarded-for': '198.51.100.1, 203.0.113.9' } });
   assert.deepEqual(who.data, { ip: '203.0.113.9', protocol: 'https', host: 'af.example' }, 'the address the proxy saw, not what the client claims');
   // Direct clients (the default, TRUST_PROXY unset) can not claim https: identical cookies to plain http.
-  const direct = await call('POST', '/api/auth/login', { headers: XF, body: { username: 'owner', password: 'correct horse', device: PC } });
+  const direct = await deviceLogin(OWNER_DEV, { headers: XF });
   assert.equal(direct.status, 200);
   assert.doesNotMatch(direct.setCookie, /Secure/);
   assert.doesNotMatch((await call('POST', '/api/auth/logout', { headers: XF, cookie: cookieOf(direct) })).setCookie, /Secure/);
@@ -208,29 +243,51 @@ test('TRUST_PROXY: forwarded https gives Secure cookies, the forwarded origin an
   assert.equal((await socket(admin, { origin: 'https://af.example', headers: XF })).status, 403, 'untrusted forwarded origin');
 });
 
-test('sign-up is refused for a computer bound to another username, or a name that is taken', async () => {
-  const again = await signup('bob2', BOB_PC);
-  assert.equal(again.status, 409);
-  assert.equal(again.data.code, 'device_taken');
-  // A bigger window, another monitor or language is still the same computer.
-  assert.equal((await signup('bob3', pc({ ...BOB_PC, screen: '2560x1440', language: 'de-DE', innerWidth: 900 }))).data.code, 'device_taken');
-  const taken = await signup('BOB', CAROL_PC);
-  assert.equal(taken.status, 409);
+test('sign-up is refused for a registered device, a taken or invalid username, a missing secret and an oversized payload', async () => {
+  const again = await signup('bob2', BOB_DEV);
+  assert.deepEqual([again.status, again.data.code], [409, 'device_taken']);
+  assert.match(again.data.error, /already registered as bob/);
+  const taken = await signup('BOB', CAROL_DEV);
+  assert.deepEqual([taken.status, taken.data.code], [409, 'username_taken']);
   assert.match(taken.data.error, /username/);
-  assert.equal((await signup('x', CAROL_PC)).status, 400);
-  assert.equal((await call('POST', '/api/auth/signup', { body: { username: 'carol', password: 'short', device: CAROL_PC } })).status, 400);
-  assert.equal((await signup('carol', { ip: '10.0.0.1' })).status, 400, 'no device characteristics');
-  assert.equal(await one(`SELECT 1 FROM users WHERE lower(username) IN ('bob2', 'bob3', 'carol')`), null);
+  for (const name of ['x', '', '-bob', 'a b c', 'x'.repeat(33), '../etc']) {
+    const r = await signup(name, CAROL_DEV);
+    assert.deepEqual([r.status, r.data.code], [400, 'invalid_username'], name);
+  }
+  // The secret is what binds the device: describing a computer is not enough.
+  for (const device of [undefined, { info: CAROL_DEV.info }, { secret: 'short', info: CAROL_DEV.info }, { secret: 'x'.repeat(40) + '!!!', info: {} }]) {
+    const r = await signup('carol', device);
+    assert.deepEqual([r.status, r.data.code], [400, 'device_required'], JSON.stringify(device));
+    assert.match(r.data.error, /device key/);
+  }
+  assert.equal((await signup('carol', { ...CAROL_DEV, info: 'Windows' })).status, 400);
+  const big = await signup('carol', { ...CAROL_DEV, info: { ...CAROL_DEV.info, label: 'x'.repeat(5000) } });
+  assert.deepEqual([big.status, big.data.code], [413, 'device_info_too_large']);
+  assert.match(big.data.error, /too large/);
+  const huge = await signup('carol', { ...CAROL_DEV, info: { padding: 'x'.repeat(40_000) } });
+  assert.equal(huge.status, 413, 'over the route body limit');
+  assert.equal(await one(`SELECT 1 FROM users WHERE lower(username) IN ('bob2', 'carol')`), null);
 });
 
-test('the stored device holds hashed characteristics only, never an IP address', async () => {
-  const r = await signup('carol', { ...CAROL_PC, ip: '203.0.113.7', ipv6: '2001:db8::1', localAddress: '192.168.1.20' });
+test('registrations are rate-limited per client address', async () => {
+  const XF = (ip) => ({ 'x-forwarded-for': ip });
+  const at = proxiedBase; // signupLimit max 2, keyed by the address the trusted proxy saw
+  for (let i = 0; i < 2; i++) assert.equal((await call('POST', '/api/auth/signup', { at, headers: XF('203.0.113.50'), body: { username: '!' } })).status, 400);
+  const over = await call('POST', '/api/auth/signup', { at, headers: XF('203.0.113.50'), body: { username: 'dave', device: browser('x') } });
+  assert.deepEqual([over.status, over.data.code], [429, 'rate_limited']);
+  assert.equal(await one(`SELECT 1 FROM users WHERE username = 'dave'`), null);
+  assert.equal((await call('POST', '/api/auth/signup', { at, headers: XF('203.0.113.51'), body: { username: '!' } })).status, 400, 'another address is not limited');
+});
+
+test('the stored device: a hash of the secret plus the known descriptive fields, never an IP address', async () => {
+  const r = await signup('carol', { ...CAROL_DEV, info: { ...CAROL_DEV.info, ip: '203.0.113.7', ipv6: '2001:db8::1', localAddress: '192.168.1.20', cores: { nested: true } } });
   assert.equal(r.status, 200);
-  const { device } = await one(`SELECT device FROM users WHERE username = 'carol'`);
-  assert.deepEqual(Object.keys(device).sort(), [...auth.DEVICE_HARDWARE, ...auth.DEVICE_SOFT].sort());
-  for (const v of Object.values(device)) assert.match(v, /^[0-9a-f]{64}$/);
-  const text = JSON.stringify(device);
-  for (const raw of ['203.0.113', '2001:db8', '192.168', 'Win32', 'Radeon', 'Asia/Seoul']) assert.ok(!text.includes(raw), raw);
+  const row = await one(`SELECT device, device_secret_hash, device_info FROM users WHERE username = 'carol'`);
+  assert.equal(row.device, null, 'no legacy fingerprint for new accounts');
+  assert.deepEqual(row.device_info, CAROL_DEV.info);
+  assert.deepEqual(Object.keys(row.device_info).sort(), [...auth.DEVICE_INFO].sort());
+  const text = JSON.stringify(row);
+  for (const raw of ['203.0.113', '2001:db8', '192.168', CAROL_DEV.secret]) assert.ok(!text.includes(raw), raw);
 });
 
 test('fingerprint matching tolerates small changes, not another computer', () => {
@@ -246,6 +303,9 @@ test('fingerprint matching tolerates small changes, not another computer', () =>
 test('the admin approves; permissions decide the projects (never the AgentForge one) and the capabilities', async () => {
   const bobId = await userId('bob');
   assert.equal((await call('POST', `/api/users/${bobId}/approve`, { cookie: admin })).data.status, 'active');
+  const signedIn = await deviceLogin(BOB_DEV);
+  assert.equal(signedIn.status, 200);
+  bob = cookieOf(signedIn);
   assert.deepEqual((await call('GET', '/api/projects', { cookie: bob })).data, []);
   const set = await call('PUT', `/api/users/${bobId}/permissions`, { cookie: admin, body: { projects: [alpha, core, 'nope'], runMissions: false, bogus: true } });
   assert.deepEqual(set.data.permissions, { projects: [alpha], createProjects: false, runMissions: false, manageAgents: false, manageSettings: false });
@@ -285,6 +345,20 @@ test('the admin approves; permissions decide the projects (never the AgentForge 
   assert.equal(dash.status, 200);
   assert.equal(dash.data.counts.projects, 1);
   assert.equal((await call('GET', '/api/dashboard', { cookie: admin })).data.counts.projects, 3);
+});
+
+test('an approved browser signs in with no password; another device or a forged user agent without its secret is refused', async () => {
+  const me = await call('GET', '/api/auth/me', { cookie: bob });
+  assert.deepEqual([me.status, me.data.user.username, me.data.user.status], [200, 'bob', 'active']);
+  // Everything the browser says about itself, copied exactly, with another secret or none.
+  for (const device of [{ ...BOB_DEV, secret: browser('x').secret }, { info: BOB_DEV.info }, { secret: sha(BOB_DEV.secret).slice(0, 43), info: BOB_DEV.info }]) {
+    const r = await call('POST', '/api/auth/device', { body: { device }, headers: { 'user-agent': UA } });
+    assert.ok([400, 401].includes(r.status), `${r.status} ${JSON.stringify(device).slice(0, 60)}`);
+    assert.equal(r.setCookie, null);
+  }
+  assert.equal((await deviceLogin(LAPTOP_DEV)).data.code, 'unknown_device');
+  // The secret alone decides: the same browser on another network, with another user agent string, still signs in.
+  assert.equal((await deviceLogin({ secret: BOB_DEV.secret })).status, 200);
 });
 
 test('notifications of hidden projects are not listed for a non-admin', async () => {
@@ -330,60 +404,70 @@ test('WebSocket broadcasts reach a non-admin only for granted projects; the admi
   a.ws.close();
 });
 
-test('login: wrong password, another computer and rejected or disabled accounts are refused', async () => {
-  assert.equal((await login('bob', BOB_PC, 'wrong horse')).status, 401);
-  assert.equal((await login('nobody', BOB_PC)).status, 401);
-  const away = await login('bob', LAPTOP);
-  assert.equal(away.status, 403);
-  assert.equal(away.data.code, 'device_mismatch');
-  assert.match(away.data.error, /another computer/);
-  assert.equal((await login('bob', pc({ ...BOB_PC, screen: '3840x2160', timezone: 'UTC' }))).status, 200, 'same computer, other monitor and timezone');
-  // The admin may sign in from anywhere.
-  assert.equal((await login('owner', LAPTOP)).status, 200);
-
-  // Reset: the next login binds the new computer, and the old one is refused from then on.
+test('reset device: the user registers again from the new computer and waits for approval; rejected and disabled are refused', async () => {
   const bobId = await userId('bob');
+  // A bound name can not be claimed from another computer.
+  assert.equal((await signup('bob', LAPTOP_DEV)).data.code, 'username_taken');
   const reset = await call('POST', `/api/users/${bobId}/reset-device`, { cookie: admin });
   assert.equal(reset.data.device_bound, false);
-  assert.equal((await login('bob', CAROL_PC)).data.code, 'device_taken', 'a computer bound to carol can not be taken over');
-  assert.equal((await login('bob', LAPTOP)).status, 200);
-  assert.equal((await login('bob', BOB_PC)).data.code, 'device_mismatch');
+  assert.equal(reset.data.device_info, null);
+  assert.equal((await deviceLogin(BOB_DEV)).data.code, 'unknown_device', 'the old computer is refused');
+  assert.equal((await call('GET', '/api/projects', { cookie: bob })).status, 200, 'a reset alone does not end sessions');
+  assert.equal((await signup('bob', CAROL_DEV)).data.code, 'device_taken', 'carol\'s computer can not take bob over');
+  const re = await signup('bob', LAPTOP_DEV);
+  assert.deepEqual([re.status, re.data.user.status, re.data.user.id], [200, 'pending', bobId], 'the same account, pending again');
+  assert.deepEqual(re.data.user.permissions.projects, [beta], 'permissions are kept');
+  assert.equal((await call('GET', '/api/projects', { cookie: bob })).status, 401, 'its sessions ended');
+  assert.equal((await deviceLogin(LAPTOP_DEV)).data.code, 'pending');
+  await call('POST', `/api/users/${bobId}/approve`, { cookie: admin });
+  const back = await deviceLogin(LAPTOP_DEV);
+  assert.equal(back.status, 200);
+  bob = cookieOf(back);
 
   const carolId = await userId('carol');
   assert.equal((await call('POST', `/api/users/${carolId}/reject`, { cookie: admin })).data.status, 'rejected');
-  const rejected = await login('carol', CAROL_PC);
-  assert.equal(rejected.status, 403);
-  assert.equal(rejected.data.code, 'rejected');
+  const rejected = await deviceLogin(CAROL_DEV);
+  assert.deepEqual([rejected.status, rejected.data.code, rejected.setCookie], [403, 'rejected', null]);
 
   const live = await socket(bob);
   const closed = new Promise((r) => live.ws.on('close', (code) => r(code)));
   assert.equal((await call('POST', `/api/users/${bobId}/disable`, { cookie: admin })).data.status, 'disabled');
   assert.equal(await closed, 4401, 'open sockets of a disabled account are closed');
   assert.equal((await call('GET', '/api/projects', { cookie: bob })).status, 401, 'its sessions end');
-  assert.equal((await login('bob', LAPTOP)).data.code, 'disabled');
+  assert.equal((await deviceLogin(LAPTOP_DEV)).data.code, 'disabled');
   assert.equal((await call('POST', `/api/users/${bobId}/enable`, { cookie: admin })).data.status, 'active');
-  assert.equal((await login('bob', LAPTOP)).status, 200);
+  assert.equal((await deviceLogin(LAPTOP_DEV)).status, 200);
 });
 
 test('the admin can not lock itself out; delete removes an account and its sessions', async () => {
   const ownerId = await userId('owner');
   assert.equal((await call('POST', `/api/users/${ownerId}/disable`, { cookie: admin })).status, 400);
+  const reset = await call('POST', `/api/users/${ownerId}/reset-device`, { cookie: admin });
+  assert.equal(reset.status, 400, 'a password-less administrator keeps its device');
+  assert.match(reset.data.error, /reset-admin/);
   assert.equal((await call('DELETE', `/api/users/${ownerId}`, { cookie: admin })).status, 400);
   const carolId = await userId('carol');
   assert.equal((await call('DELETE', `/api/users/${carolId}`, { cookie: admin })).status, 200);
   assert.equal(await one(`SELECT 1 FROM users WHERE id = $1`, [carolId]), null);
-  // Her computer is free again for a new account, which starts pending.
-  assert.equal((await signup('carol', CAROL_PC)).data.user.status, 'pending');
+  // That computer is free again for a new account, which starts pending.
+  assert.equal((await signup('carol', CAROL_DEV)).data.user.status, 'pending');
   const out = await call('POST', '/api/auth/logout', { cookie: admin });
   assert.match(out.setCookie, /Max-Age=0/);
   assert.equal((await call('GET', '/api/projects', { cookie: admin })).status, 401);
 });
 
-test('AF_ADMIN_USERNAME bootstraps or restores the administrator on boot', async () => {
+test('AF_ADMIN_USERNAME bootstraps or restores the administrator on boot; it signs in with its password anywhere', async () => {
   assert.equal(await auth.ensureAdmin({}), null);
   const made = await auth.ensureAdmin({ AF_ADMIN_USERNAME: 'root-owner', AF_ADMIN_PASSWORD: 'long enough pw' });
   assert.deepEqual([made.role, made.status], ['admin', 'active']);
-  assert.equal((await login('root-owner', LAPTOP, 'long enough pw')).status, 200);
+  const pw = (device, password = 'long enough pw') => call('POST', '/api/auth/login', { body: { username: 'root-owner', password, device } });
+  assert.equal((await pw(browser('x'), 'wrong')).status, 401);
+  assert.equal((await pw(LAPTOP_DEV)).status, 200, 'on a computer bound to bob: signed in, never taking it over');
+  assert.equal((await one(`SELECT device_secret_hash FROM users WHERE username = 'root-owner'`)).device_secret_hash, null);
+  assert.equal((await pw(undefined)).status, 200, 'with no device at all');
+  const own = browser('Firefox on Linux');
+  assert.equal((await pw(own)).status, 200);
+  assert.equal((await deviceLogin(own)).data.user.username, 'root-owner', 'a free browser is bound at its password login');
   await pool.query(`UPDATE users SET status = 'disabled', role = 'user' WHERE username = 'carol'`);
   const promoted = await auth.ensureAdmin({ AF_ADMIN_USERNAME: 'carol' });
   assert.deepEqual([promoted.role, promoted.status], ['admin', 'active']);

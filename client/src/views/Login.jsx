@@ -1,8 +1,8 @@
-import { useState } from 'react';
-import { LogIn, UserPlus, Users, Hourglass, LogOut, RefreshCw, ShieldCheck } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { LogIn, UserPlus, Hourglass, RefreshCw, ShieldCheck, MonitorSmartphone } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { useStore } from '../lib/store.js';
-import { deviceFingerprint } from '../lib/device.js';
+import { deviceCredential, deviceFingerprint, storedDeviceSecret } from '../lib/device.js';
 import { cx, Button, Field, Input } from '../components/ui.jsx';
 
 function Brand() {
@@ -26,99 +26,105 @@ const Card = ({ children }) => (
 );
 
 /**
- * The homepage for signed-out visitors: log in, or sign up (individually or for a team). New accounts wait for the
- * administrator's approval; with no administrator yet (a fresh install) the first sign-up creates it.
+ * The homepage for signed-out visitors. Sign up takes a username only: the account is bound to this browser's device
+ * secret and waits for the administrator's approval (with no administrator yet, the first sign-up creates it). A
+ * registered browser signs in by itself (store.loadMe); after Log out, "Sign in on this computer" does it again.
+ * Accounts with a password (created before, or the administrator elsewhere) use "Log in with a password".
  */
 export function Login() {
   const setup = useStore((s) => s.setup);
   const loadMe = useStore((s) => s.loadMe);
-  const [mode, setMode] = useState(setup ? 'signup' : 'login'); // login | signup | team
-  const [f, setF] = useState({ username: '', password: '', confirm: '', team: '' });
+  const deviceSignIn = useStore((s) => s.deviceSignIn);
+  const refused = useStore((s) => s.device); // rejected or disabled (pending shows the waiting screen)
+  const [mode, setMode] = useState('signup'); // signup | password
+  const [f, setF] = useState({ username: '', password: '' });
   const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const signup = mode !== 'login';
+  const [busy, setBusy] = useState('');
+  const known = !setup && !!storedDeviceSecret();
   const up = (k) => (e) => setF({ ...f, [k]: e.target.value });
-
-  const submit = async (e) => {
-    e.preventDefault();
+  const run = (what, fn) => async (e) => {
+    e?.preventDefault();
     setError('');
-    if (signup && f.password !== f.confirm) return setError('The passwords do not match');
-    setBusy(true);
+    setBusy(what);
     try {
-      const body = { username: f.username.trim(), password: f.password, device: deviceFingerprint() };
-      if (mode === 'team') body.team = f.team.trim();
-      await api.post(signup ? '/api/auth/signup' : '/api/auth/login', body, { quiet: true });
-      await loadMe();
+      await fn();
     } catch (err) {
       setError(err.message);
     } finally {
-      setBusy(false);
+      setBusy('');
     }
   };
+
+  const register = run('signup', async () => {
+    const r = await api.post('/api/auth/signup', { username: f.username.trim(), device: deviceCredential() }, { quiet: true });
+    if (r.pending) useStore.setState({ device: { code: 'pending', username: r.user.username, team: r.user.team } });
+    else await loadMe(); // the first account: the administrator, signed in
+  });
+  const passwordLogin = run('password', async () => {
+    await api.post('/api/auth/login', { username: f.username.trim(), password: f.password, device: deviceCredential(), fingerprint: deviceFingerprint() }, { quiet: true });
+    await loadMe();
+  });
+  const thisComputer = run('device', async () => {
+    if (!(await deviceSignIn()) && !useStore.getState().device) setError('This computer is not registered. Sign up with a username first.');
+  });
   const go = (m) => { setMode(m); setError(''); };
 
   return (
     <Card>
       <div className="flex flex-col gap-1">
         <h1 className="font-semibold text-[1.02rem]">
-          {setup ? 'Create the administrator account' : mode === 'login' ? 'Log in' : mode === 'team' ? 'Team registration' : 'Sign up'}
+          {setup ? 'Create the administrator account' : mode === 'password' ? 'Log in with a password' : 'Sign up'}
         </h1>
         <p className="text-xs text-subtle">
-          {setup ? 'No administrator exists yet. This first account becomes the administrator of this AgentForge.'
-            : mode === 'login' ? 'Sign in to the AgentForge control room.'
-              : 'Your account is bound to this computer and becomes usable once the administrator approves it.'}
+          {setup ? 'No administrator exists yet. This first account becomes the administrator of this AgentForge, bound to this computer.'
+            : mode === 'password' ? 'For accounts that have a password. Your account is then bound to this computer.'
+              : 'Choose a username. Your account is bound to this computer and becomes usable once the administrator approves it.'}
         </p>
       </div>
-      <form onSubmit={submit} className="flex flex-col gap-3">
-        {mode === 'team' && <Field label="Team"><Input value={f.team} onChange={up('team')} placeholder="Team or company name" required maxLength={80} /></Field>}
-        <Field label="Username"><Input value={f.username} onChange={up('username')} autoComplete="username" autoFocus required /></Field>
-        <Field label="Password" hint={signup ? 'At least 8 characters' : undefined}>
-          <Input type="password" value={f.password} onChange={up('password')} autoComplete={signup ? 'new-password' : 'current-password'} required />
+      {refused && <div role="alert" className="text-xs text-bad bg-bad-soft rounded-md px-2.5 py-2">{refused.username ? <><b>{refused.username}</b>: </> : null}{refused.message}</div>}
+      <form onSubmit={mode === 'password' ? passwordLogin : register} className="flex flex-col gap-3">
+        <Field label="Username" hint={mode === 'signup' ? '3–32 letters, digits, dots, dashes or underscores' : undefined}>
+          <Input value={f.username} onChange={up('username')} autoComplete="username" autoFocus required maxLength={32} />
         </Field>
-        {signup && <Field label="Confirm password"><Input type="password" value={f.confirm} onChange={up('confirm')} autoComplete="new-password" required /></Field>}
+        {mode === 'password' && <Field label="Password"><Input type="password" value={f.password} onChange={up('password')} autoComplete="current-password" required /></Field>}
         {error && <div role="alert" className="text-xs text-bad bg-bad-soft rounded-md px-2.5 py-2">{error}</div>}
-        <Button type="submit" variant="primary" size="lg" loading={busy} icon={signup ? (setup ? ShieldCheck : UserPlus) : LogIn}>
-          {setup ? 'Create administrator' : mode === 'login' ? 'Log in' : 'Register'}
+        <Button type="submit" variant="primary" size="lg" loading={busy === mode} icon={mode === 'password' ? LogIn : setup ? ShieldCheck : UserPlus}>
+          {setup ? 'Create administrator' : mode === 'password' ? 'Log in' : 'Register'}
         </Button>
       </form>
       {!setup && (
         <div className="flex flex-col gap-2 pt-1 border-t border-line">
-          {mode === 'login' ? (
-            <>
-              <Button variant="secondary" icon={UserPlus} onClick={() => go('signup')} className="mt-3">Sign up</Button>
-              <button type="button" onClick={() => go('team')} className="self-center inline-flex items-center gap-1 text-xs text-subtle hover:text-fg">
-                <Users size={12} /> Team registration
-              </button>
-            </>
-          ) : (
-            <button type="button" onClick={() => go('login')} className={cx('self-center text-xs text-subtle hover:text-fg mt-3')}>Already have an account? Log in</button>
-          )}
+          {known && <Button variant="secondary" icon={MonitorSmartphone} loading={busy === 'device'} onClick={thisComputer} className="mt-3">Sign in on this computer</Button>}
+          <button type="button" onClick={() => go(mode === 'password' ? 'signup' : 'password')} className={cx('self-center text-xs text-subtle hover:text-fg', !known && 'mt-3')}>
+            {mode === 'password' ? 'New here? Sign up with a username' : 'Log in with a password'}
+          </button>
         </div>
       )}
     </Card>
   );
 }
 
-/** A signed-in account the administrator has not approved yet: nothing else is reachable. */
+/** Registered from this browser, not approved yet: nothing else is reachable. Checks again by itself every 15 s. */
 export function Pending() {
-  const me = useStore((s) => s.me);
-  const loadMe = useStore((s) => s.loadMe);
-  const logout = useStore((s) => s.logout);
+  const device = useStore((s) => s.device);
+  const deviceSignIn = useStore((s) => s.deviceSignIn);
   const [busy, setBusy] = useState(false);
+  const check = async () => { setBusy(true); try { await deviceSignIn(); } catch { /* server unreachable: try again later */ } finally { setBusy(false); } };
+  useEffect(() => {
+    const t = setInterval(() => deviceSignIn().catch(() => {}), 15000);
+    return () => clearInterval(t);
+  }, []);
   return (
     <Card>
       <div className="flex flex-col items-center text-center gap-3 py-2">
         <span className="size-11 rounded-full bg-warn-soft text-warn flex items-center justify-center"><Hourglass size={20} /></span>
         <h1 className="font-semibold text-[1.02rem]">Waiting for administrator approval</h1>
         <p className="text-xs text-subtle">
-          Your account <b className="text-fg">{me?.username}</b>{me?.team ? <> for team <b className="text-fg">{me.team}</b></> : null} is registered.
-          You can use AgentForge once the administrator approves it.
+          Your account <b className="text-fg">{device?.username}</b>{device?.team ? <> for team <b className="text-fg">{device.team}</b></> : null} is registered on this computer.
+          You can use AgentForge once the administrator approves it; this page signs you in by itself.
         </p>
       </div>
-      <div className="flex gap-2">
-        <Button className="flex-1" icon={RefreshCw} loading={busy} onClick={async () => { setBusy(true); try { await loadMe(); } finally { setBusy(false); } }}>Check again</Button>
-        <Button className="flex-1" variant="ghost" icon={LogOut} onClick={logout}>Log out</Button>
-      </div>
+      <Button icon={RefreshCw} loading={busy} onClick={check}>Check again</Button>
     </Card>
   );
 }

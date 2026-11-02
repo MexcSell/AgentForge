@@ -2,8 +2,12 @@ import { create } from 'zustand';
 import { api, onSignedOut } from './api.js';
 import { toast } from './toast.js';
 import { can, canView } from './access.js';
+import { deviceCredential, storedDeviceSecret } from './device.js';
 
 const PREF_KEY = 'af.prefs';
+// Set by Log out so the homepage does not sign this browser straight back in with its device; any session clears it.
+const SIGNED_OUT_KEY = 'af.signedOut';
+const storage = (fn) => { try { return fn(globalThis.localStorage); } catch { return null; } };
 const PREFS = ['theme', 'accent', 'layoutId', 'view', 'activeProjectId', 'activeTopic', 'filePanes', 'activePane', 'showHidden', 'notifFilter', 'orgTree'];
 
 function loadPrefs() {
@@ -74,6 +78,7 @@ export const useStore = create((set, get) => ({
   me: undefined,
   capabilities: {}, // permission flag → description, from /api/auth/me
   setup: false, // no administrator yet: the homepage creates it
+  device: null, // signed out: why this browser's device sign-in was refused { code: pending|rejected|disabled, message, username, team }
 
   // server data
   connected: false,
@@ -120,23 +125,46 @@ export const useStore = create((set, get) => ({
   async loadMe() {
     try {
       const { user, capabilities } = await api.get('/api/auth/me', { quiet: true });
-      set({ me: user, capabilities });
+      storage((s) => s.removeItem(SIGNED_OUT_KEY));
+      set({ me: user, capabilities, device: null });
     } catch (e) {
       if (e.status !== 401) throw e; // server unreachable (restarting): keep the account, the caller retries
+      // No session: a registered browser signs in with its device secret, unless the user logged out here.
+      if (!storage((s) => s.getItem(SIGNED_OUT_KEY)) && storedDeviceSecret() && (await get().deviceSignIn())) return get().me;
       const { setup } = await api.get('/api/auth/state', { quiet: true }).catch(() => ({ setup: false }));
       set({ me: null, setup });
     }
     return get().me;
   },
 
+  /**
+   * Signs in with this browser's device secret (no password). Sets me and returns it; when refused, sets device to the
+   * reason (pending, rejected, disabled) or null for an unknown computer, and returns null.
+   */
+  async deviceSignIn() {
+    try {
+      await api.post('/api/auth/device', { device: deviceCredential() }, { quiet: true });
+      const { user, capabilities } = await api.get('/api/auth/me', { quiet: true });
+      storage((s) => s.removeItem(SIGNED_OUT_KEY));
+      set({ me: user, capabilities, device: null });
+      return user;
+    } catch (e) {
+      if (e.status === 403 && e.code) set({ me: null, device: { code: e.code, message: e.message, username: e.user?.username, team: e.user?.team || null } });
+      else if (e.status === 400 || e.status === 401) set({ device: null });
+      else throw e;
+      return null;
+    }
+  },
+
   async logout() {
     await api.post('/api/auth/logout', {}, { quiet: true }).catch(() => {});
+    storage((s) => s.setItem(SIGNED_OUT_KEY, '1'));
     get().signedOut();
   },
 
   // Back to the homepage, dropping everything the account could see.
   signedOut() {
-    set({ me: null, loaded: false, projects: [], agents: [], notifications: [], settings: null, topics: {}, messages: {}, tasks: {}, members: {}, previews: {}, live: {}, bittensor: null });
+    set({ me: null, device: null, loaded: false, projects: [], agents: [], notifications: [], settings: null, topics: {}, messages: {}, tasks: {}, members: {}, previews: {}, live: {}, bittensor: null });
   },
 
   async loadAll() {
