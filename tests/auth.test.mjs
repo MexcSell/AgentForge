@@ -472,3 +472,28 @@ test('AF_ADMIN_USERNAME bootstraps or restores the administrator on boot; it sig
   const promoted = await auth.ensureAdmin({ AF_ADMIN_USERNAME: 'carol' });
   assert.deepEqual([promoted.role, promoted.status], ['admin', 'active']);
 });
+
+test('the page-load device check: approved → session; pending, rejected, disabled → why, with no session; deleted → unknown, a fresh secret registers', async () => {
+  const owner = cookieOf(await call('POST', '/api/auth/login', { body: { username: 'root-owner', password: 'long enough pw' } }));
+  const dev = browser('Firefox on Linux');
+  assert.equal((await signup('gina', dev)).data.user.status, 'pending');
+  const id = await userId('gina');
+  for (const [action, code] of [[null, 'pending'], ['reject', 'rejected'], ['approve', null], ['disable', 'disabled']]) {
+    if (action) assert.equal((await call('POST', `/api/users/${id}/${action}`, { cookie: owner })).status, 200, action);
+    const r = await deviceLogin(dev);
+    if (!code) {
+      assert.equal(r.status, 200);
+      const me = await call('GET', '/api/auth/me', { cookie: cookieOf(r) });
+      assert.equal(me.data.user.username, 'gina', 'an approved device lands signed in');
+      continue;
+    }
+    assert.deepEqual([r.status, r.data.code, r.data.user.username, r.setCookie], [403, code, 'gina', null], code);
+    assert.equal((await call('GET', '/api/auth/me')).status, 401);
+  }
+  // The account is deleted: its browser's secret is unknown (no session), and that browser registers with a fresh one.
+  assert.equal((await call('DELETE', `/api/users/${id}`, { cookie: owner })).status, 200);
+  const gone = await deviceLogin(dev);
+  assert.deepEqual([gone.status, gone.data.code, gone.setCookie], [401, 'unknown_device', null]);
+  const fresh = await signup('gina', browser('Firefox on Linux'));
+  assert.deepEqual([fresh.status, fresh.data.user.status, fresh.setCookie], [200, 'pending', null]);
+});

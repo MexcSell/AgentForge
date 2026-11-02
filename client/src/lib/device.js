@@ -18,6 +18,11 @@ export function storedDeviceSecret(storage = globalThis.localStorage) {
   }
 }
 
+/** Drops a secret the server no longer recognises (e.g. its account was deleted), so the next sign-up makes a new one. */
+export function forgetDeviceSecret(storage = globalThis.localStorage) {
+  try { storage?.removeItem(DEVICE_KEY); } catch { /* no storage: nothing kept */ }
+}
+
 /** This browser's secret, created and stored on first use. crypto.getRandomValues works on plain-http origins too. */
 export function deviceSecret(storage = globalThis.localStorage, rand = globalThis.crypto) {
   const have = storedDeviceSecret(storage);

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { LogIn, UserPlus, Hourglass, RefreshCw, ShieldCheck, MonitorSmartphone } from 'lucide-react';
+import { LogIn, UserPlus, Hourglass, RefreshCw, ShieldCheck, MonitorSmartphone, Ban } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { useStore } from '../lib/store.js';
 import { deviceCredential, deviceFingerprint, storedDeviceSecret } from '../lib/device.js';
@@ -29,6 +29,7 @@ const Card = ({ children }) => (
  * The homepage for signed-out visitors. Sign up takes a username only: the account is bound to this browser's device
  * secret and waits for the administrator's approval (with no administrator yet, the first sign-up creates it). A
  * registered browser signs in by itself (store.loadMe); after Log out, "Sign in on this computer" does it again.
+ * A browser whose account was rejected or disabled sees why instead of the form (it can not register again).
  * Accounts with a password (created before, or the administrator elsewhere) use "Log in with a password".
  */
 export function Login() {
@@ -68,6 +69,23 @@ export function Login() {
     if (!(await deviceSignIn()) && !useStore.getState().device) setError('This computer is not registered. Sign up with a username first.');
   });
   const go = (m) => { setMode(m); setError(''); };
+
+  if (refused && mode === 'signup') {
+    return (
+      <Card>
+        <div className="flex flex-col items-center text-center gap-3 py-2">
+          <span className="size-11 rounded-full bg-bad-soft text-bad flex items-center justify-center"><Ban size={20} /></span>
+          <h1 className="font-semibold text-[1.02rem]">{refused.code === 'disabled' ? 'Account disabled' : refused.code === 'rejected' ? 'Registration rejected' : 'Sign-in refused'}</h1>
+          <p role="alert" className="text-xs text-subtle">{refused.username ? <><b className="text-fg">{refused.username}</b>: </> : null}{refused.message}</p>
+        </div>
+        {error && <div role="alert" className="text-xs text-bad bg-bad-soft rounded-md px-2.5 py-2">{error}</div>}
+        <div className="flex flex-col gap-2">
+          <Button icon={RefreshCw} loading={busy === 'device'} onClick={thisComputer}>Check again</Button>
+          <button type="button" onClick={() => go('password')} className="self-center text-xs text-subtle hover:text-fg">Log in with a password</button>
+        </div>
+      </Card>
+    );
+  }
 
   return (
     <Card>

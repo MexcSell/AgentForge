@@ -31,7 +31,10 @@ function useNarrow() {
   return narrow;
 }
 
-/** Signed out → the login homepage; pending approval → the waiting screen; otherwise the control room. */
+/**
+ * Loading (me undefined, also while loadMe tries this browser's device secret) → a neutral spinner; signed out → the
+ * login homepage (rejected/disabled devices see why there); pending approval → the waiting screen; else the control room.
+ */
 export default function App() {
   const me = useStore((s) => s.me);
   const waiting = useStore((s) => s.device?.code === 'pending'); // registered from this browser, not approved yet

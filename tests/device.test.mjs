@@ -3,7 +3,7 @@
 // computer only — no IP or other network address, no window size — and stable for one computer.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { deviceFingerprint, deviceSecret, storedDeviceSecret, deviceInfo, deviceCredential, DEVICE_KEY } from '../client/src/lib/device.js';
+import { deviceFingerprint, deviceSecret, storedDeviceSecret, forgetDeviceSecret, deviceInfo, deviceCredential, DEVICE_KEY } from '../client/src/lib/device.js';
 import { hashDevice, sameDevice, deviceSecretHash, deviceInfo as storedInfo, DEVICE_HARDWARE, DEVICE_SOFT, DEVICE_INFO } from '../server/services/auth.js';
 
 const nav = { platform: 'Linux x86_64', hardwareConcurrency: 8, deviceMemory: 8, maxTouchPoints: 0, language: 'en-US' };
@@ -28,6 +28,11 @@ test('the device secret: 256 random bits created on first use, then the same one
   store.setItem(DEVICE_KEY, 'tampered!');
   assert.equal(storedDeviceSecret(store), null, 'a malformed stored value is not used');
   assert.notEqual(deviceSecret(store), 'tampered!');
+  const kept = storedDeviceSecret(store);
+  forgetDeviceSecret(store);
+  assert.equal(storedDeviceSecret(store), null, 'an unrecognised secret is forgotten');
+  assert.notEqual(deviceSecret(store), kept, 'the next sign-up makes a new one');
+  forgetDeviceSecret(undefined); // no storage: no throw
   const broken = { getItem() { throw new Error('denied'); }, setItem() { throw new Error('denied'); } };
   assert.match(deviceSecret(broken), /^[A-Za-z0-9_-]{43}$/, 'no storage: still a secret for this page');
 });

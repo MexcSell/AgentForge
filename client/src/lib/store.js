@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { api, onSignedOut } from './api.js';
 import { toast } from './toast.js';
 import { can, canView } from './access.js';
-import { deviceCredential, storedDeviceSecret } from './device.js';
+import { deviceCredential, forgetDeviceSecret, storedDeviceSecret } from './device.js';
 
 const PREF_KEY = 'af.prefs';
 // Set by Log out so the homepage does not sign this browser straight back in with its device; any session clears it.
@@ -139,7 +139,8 @@ export const useStore = create((set, get) => ({
 
   /**
    * Signs in with this browser's device secret (no password). Sets me and returns it; when refused, sets device to the
-   * reason (pending, rejected, disabled) or null for an unknown computer, and returns null.
+   * reason (pending, rejected, disabled) or null for an unknown computer, and returns null. An unknown secret (its
+   * account or device was deleted or reset) is forgotten, so this browser registers again with a fresh one.
    */
   async deviceSignIn() {
     try {
@@ -150,7 +151,10 @@ export const useStore = create((set, get) => ({
       return user;
     } catch (e) {
       if (e.status === 403 && e.code) set({ me: null, device: { code: e.code, message: e.message, username: e.user?.username, team: e.user?.team || null } });
-      else if (e.status === 400 || e.status === 401) set({ device: null });
+      else if (e.status === 400 || e.status === 401) {
+        if (e.code === 'unknown_device') forgetDeviceSecret();
+        set({ device: null });
+      }
       else throw e;
       return null;
     }

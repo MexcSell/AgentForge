@@ -2,7 +2,9 @@
 // over a fake API that keys accounts by device secret like the server: sign-up asks for a username only and sends this
 // browser's device; the pending browser waits without a session; once approved it signs in by itself, with no
 // password, after a reload too; another browser (another or a forged secret) is not; Log out is not undone by the
-// automatic sign-in; the administrator sees the computer info in the approval list.
+// automatic sign-in; the administrator sees the computer info in the approval list. The auth gate on page load: a
+// session goes straight in, a registered approved device signs in with no clicks and no flash of the sign-up screen,
+// pending/rejected/disabled devices see why (no session), and an unrecognised secret is dropped for a fresh sign-up.
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { window as w, createLoader, React, createRoot } from './setup/jsdom-vite.mjs';
@@ -30,6 +32,7 @@ globalThis.fetch = async (url, opts = {}) => {
     return json({ user, pending: true });
   }
   if (u.pathname === '/api/auth/device') {
+    if (server.hold) await server.hold;
     const user = server.accounts[body.device?.secret];
     if (!user) return json({ error: 'This computer is not registered. Sign up with a username first.', code: 'unknown_device' }, 401);
     if (user.status !== 'active') return json({ error: `status ${user.status}`, code: user.status, user: { username: user.username } }, 403);
@@ -164,34 +167,109 @@ test('register → waiting for approval (no session) → approved → signed in 
   assert.ok(signedInView());
 });
 
-test('another browser, or a forged device secret, is not signed in', async () => {
+test('another browser, or a forged device secret, is not signed in: the unknown secret is dropped and a new sign-up works', async () => {
   const mine = 'A'.repeat(43);
   server.accounts[mine] = { ...PENDING, status: 'active' };
-  localStorage.setItem('agentforge.device', 'B'.repeat(43)); // registered nowhere
+  localStorage.setItem('agentforge.device', 'B'.repeat(43)); // registered nowhere (or its account was deleted)
   await act(async () => root.render(h(App)));
   await settle();
+  assert.equal(calls.filter((c) => c.url === '/api/auth/device').length, 1, 'tried once, silently');
   assert.equal(button('Dashboard'), undefined);
-  assert.ok(text().includes('Sign up'));
-  await click(button('Sign in on this computer'));
+  assert.equal(server.me, null);
+  assert.ok(text().includes('Sign up') && button('Register'), 'the registration screen');
+  assert.equal(localStorage.getItem('agentforge.device'), null, 'the stale secret is cleared');
+  assert.equal(button('Sign in on this computer'), undefined, 'nothing left to sign in with');
+  await typeInto(inputs()[0], 'erin');
+  await submit();
   await settle();
-  assert.ok(text().includes('This computer is not registered'));
-  assert.equal(button('Dashboard'), undefined);
+  const sent = calls.find((c) => c.url === '/api/auth/signup').body;
+  assert.match(sent.device.secret, /^[A-Za-z0-9_-]{43}$/);
+  assert.notEqual(sent.device.secret, 'B'.repeat(43), 'a fresh secret');
+  assert.equal(localStorage.getItem('agentforge.device'), sent.device.secret);
+  assert.ok(text().includes('Waiting for administrator approval') && text().includes('erin'));
   // Only its own secret signs the account in.
   localStorage.setItem('agentforge.device', mine);
   await reload();
   assert.ok(signedInView());
 });
 
-test('a rejected registration is told so on the homepage, with no session', async () => {
-  const secret = 'R'.repeat(43);
-  server.accounts[secret] = { ...PENDING, status: 'rejected' };
+test('page load with a valid session goes straight in, without device sign-in', async () => {
+  server.me = { ...PENDING, status: 'active' };
+  localStorage.setItem('agentforge.device', 'S'.repeat(43));
+  await act(async () => root.render(h(App)));
+  await settle();
+  assert.ok(signedInView());
+  assert.ok(!calls.some((c) => c.url === '/api/auth/device' || c.url === '/api/auth/state'), 'no device sign-in');
+});
+
+test('page load on an approved device: a neutral loading state, then the app, with no clicks and no flash of sign-up', async () => {
+  const secret = 'K'.repeat(43);
+  server.accounts[secret] = { ...PENDING, status: 'active' };
+  localStorage.setItem('agentforge.device', secret);
+  let release;
+  server.hold = new Promise((r) => { release = r; });
+  const seen = [];
+  const watch = new w.MutationObserver(() => seen.push(text()));
+  watch.observe(document.getElementById('root'), { childList: true, subtree: true, characterData: true });
+  await act(async () => root.render(h(App)));
+  await settle();
+  assert.ok(text().includes('Connecting to AgentForge'), 'loading while the device check runs');
+  assert.equal(inputs().length, 0);
+  release();
+  await settle();
+  watch.disconnect();
+  assert.ok(signedInView());
+  assert.equal(calls.find((c) => c.url === '/api/auth/device').body.device.secret, secret);
+  assert.ok(seen.length > 0);
+  for (const t of seen) assert.ok(!/Sign up|Register|Waiting for administrator|Create the administrator/.test(t), `no auth screen: ${t.slice(0, 80)}`);
+  assert.ok(!calls.some((c) => c.url === '/api/auth/signup' || c.url === '/api/auth/login'));
+});
+
+test('page load on a pending device shows the waiting screen, not the registration form, with no session', async () => {
+  const secret = 'P'.repeat(43);
+  server.accounts[secret] = { ...PENDING };
   localStorage.setItem('agentforge.device', secret);
   await act(async () => root.render(h(App)));
   await settle();
-  assert.ok(text().includes('status rejected'));
-  assert.ok(text().includes('bob'));
-  assert.equal(button('Dashboard'), undefined);
+  assert.ok(text().includes('Waiting for administrator approval') && text().includes('bob'));
+  assert.equal(button('Register'), undefined);
+  assert.equal(inputs().length, 0);
   assert.equal(server.me, null);
+  assert.equal(localStorage.getItem('agentforge.device'), secret, 'a known secret is kept');
+});
+
+for (const [status, title] of [['rejected', 'Registration rejected'], ['disabled', 'Account disabled']]) {
+  test(`page load on a ${status} device shows a clear message, not the registration form, with no session`, async () => {
+    const secret = status[0].toUpperCase().repeat(43);
+    server.accounts[secret] = { ...PENDING, status };
+    localStorage.setItem('agentforge.device', secret);
+    await act(async () => root.render(h(App)));
+    await settle();
+    assert.ok(text().includes(title));
+    assert.ok(text().includes(`status ${status}`) && text().includes('bob'), 'the server\'s reason');
+    assert.equal(button('Register'), undefined);
+    assert.equal(inputs().length, 0);
+    assert.equal(button('Dashboard'), undefined);
+    assert.equal(server.me, null);
+    assert.equal(localStorage.getItem('agentforge.device'), secret, 'a known secret is kept');
+    // Re-enabled meanwhile: "Check again" signs in.
+    server.accounts[secret].status = 'active';
+    await click(button('Check again'));
+    await settle();
+    assert.ok(signedInView());
+  });
+}
+
+test('a refused device still reaches the password login (administrator break-glass)', async () => {
+  const secret = 'D'.repeat(43);
+  server.accounts[secret] = { ...PENDING, status: 'disabled' };
+  localStorage.setItem('agentforge.device', secret);
+  await act(async () => root.render(h(App)));
+  await settle();
+  await click(button('Log in with a password'));
+  const [, pw] = inputs();
+  assert.equal(pw?.type, 'password');
+  assert.ok(button('Log in'));
 });
 
 test('existing password accounts: "Log in with a password" sends the password with this browser\'s device', async () => {
