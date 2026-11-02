@@ -242,7 +242,7 @@ export async function analyzeMission(missionId) {
   if (!m) return;
   const stats = await one(
     `SELECT count(*)::int AS total, count(*) FILTER (WHERE t.status='done')::int AS done,
-            coalesce(sum(r.input_tokens + r.output_tokens),0) AS tokens, coalesce(sum(r.duration_ms),0) AS ms
+            coalesce(sum(r.input_tokens + r.cache_write_5m_tokens + r.cache_write_1h_tokens + r.output_tokens),0) AS tokens, coalesce(sum(r.duration_ms),0) AS ms
      FROM tasks t LEFT JOIN runs r ON r.task_id = t.id WHERE t.mission_id = $1`, [missionId]);
   if (!stats.total) return;
   await event('observe', null, `Gauge observed mission: ${stats.done}/${stats.total} tasks passed`, { missionId, ...stats });

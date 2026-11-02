@@ -44,15 +44,16 @@ export function windows(limits = {}, now = new Date()) {
 
 export async function usageFor(model) {
   const w = windows(model.limits);
+  const tokens = 'input_tokens + cache_write_5m_tokens + cache_write_1h_tokens + output_tokens';
   const row = await one(
     `SELECT
-       coalesce(sum(input_tokens + output_tokens) FILTER (WHERE created_at >= $2), 0) AS daily_tokens,
+       coalesce(sum(${tokens}) FILTER (WHERE created_at >= $2), 0) AS daily_tokens,
        count(*) FILTER (WHERE created_at >= $2) AS daily_prompts,
-       coalesce(sum(input_tokens + output_tokens) FILTER (WHERE created_at >= $3), 0) AS weekly_tokens,
+       coalesce(sum(${tokens}) FILTER (WHERE created_at >= $3), 0) AS weekly_tokens,
        count(*) FILTER (WHERE created_at >= $3) AS weekly_prompts,
        coalesce(sum(cost_usd) FILTER (WHERE created_at >= $3), 0) AS weekly_cost,
        coalesce(sum(cache_tokens) FILTER (WHERE created_at >= $3), 0) AS weekly_cache,
-       coalesce(sum(input_tokens + output_tokens), 0) AS total_tokens,
+       coalesce(sum(${tokens}), 0) AS total_tokens,
        count(*) AS total_prompts
      FROM runs WHERE model_id = $1`,
     [model.id, w.dailyStart, w.weeklyStart],
@@ -149,7 +150,9 @@ export async function runModel(model, opts, runId) {
 export async function recordRunUsage(runId, out) {
   if (!out) return;
   await query(
-    `UPDATE runs SET input_tokens=$2, output_tokens=$3, cache_tokens=$4, cost_usd=$5, tool_calls=$6, duration_ms=$7, session_id=$8, context_tokens=$9 WHERE id=$1`,
-    [runId, out.usage?.input || 0, out.usage?.output || 0, out.usage?.cache || 0, out.costUsd || 0, out.toolCalls || {}, out.durationMs || 0, out.sessionId || null, out.contextTokens || 0],
+    `UPDATE runs SET input_tokens=$2, output_tokens=$3, cache_tokens=$4, cost_usd=$5, tool_calls=$6, duration_ms=$7, session_id=$8, context_tokens=$9,
+       cache_write_5m_tokens=$10, cache_write_1h_tokens=$11 WHERE id=$1`,
+    [runId, out.usage?.input || 0, out.usage?.output || 0, out.usage?.cache || 0, out.costUsd || 0, out.toolCalls || {}, out.durationMs || 0, out.sessionId || null, out.contextTokens || 0,
+      out.usage?.cacheWrite5m || 0, out.usage?.cacheWrite1h || 0],
   );
 }

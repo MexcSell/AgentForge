@@ -169,6 +169,8 @@ async function executeRun({ kind, agent, project, mission, task, model, prompt, 
 
 async function bumpAgentStats(agentId, out) {
   const tools = Object.values(out.toolCalls || {}).reduce((a, b) => a + b, 0);
+  // tokensIn counts prompt-cache writes as input, as it always has (Claude Code reports them apart from input now).
+  const tokensIn = (out.usage?.input || 0) + (out.usage?.cacheWrite5m || 0) + (out.usage?.cacheWrite1h || 0);
   await query(
     `UPDATE agents SET stats = stats || jsonb_build_object(
         'prompts', coalesce((stats->>'prompts')::int, 0) + 1,
@@ -178,7 +180,7 @@ async function bumpAgentStats(agentId, out) {
         'totalMs', coalesce((stats->>'totalMs')::bigint, 0) + $5,
         'costUsd', coalesce((stats->>'costUsd')::numeric, 0) + $6)
      WHERE id = $1`,
-    [agentId, out.usage?.input || 0, out.usage?.output || 0, tools, out.durationMs || 0, out.costUsd || 0],
+    [agentId, tokensIn, out.usage?.output || 0, tools, out.durationMs || 0, out.costUsd || 0],
   );
 }
 
@@ -636,7 +638,7 @@ async function runMission(mission, signal) {
     const digest = await digesting;
 
     // Measured after the sync and the digest so the GM's commit-message and digest runs are counted too.
-    const usage = await one(`SELECT coalesce(sum(input_tokens + output_tokens),0) AS tokens, coalesce(sum(cost_usd),0) AS cost FROM runs WHERE mission_id = $1`, [mission.id]);
+    const usage = await one(`SELECT coalesce(sum(input_tokens + cache_write_5m_tokens + cache_write_1h_tokens + output_tokens),0) AS tokens, coalesce(sum(cost_usd),0) AS cost FROM runs WHERE mission_id = $1`, [mission.id]);
     const secs = Math.round((Date.now() - started) / 1000);
     const summary = `**Mission ${status}** · ${done}/${final.length} tasks · ${fmtDuration(secs)} · ${Number(usage.tokens).toLocaleString()} tokens\n\n${digest || lines.join('\n')}${github}`;
 

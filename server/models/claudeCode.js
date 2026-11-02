@@ -9,6 +9,39 @@ function brief(input) {
   return String(v).slice(0, 200);
 }
 
+/**
+ * Adds one `result` event's usage to a run's totals. A -p run writes a result per turn (queued background-task turns add
+ * more), and a result's `usage` covers only that turn's main loop, summed over its API calls. `total_cost_usd` and
+ * `modelUsage` are running totals instead (modelUsage even starts from a resumed session's earlier turns), and
+ * `usage.iterations` lists only the turn's last API call. So the calls beyond the main loop (advisor iterations, Task
+ * subagents, compaction) come from `model_usage_since_last_result`, which states each call of the process on one result.
+ * Cache writes are split by TTL; writes whose TTL the CLI does not state count as 5-minute ones, the API's default.
+ */
+function addResultUsage(t, e) {
+  const u = e.usage || {};
+  const main = { input: u.input_tokens || 0, output: u.output_tokens || 0, cache: u.cache_read_input_tokens || 0, write: u.cache_creation_input_tokens || 0 };
+  const w5m = u.cache_creation?.ephemeral_5m_input_tokens || 0;
+  const w1h = u.cache_creation?.ephemeral_1h_input_tokens || 0;
+  t.input += main.input;
+  t.output += main.output;
+  t.cache += main.cache;
+  t.cacheWrite5m += w5m + Math.max(0, main.write - w5m - w1h);
+  t.cacheWrite1h += w1h;
+  const since = e.model_usage_since_last_result;
+  if (!since || typeof since !== 'object') return;
+  const all = { input: 0, output: 0, cache: 0, write: 0 };
+  for (const m of Object.values(since)) {
+    all.input += m?.inputTokens || 0;
+    all.output += m?.outputTokens || 0;
+    all.cache += m?.cacheReadInputTokens || 0;
+    all.write += m?.cacheCreationInputTokens || 0;
+  }
+  t.input += Math.max(0, all.input - main.input);
+  t.output += Math.max(0, all.output - main.output);
+  t.cache += Math.max(0, all.cache - main.cache);
+  t.cacheWrite5m += Math.max(0, all.write - main.write);
+}
+
 // Tools that write files; their events carry `files` so a mission's edits can be committed on their own.
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
@@ -63,6 +96,7 @@ function runOnce({ model, prompt, system, cwd, addDirs = [], signal, onEvent, ti
     const toolNames = {};
     let text = '';
     let final = null;
+    const usage = { input: 0, output: 0, cache: 0, cacheWrite5m: 0, cacheWrite1h: 0 }; // summed over the run's result events
     let rateLimit = null;
     let sessionId = null;
     let contextTokens = 0; // prompt size of the last model call: what a resume of this session starts from
@@ -108,6 +142,7 @@ function runOnce({ model, prompt, system, cwd, addDirs = [], signal, onEvent, ti
         }
       } else if (e.type === 'result') {
         final = e;
+        addResultUsage(usage, e);
       }
     };
 
@@ -133,16 +168,11 @@ function runOnce({ model, prompt, system, cwd, addDirs = [], signal, onEvent, ti
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
-      const u = final?.usage || {};
       const out = {
         text: final?.result ?? text,
-        usage: {
-          input: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0),
-          output: u.output_tokens || 0,
-          cache: u.cache_read_input_tokens || 0,
-        },
+        usage,
         toolCalls,
-        costUsd: final?.total_cost_usd || 0,
+        costUsd: final?.total_cost_usd || 0, // a running total: the last result's covers the whole run
         durationMs: final?.duration_ms || Date.now() - started,
         rateLimit,
         sessionId,

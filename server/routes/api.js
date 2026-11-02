@@ -247,7 +247,7 @@ export default async function apiRoutes(app, opts = {}) {
       many(`SELECT t.id, t.key, t.title, t.status, t.progress, t.started_at, t.finished_at, t.created_at, p.name AS project_name FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.agent_id = $1 ORDER BY t.created_at DESC LIMIT 40`, [a.id]),
       many(`SELECT * FROM experiences WHERE agent_id = $1 ORDER BY created_at DESC LIMIT 30`, [a.id]),
       many(`SELECT version, reason, created_at FROM agent_versions WHERE agent_id = $1 ORDER BY version DESC LIMIT 20`, [a.id]),
-      many(`SELECT id, kind, status, model_id, input_tokens, output_tokens, cost_usd, tool_calls, duration_ms, created_at, finished_at FROM runs WHERE agent_id = $1 ORDER BY created_at DESC LIMIT 30`, [a.id]),
+      many(`SELECT id, kind, status, model_id, input_tokens, cache_write_5m_tokens, cache_write_1h_tokens, output_tokens, cost_usd, tool_calls, duration_ms, created_at, finished_at FROM runs WHERE agent_id = $1 ORDER BY created_at DESC LIMIT 30`, [a.id]),
     ]);
     const current = a.current_task_id ? await one(`SELECT t.*, p.name AS project_name FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = $1`, [a.current_task_id]) : null;
     const reports = await many(`SELECT id, name, role, title, status, level FROM agents WHERE supervisor_id = $1 AND NOT archived`, [a.id]);
@@ -546,7 +546,7 @@ export default async function apiRoutes(app, opts = {}) {
         (SELECT count(*)::int FROM tasks WHERE status = 'failed' AND finished_at >= date_trunc('day', now()) AND ${inP('project_id')}) AS tasks_failed_today,
         (SELECT count(*)::int FROM tasks WHERE status = 'running' AND ${inP('project_id')}) AS tasks_running,
         (SELECT count(*)::int FROM tasks WHERE status = 'proposed' AND ${inP('project_id')}) AS proposals,
-        (SELECT coalesce(sum(input_tokens + output_tokens),0) FROM runs WHERE created_at >= date_trunc('day', now()) AND ${inP('project_id')}) AS tokens_today,
+        (SELECT coalesce(sum(input_tokens + cache_write_5m_tokens + cache_write_1h_tokens + output_tokens),0) FROM runs WHERE created_at >= date_trunc('day', now()) AND ${inP('project_id')}) AS tokens_today,
         (SELECT coalesce(sum(cost_usd),0) FROM runs WHERE created_at >= now() - interval '7 days' AND ${inP('project_id')}) AS cost_week,
         (SELECT count(*)::int FROM notifications WHERE NOT read AND ${inP('project_id')}) AS unread`, g),
       many(`SELECT m.id, m.command, m.status, m.created_at, m.finished_at, p.name AS project_name, p.id AS project_id,
@@ -557,7 +557,7 @@ export default async function apiRoutes(app, opts = {}) {
       many(`SELECT to_char(d, 'MM-DD') AS day,
               (SELECT count(*)::int FROM tasks t WHERE t.status='done' AND t.finished_at >= d AND t.finished_at < d + interval '1 day' AND ${inP('t.project_id')}) AS done,
               (SELECT count(*)::int FROM tasks t WHERE t.status='failed' AND t.finished_at >= d AND t.finished_at < d + interval '1 day' AND ${inP('t.project_id')}) AS failed,
-              (SELECT coalesce(sum(input_tokens + output_tokens),0) FROM runs r WHERE r.created_at >= d AND r.created_at < d + interval '1 day' AND ${inP('r.project_id')}) AS tokens
+              (SELECT coalesce(sum(input_tokens + cache_write_5m_tokens + cache_write_1h_tokens + output_tokens),0) FROM runs r WHERE r.created_at >= d AND r.created_at < d + interval '1 day' AND ${inP('r.project_id')}) AS tokens
             FROM generate_series(date_trunc('day', now()) - interval '13 days', date_trunc('day', now()), interval '1 day') d ORDER BY d`, g),
       many(`SELECT status, count(*)::int AS n FROM tasks WHERE ${inP('project_id')} GROUP BY status`, g),
     ]);

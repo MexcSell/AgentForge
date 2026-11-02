@@ -154,6 +154,10 @@ CREATE INDEX IF NOT EXISTS runs_agent_idx ON runs(agent_id, created_at DESC);
 -- Claude Code session of a task run, and its last prompt size: the agent's next task in the topic resumes it.
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS session_id text;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS context_tokens integer NOT NULL DEFAULT 0;
+-- Prompt-cache writes by TTL (Claude Code runs). input_tokens of newer rows excludes them; older rows have 0 here and
+-- their writes folded into input_tokens, so input_tokens + both columns is a run's full input either way.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS cache_write_5m_tokens bigint NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS cache_write_1h_tokens bigint NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS runs_session_idx ON runs(agent_id, finished_at DESC) WHERE session_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS run_events (

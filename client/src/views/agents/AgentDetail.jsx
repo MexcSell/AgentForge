@@ -247,7 +247,7 @@ export function AgentDetailModal() {
                   <tbody>{detail.runs.map((r) => (
                     <tr key={r.id} className="border-t border-line">
                       <td className="py-1.5">{timeAgo(r.created_at)}</td><td>{r.kind}</td><td className="truncate max-w-32">{r.model_id}</td>
-                      <td className="text-right">{compact(r.input_tokens)}</td><td className="text-right">{compact(r.output_tokens)}</td>
+                      <td className="text-right" title="Input incl. prompt-cache writes">{compact(Number(r.input_tokens) + Number(r.cache_write_5m_tokens || 0) + Number(r.cache_write_1h_tokens || 0))}</td><td className="text-right">{compact(r.output_tokens)}</td>
                       <td className="text-right">{Object.values(r.tool_calls || {}).reduce((x, y) => x + y, 0)}</td><td className="text-right">{duration(r.duration_ms)}</td>
                     </tr>
                   ))}</tbody>
