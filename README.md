@@ -45,6 +45,45 @@ sudo systemctl daemon-reload && sudo systemctl restart agentforge
 
 Check it with `systemctl show agentforge -p EnvironmentFiles` and Model Manager's `ANTHROPIC_API_KEY: set` line. Without systemd, `ANTHROPIC_API_KEY=` in `.env` (`chmod 600 .env`) also works.
 
+### Claude models in Model Manager
+
+The Add / Edit dialog of a **Claude Code** or **Anthropic API** model lists the Claude models to pick from (name, context size and Anthropic API price per 1M tokens; **Older models** shows the previous generations that are still served). Picking one fills the model id and, unless you renamed it, the display name. A Claude Code model also takes, in two fields that work the same way:
+
+- **API key**: Claude Code runs of this model authenticate with it instead of the server's `ANTHROPIC_API_KEY` or the `claude` CLI login. It is stored server-side, never sent to the browser, and masked in run output.
+- **Session ID**: a Claude Code session id (a UUID: the name of a session file under `~/.claude/projects/<project folder>/`, without `.jsonl`). Agent task runs that have no session of their own start from that conversation with `--resume <id> --fork-session`, so the saved session itself never changes. The GM's planning, digest, triage and commit runs and the card's **Test** stay fresh, so they do not carry the whole transcript. The CLI looks the session up for the project folder the agent works in; if it is not there, the run starts fresh. Unlike the key, the session id is shown in Model Manager.
+
+Type a new value to replace the stored one, leave the field blank to keep it, or remove it with ×.
+
+### OpenRouter
+
+Model Manager → **Add model** → **OpenRouter** lists every model OpenRouter offers (its public catalog, refreshed every 10 minutes) with the input and output price per 1M tokens and the context size. Search it, sort it (free first, cheapest, most expensive, newest, largest context, name) or show free models only, and click one to fill the model id and name. A model id that is not listed can still be typed. **OpenRouter · Free router** (`openrouter/free`) is built in. OpenRouter models answer in text, like the other HTTP providers, and the cost OpenRouter reports for each run is recorded.
+
+They authenticate with `OPENROUTER_API_KEY` from the server's environment, unless a key is stored on the model. Put it in the same root-only file as the Anthropic key (`OPENROUTER_API_KEY=sk-or-v1-...` in `/etc/agentforge/agentforge.env`, then `sudo systemctl restart agentforge`), or in `.env`. Agents and terminals do not get this variable, run output is masked, and Model Manager shows administrators only whether it is `set` or `missing`. A key without credits can only use free models (`:free` ids, free only in the picker); OpenRouter limits free models to a daily number of requests per key.
+
+### Groq
+
+Model Manager → **Add model** → **Groq** lists the chat models your Groq key can use (Groq's model list, refreshed every 10 minutes; speech, transcription and Prompt Guard models are left out) with the input and output price per 1M tokens and the context size. Search it, sort it (cheapest, most expensive, newest, largest context, name) and click one to fill the model id and name. A model id that is not listed can still be typed. Groq models answer in text, like the other HTTP providers. Groq does not report a cost, so each run is costed from the prices saved when the model was picked.
+
+They authenticate with `GROQ_API_KEY` from the server's environment (`GROQ_API_KEY=gsk_...` in `/etc/agentforge/agentforge.env` or `.env`), unless a key is stored on the model. Groq's model list needs a key too: the dialog uses the key typed in its **API key** field (the list reloads once a whole key is typed), else the key stored on the model, else `GROQ_API_KEY`. Agents and terminals do not get this variable, run output is masked, and Model Manager shows administrators only whether it is `set` or `missing`.
+
+### Mistral
+
+Model Manager → **Add model** → **Mistral** lists the chat models your [Mistral](https://console.mistral.ai) key can see (Mistral's model list, refreshed every 10 minutes; embedding, OCR, moderation, transcription, speech and retired models are left out). Mistral lists every alias of a model separately; the picker shows one row per model, under its `-latest` name when it has one, with a note for reasoning, vision and code models, and searching any alias finds it. Sort by name or context size and click one to fill the model id and name; a model id that is not listed can still be typed. Mistral's list has no prices and its API reports no cost, so Mistral runs cost $0 in AgentForge: use token budgets to cap them. Reasoning models (e.g. `mistral-large-4`) answer with their thinking left out. A listed model is not always usable on your plan: a model your plan does not include fails with `429 Rate limit exceeded` straight away (its limit is 0 requests per minute); pick another one.
+
+They authenticate with `MISTRAL_API_KEY` from the server's environment (`MISTRAL_API_KEY=...` in `/etc/agentforge/agentforge.env` or `.env`), unless a key is stored on the model. The model list needs a key too: the key typed in the dialog's **API key** field (the list reloads once a whole key is typed), else the key stored on the model, else `MISTRAL_API_KEY`. Agents and terminals do not get this variable, run output is masked, and Model Manager shows administrators only whether it is `set` or `missing`.
+
+### Cohere
+
+Model Manager → **Add model** → **Cohere** lists the chat models your [Cohere](https://dashboard.cohere.com/api-keys) key can use (Cohere's model list, refreshed every 10 minutes; deprecated models are left out) with their context size. Cohere's list has no prices, so the picker shows none and runs record no cost. Search it, sort it by name or context size, and click one to fill the model id and name. A model id that is not listed can still be typed. Runs go through Cohere's OpenAI-compatible API (`https://api.cohere.ai/compatibility/v1`) and answer in text, like the other HTTP providers.
+
+They authenticate with `COHERE_API_KEY` from the server's environment (`COHERE_API_KEY=...` in `/etc/agentforge/agentforge.env` or `.env`), unless a key is stored on the model. The model list needs a key too: the one typed in the dialog's **API key** field (the list reloads once a whole key is typed), else the key stored on the model, else `COHERE_API_KEY`. Agents and terminals do not get this variable, run output is masked, and Model Manager shows administrators only whether it is `set` or `missing`.
+
+### SambaNova
+
+Model Manager → **Add model** → **SambaNova** lists every chat model on [SambaNova Cloud](https://cloud.sambanova.ai) (its model list, refreshed every 10 minutes) with the input and output price per 1M tokens and the context size. Search it, sort it (cheapest, most expensive, newest, largest context, name) and click one to fill the model id and name. A model id that is not listed can still be typed. SambaNova models answer in text, like the other HTTP providers. SambaNova does not report a cost, so each run is costed from the prices saved when the model was picked. Busy models answer "currently experiencing high demand"; try again later or pick another one.
+
+They authenticate with `SAMBANOVA_API_KEY` from the server's environment (`SAMBANOVA_API_KEY=...` in `/etc/agentforge/agentforge.env` or `.env`), unless a key is stored on the model. The model list is public; the dialog sends the key typed in its **API key** field (the list reloads once a whole key is typed), else the key stored on the model, else `SAMBANOVA_API_KEY`. Agents and terminals do not get this variable, run output is masked, and Model Manager shows administrators only whether it is `set` or `missing`.
+
 ### Remote access
 
 With **HTTPS mode** off (the default, Settings → Network · HTTPS mode, administrators only) the server listens on all interfaces over plain HTTP with no proxy hop, so other computers can open `http://<server IP or hostname>:4800` (the startup log lists the URLs). Every page and API still needs a signed-in account, and WebSockets only accept the app's own origin. To keep it local, set `HOST=127.0.0.1` in `.env` (another address binds just that interface); the change applies on the next restart. The administrator can sign in from any computer; other accounts are bound to the computer they registered from, so a teammate signs up from their own computer and the administrator approves it (or uses **Reset device** to move an account). If it does not load from outside, open TCP port 4800 in the host firewall and any cloud security group / router port forward. Traffic on port 4800 is plain HTTP, and the app includes a shell terminal (admin only). Over the internet, serve it over HTTPS (below) and keep 4800 private.

@@ -98,7 +98,7 @@ test('without ANTHROPIC_API_KEY an Anthropic API run fails clearly and sends not
   hits.length = 0;
   await assert.rejects(runModel(anthropicModel(), { prompt: 'x' }), /ANTHROPIC_API_KEY is not set in the AgentForge service environment/);
   assert.equal(hits.length, 0);
-  assert.deepEqual(credentialStatus(), { ANTHROPIC_API_KEY: 'missing' });
+  assert.equal(credentialStatus().ANTHROPIC_API_KEY, 'missing');
 }));
 
 test('a cancelled run still rejects with the abort, not a masking error', withKey(KEY, async () => {
@@ -106,10 +106,10 @@ test('a cancelled run still rejects with the abort, not a masking error', withKe
 }));
 
 test('credential status says set / missing, never the value', withKey(KEY, async () => {
-  assert.deepEqual(credentialStatus(), { ANTHROPIC_API_KEY: 'set' });
+  assert.equal(credentialStatus().ANTHROPIC_API_KEY, 'set');
   assert.equal(JSON.stringify(credentialStatus()).includes(KEY), false);
   process.env.ANTHROPIC_API_KEY = '   ';
-  assert.deepEqual(credentialStatus(), { ANTHROPIC_API_KEY: 'missing' }, 'blank counts as missing');
+  assert.equal(credentialStatus().ANTHROPIC_API_KEY, 'missing', 'blank counts as missing');
 }));
 
 test('Claude Code runs get the server ANTHROPIC_API_KEY; without it an auth failure names the variable', async () => {

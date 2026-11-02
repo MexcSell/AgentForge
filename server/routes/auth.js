@@ -71,6 +71,11 @@ const POLICY = {
   // GET/PUT /api/settings are admin-only (not listed): a non-admin's Settings page has only Appearance and Screen
   // format, which are browser preferences (client/src/lib/store.js PREFS) and never reach the server.
   'GET /api/providers': { cap: 'manageSettings' },
+  'GET /api/openrouter/models': { cap: 'manageSettings' },
+  'POST /api/groq/models': { cap: 'manageSettings' },
+  'POST /api/mistral/models': { cap: 'manageSettings' },
+  'POST /api/cohere/models': { cap: 'manageSettings' },
+  'POST /api/sambanova/models': { cap: 'manageSettings' },
   'POST /api/models': { cap: 'manageSettings' },
   'PATCH /api/models/:id': { cap: 'manageSettings' },
   'POST /api/models/:id/default': { cap: 'manageSettings' },

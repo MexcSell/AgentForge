@@ -33,6 +33,9 @@ export const MODELS = [
   { id: 'anthropic-opus', name: 'Anthropic API · Opus 5.5', provider: 'anthropic', model: 'claude-opus-5-5' },
   { id: 'anthropic-sonnet', name: 'Anthropic API · Sonnet 5.5', provider: 'anthropic', model: 'claude-sonnet-5-5' },
   { id: 'anthropic-haiku', name: 'Anthropic API · Haiku 5.5', provider: 'anthropic', model: 'claude-haiku-5-5' },
+  // OpenRouter's free router (picks a free model per request) with OPENROUTER_API_KEY; every other OpenRouter model is
+  // added from the catalog picker in Model Manager.
+  { id: 'openrouter-free', name: 'OpenRouter · Free router', provider: 'openrouter', model: 'openrouter/free' },
   { id: 'codex-gpt-6-luna', name: 'Codex · GPT-6 Luna', provider: 'codex', model: 'gpt-6-luna' },
   // Enabled only if OPENAI_API_KEY is set on first seed; otherwise add a key and enable it in Model Manager.
   { id: 'gpt-6-luna', name: 'GPT · GPT-6 Luna', provider: 'gpt', model: 'gpt-6-luna', enabled: !!process.env.OPENAI_API_KEY },

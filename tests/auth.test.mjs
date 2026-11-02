@@ -7,6 +7,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import http from 'node:http';
 import WebSocket from 'ws';
 
 process.env.PGOPTIONS = '-c search_path=pg_temp';
@@ -567,14 +568,29 @@ test('settings are admin-only: even with manageSettings a non-admin can neither 
   a.ws.close();
 });
 
-test('ANTHROPIC_API_KEY: only administrators learn whether it is set, and nothing returns the value', async () => {
+test('ANTHROPIC_API_KEY / OPENROUTER_API_KEY / GROQ_API_KEY / MISTRAL_API_KEY / COHERE_API_KEY / SAMBANOVA_API_KEY: only administrators learn whether they are set, and nothing returns the value', async () => {
   const old = process.env.ANTHROPIC_API_KEY;
+  const oldOr = process.env.OPENROUTER_API_KEY;
   const key = `sk-ant-test-${crypto.randomBytes(12).toString('hex')}`;
+  const oldGroq = process.env.GROQ_API_KEY;
+  const orKey = `sk-or-v1-${crypto.randomBytes(16).toString('hex')}`;
+  const groqKey = `gsk_${crypto.randomBytes(24).toString('hex')}`;
+  const oldMistral = process.env.MISTRAL_API_KEY;
+  const mistralKey = `mstrl_${crypto.randomBytes(18).toString('hex')}`;
+  const oldCohere = process.env.COHERE_API_KEY;
+  const cohereKey = crypto.randomBytes(20).toString('hex');
+  const oldSamba = process.env.SAMBANOVA_API_KEY;
+  const sambaKey = crypto.randomUUID();
   process.env.ANTHROPIC_API_KEY = key;
+  process.env.OPENROUTER_API_KEY = orKey;
+  process.env.GROQ_API_KEY = groqKey;
+  process.env.MISTRAL_API_KEY = mistralKey;
+  process.env.COHERE_API_KEY = cohereKey;
+  process.env.SAMBANOVA_API_KEY = sambaKey;
   try {
     const sid = `af_session=${await auth.createSession(await userId('sid'))}`; // has manageSettings
     const asAdmin = await call('GET', '/api/models/credentials', { cookie: root });
-    assert.deepEqual([asAdmin.status, asAdmin.data], [200, { ANTHROPIC_API_KEY: 'set' }]);
+    assert.deepEqual([asAdmin.status, asAdmin.data], [200, { ANTHROPIC_API_KEY: 'set', OPENROUTER_API_KEY: 'set', GROQ_API_KEY: 'set', MISTRAL_API_KEY: 'set', COHERE_API_KEY: 'set', SAMBANOVA_API_KEY: 'set' }]);
     assert.equal((await call('GET', '/api/models/credentials', { cookie: nia })).status, 403, 'non-admin');
     assert.equal((await call('GET', '/api/models/credentials', { cookie: sid })).status, 403, 'manageSettings is not enough');
     const s = await socket(root);
@@ -586,14 +602,206 @@ test('ANTHROPIC_API_KEY: only administrators learn whether it is set, and nothin
     for (const p of ['/api/models', '/api/providers', '/api/settings', '/api/models/credentials']) {
       const r = await call('GET', p, { cookie: root });
       assert.equal(JSON.stringify(r.data).includes(key), false, p);
+      assert.equal(JSON.stringify(r.data).includes(orKey), false, p);
+      assert.equal(JSON.stringify(r.data).includes(groqKey), false, p);
+      assert.equal(JSON.stringify(r.data).includes(mistralKey), false, p);
+      assert.equal(JSON.stringify(r.data).includes(cohereKey), false, p);
+      assert.equal(JSON.stringify(r.data).includes(sambaKey), false, p);
     }
     assert.ok(s.events.some((e) => e.type === 'models:update'));
     assert.equal(JSON.stringify(s.events).includes(key), false, 'models:update');
+    assert.equal(JSON.stringify(s.events).includes(orKey), false, 'models:update');
+    assert.equal(JSON.stringify(s.events).includes(groqKey), false, 'models:update');
+    assert.equal(JSON.stringify(s.events).includes(mistralKey), false, 'models:update');
+    assert.equal(JSON.stringify(s.events).includes(cohereKey), false, 'models:update');
+    assert.equal(JSON.stringify(s.events).includes(sambaKey), false, 'models:update');
     s.ws.close();
     delete process.env.ANTHROPIC_API_KEY;
-    assert.deepEqual((await call('GET', '/api/models/credentials', { cookie: root })).data, { ANTHROPIC_API_KEY: 'missing' });
+    delete process.env.OPENROUTER_API_KEY;
+    delete process.env.GROQ_API_KEY;
+    delete process.env.MISTRAL_API_KEY;
+    delete process.env.COHERE_API_KEY;
+    delete process.env.SAMBANOVA_API_KEY;
+    assert.deepEqual((await call('GET', '/api/models/credentials', { cookie: root })).data, { ANTHROPIC_API_KEY: 'missing', OPENROUTER_API_KEY: 'missing', GROQ_API_KEY: 'missing', MISTRAL_API_KEY: 'missing', COHERE_API_KEY: 'missing', SAMBANOVA_API_KEY: 'missing' });
   } finally {
     if (old === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = old;
+    if (oldOr === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = oldOr;
+    if (oldGroq === undefined) delete process.env.GROQ_API_KEY; else process.env.GROQ_API_KEY = oldGroq;
+    if (oldMistral === undefined) delete process.env.MISTRAL_API_KEY; else process.env.MISTRAL_API_KEY = oldMistral;
+    if (oldCohere === undefined) delete process.env.COHERE_API_KEY; else process.env.COHERE_API_KEY = oldCohere;
+    if (oldSamba === undefined) delete process.env.SAMBANOVA_API_KEY; else process.env.SAMBANOVA_API_KEY = oldSamba;
+  }
+});
+
+test('the OpenRouter model catalog is for model managers (manageSettings), like the provider list', async () => {
+  const old = process.env.OPENROUTER_CATALOG_URL;
+  process.env.OPENROUTER_CATALOG_URL = 'http://127.0.0.1:1/models'; // unreachable: an allowed call gets 502, never the network
+  try {
+    const sid = `af_session=${await auth.createSession(await userId('sid'))}`; // has manageSettings
+    const allowed = await call('GET', '/api/openrouter/models', { cookie: sid });
+    assert.equal(allowed.status, 502);
+    assert.match(allowed.data.error, /Could not load the OpenRouter model list/);
+    assert.equal((await call('GET', '/api/openrouter/models', { cookie: root })).status, 502);
+    assert.equal((await call('GET', '/api/openrouter/models', { cookie: nia })).status, 403, 'non-admin without manageSettings');
+  } finally {
+    if (old === undefined) delete process.env.OPENROUTER_CATALOG_URL; else process.env.OPENROUTER_CATALOG_URL = old;
+  }
+});
+
+test('the Groq model list is for model managers and uses the typed key, else the stored key, else GROQ_API_KEY', async () => {
+  const oldUrl = process.env.GROQ_CATALOG_URL;
+  const oldKey = process.env.GROQ_API_KEY;
+  const seen = [];
+  const fake = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'acme/chat', name: 'Acme Chat', context_window: 8192, pricing: { prompt: '0.000001', completion: '0.000002' } }] }));
+  });
+  await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+  process.env.GROQ_CATALOG_URL = `http://127.0.0.1:${fake.address().port}/models`;
+  process.env.GROQ_API_KEY = 'gsk_env';
+  const { resetGroqCache } = await import('../server/models/groq.js');
+  resetGroqCache();
+  try {
+    const sid = `af_session=${await auth.createSession(await userId('sid'))}`; // has manageSettings
+    const list = (body, cookie = sid) => call('POST', '/api/groq/models', { cookie, body });
+    const ok = await list({});
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.data.models.map((m) => [m.id, m.prompt, m.completion]), [['acme/chat', 1, 2]]);
+    assert.equal((await list({}, nia)).status, 403, 'non-admin without manageSettings');
+    await list({ api_key: ' gsk_typed ' });
+    await pool.query(`INSERT INTO models(id, name, provider, model, api_key) VALUES ('groq-auth-test', 'Groq · T', 'groq', 'acme/chat', 'gsk_stored')`);
+    await list({ model_id: 'groq-auth-test' });
+    await list({ model_id: 'groq-auth-test', api_key: 'gsk_typed2' });
+    assert.deepEqual(seen, ['Bearer gsk_env', 'Bearer gsk_typed', 'Bearer gsk_stored', 'Bearer gsk_typed2'], 'one fetch per key; the 403 sent nothing');
+    delete process.env.GROQ_API_KEY;
+    resetGroqCache();
+    const none = await list({});
+    assert.equal(none.status, 502);
+    assert.match(none.data.error, /No Groq API key/);
+    assert.equal(seen.length, 4, 'no request without a key');
+  } finally {
+    fake.close();
+    await pool.query(`DELETE FROM models WHERE id = 'groq-auth-test'`);
+    if (oldUrl === undefined) delete process.env.GROQ_CATALOG_URL; else process.env.GROQ_CATALOG_URL = oldUrl;
+    if (oldKey === undefined) delete process.env.GROQ_API_KEY; else process.env.GROQ_API_KEY = oldKey;
+  }
+});
+
+test('the Mistral model list is for model managers and uses the typed key, else the stored Mistral key, else MISTRAL_API_KEY', async () => {
+  const oldUrl = process.env.MISTRAL_CATALOG_URL;
+  const oldKey = process.env.MISTRAL_API_KEY;
+  const seen = [];
+  const fake = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ object: 'list', data: [{ id: 'acme-latest', max_context_length: 8192, capabilities: { completion_chat: true }, aliases: [] }] }));
+  });
+  await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+  process.env.MISTRAL_CATALOG_URL = `http://127.0.0.1:${fake.address().port}/models`;
+  process.env.MISTRAL_API_KEY = 'mstrl_env';
+  const { resetMistralCache } = await import('../server/models/mistral.js');
+  resetMistralCache();
+  try {
+    const sid = `af_session=${await auth.createSession(await userId('sid'))}`; // has manageSettings
+    const list = (body, cookie = sid) => call('POST', '/api/mistral/models', { cookie, body });
+    const ok = await list({});
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.data.models.map((m) => [m.id, m.context]), [['acme-latest', 8192]]);
+    assert.equal((await list({}, nia)).status, 403, 'non-admin without manageSettings');
+    await list({ api_key: ' mstrl_typed ' });
+    await pool.query(`INSERT INTO models(id, name, provider, model, api_key) VALUES ('mistral-auth-test', 'Mistral · T', 'mistral', 'acme-latest', 'mstrl_stored'), ('groq-auth-test2', 'Groq · T', 'groq', 'acme', 'gsk_other')`);
+    await list({ model_id: 'mistral-auth-test' });
+    await list({ model_id: 'groq-auth-test2' }); // another provider's key is never sent to Mistral: the env key (cached)
+    assert.deepEqual(seen, ['Bearer mstrl_env', 'Bearer mstrl_typed', 'Bearer mstrl_stored'], 'one fetch per key; the 403 sent nothing');
+    delete process.env.MISTRAL_API_KEY;
+    resetMistralCache();
+    const none = await list({});
+    assert.equal(none.status, 502);
+    assert.match(none.data.error, /No Mistral API key/);
+    assert.equal(seen.length, 3, 'no request without a key');
+  } finally {
+    fake.close();
+    await pool.query(`DELETE FROM models WHERE id IN ('mistral-auth-test', 'groq-auth-test2')`);
+    if (oldUrl === undefined) delete process.env.MISTRAL_CATALOG_URL; else process.env.MISTRAL_CATALOG_URL = oldUrl;
+    if (oldKey === undefined) delete process.env.MISTRAL_API_KEY; else process.env.MISTRAL_API_KEY = oldKey;
+  }
+});
+
+test('the Cohere model list is for model managers and uses the typed key, else the stored Cohere key, else COHERE_API_KEY', async () => {
+  const oldUrl = process.env.COHERE_CATALOG_URL;
+  const oldKey = process.env.COHERE_API_KEY;
+  const seen = [];
+  const fake = http.createServer((req, res) => {
+    seen.push([req.headers.authorization, new URL(req.url, 'http://x').searchParams.get('endpoint')]);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ models: [{ name: 'command-x', endpoints: ['chat'], context_length: 8192 }] }));
+  });
+  await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+  process.env.COHERE_CATALOG_URL = `http://127.0.0.1:${fake.address().port}/v1/models`;
+  process.env.COHERE_API_KEY = 'co_env';
+  const { resetCohereCache } = await import('../server/models/cohere.js');
+  resetCohereCache();
+  try {
+    const sid = `af_session=${await auth.createSession(await userId('sid'))}`; // has manageSettings
+    const list = (body, cookie = sid) => call('POST', '/api/cohere/models', { cookie, body });
+    const ok = await list({});
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.data.models.map((m) => [m.id, m.context]), [['command-x', 8192]]);
+    assert.equal((await list({}, nia)).status, 403, 'non-admin without manageSettings');
+    await list({ api_key: ' co_typed ' });
+    await pool.query(`INSERT INTO models(id, name, provider, model, api_key) VALUES ('cohere-auth-test', 'Cohere · T', 'cohere', 'command-x', 'co_stored'), ('groq-auth-test3', 'Groq · T', 'groq', 'acme', 'gsk_other')`);
+    await list({ model_id: 'cohere-auth-test' });
+    await list({ model_id: 'groq-auth-test3' }); // another provider's key is never sent to Cohere: the env key (cached)
+    assert.deepEqual(seen, [['Bearer co_env', 'chat'], ['Bearer co_typed', 'chat'], ['Bearer co_stored', 'chat']], 'one fetch per key; the 403 sent nothing');
+    delete process.env.COHERE_API_KEY;
+    resetCohereCache();
+    const none = await list({});
+    assert.equal(none.status, 502);
+    assert.match(none.data.error, /No Cohere API key/);
+    assert.equal(seen.length, 3, 'no request without a key');
+  } finally {
+    fake.close();
+    await pool.query(`DELETE FROM models WHERE id IN ('cohere-auth-test', 'groq-auth-test3')`);
+    if (oldUrl === undefined) delete process.env.COHERE_CATALOG_URL; else process.env.COHERE_CATALOG_URL = oldUrl;
+    if (oldKey === undefined) delete process.env.COHERE_API_KEY; else process.env.COHERE_API_KEY = oldKey;
+  }
+});
+
+test('the SambaNova model list is for model managers; it sends the typed key, else the stored SambaNova key, else SAMBANOVA_API_KEY, else none', async () => {
+  const oldUrl = process.env.SAMBANOVA_CATALOG_URL;
+  const oldKey = process.env.SAMBANOVA_API_KEY;
+  const seen = [];
+  const fake = http.createServer((req, res) => {
+    seen.push(req.headers.authorization);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ object: 'list', data: [{ id: 'Acme-70B', context_length: 8192, pricing: { prompt: '0.0000006', completion: '0.0000012' } }] }));
+  });
+  await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+  process.env.SAMBANOVA_CATALOG_URL = `http://127.0.0.1:${fake.address().port}/models`;
+  process.env.SAMBANOVA_API_KEY = 'sn-env';
+  const { resetSambanovaCache } = await import('../server/models/sambanova.js');
+  resetSambanovaCache();
+  try {
+    const sid = `af_session=${await auth.createSession(await userId('sid'))}`; // has manageSettings
+    const list = (body, cookie = sid) => call('POST', '/api/sambanova/models', { cookie, body });
+    const ok = await list({});
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.data.models.map((m) => [m.id, m.context, m.prompt, m.completion]), [['Acme-70B', 8192, 0.6, 1.2]]);
+    assert.equal((await list({}, nia)).status, 403, 'non-admin without manageSettings');
+    await list({ api_key: ' sn-typed ' });
+    await pool.query(`INSERT INTO models(id, name, provider, model, api_key) VALUES ('samba-auth-test', 'SambaNova · T', 'sambanova', 'Acme-70B', 'sn-stored'), ('groq-auth-test4', 'Groq · T', 'groq', 'acme', 'gsk_other')`);
+    await list({ model_id: 'samba-auth-test' });
+    await list({ model_id: 'groq-auth-test4' }); // another provider's key is never sent to SambaNova: the env key (cached)
+    delete process.env.SAMBANOVA_API_KEY;
+    const anon = await list({});
+    assert.equal(anon.status, 200, 'the public list loads without any key');
+    assert.deepEqual(seen, ['Bearer sn-env', 'Bearer sn-typed', 'Bearer sn-stored', undefined], 'one fetch per key; the 403 sent nothing');
+  } finally {
+    fake.close();
+    await pool.query(`DELETE FROM models WHERE id IN ('samba-auth-test', 'groq-auth-test4')`);
+    if (oldUrl === undefined) delete process.env.SAMBANOVA_CATALOG_URL; else process.env.SAMBANOVA_CATALOG_URL = oldUrl;
+    if (oldKey === undefined) delete process.env.SAMBANOVA_API_KEY; else process.env.SAMBANOVA_API_KEY = oldKey;
   }
 });
 

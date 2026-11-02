@@ -88,5 +88,10 @@ export const PROVIDER_STYLE = {
   anthropic: { from: '#c96442', to: '#8f3f22', label: 'Anthropic API' },
   gpt: { from: '#a855f7', to: '#a21caf', label: 'OpenAI GPT' },
   openai: { from: '#10a37f', to: '#0b6e56', label: 'OpenAI-compatible' },
+  openrouter: { from: '#6467f2', to: '#3b3fc4', label: 'OpenRouter' },
+  groq: { from: '#f55036', to: '#c2361d', label: 'Groq' },
+  mistral: { from: '#ff8205', to: '#e10500', label: 'Mistral' },
+  cohere: { from: '#39594d', to: '#1f3a30', label: 'Cohere' },
+  sambanova: { from: '#ee7624', to: '#b34d0f', label: 'SambaNova' },
   simulator: { from: '#71717a', to: '#3f3f46', label: 'Simulator' },
 };

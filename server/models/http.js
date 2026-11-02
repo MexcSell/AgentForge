@@ -12,9 +12,14 @@ function loadImages(images = []) {
 async function post(url, headers, body, signal) {
   const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body), signal });
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`${res.status} ${json.error?.message || json.error || res.statusText}`);
+  // OpenAI-style { error: { message } }; Mistral puts `message` at the top level (a string, or validation details).
+  const message = json.error?.message || json.error || json.message;
+  if (!res.ok) throw new Error(`${res.status} ${(typeof message === 'object' ? JSON.stringify(message) : message) || res.statusText}`);
   return json;
 }
+
+/** A chat answer's text: a string, or content blocks (Mistral's reasoning models) whose thinking blocks are left out. */
+const textOf = (content) => (Array.isArray(content) ? content.filter((b) => b?.type === 'text').map((b) => b.text).join('') : content || '');
 
 /** ANTHROPIC_API_KEY of the server process (systemd EnvironmentFile or .env, see README), or '' when unset. */
 export const anthropicEnvKey = () => (process.env.ANTHROPIC_API_KEY || '').trim();
@@ -51,22 +56,25 @@ export async function runGpt(opts) {
   return runOpenAI({ ...opts, model: { ...opts.model, api_key: key } });
 }
 
-/** Any OpenAI-compatible /chat/completions endpoint (OpenAI, Ollama, llama.cpp, vLLM, OpenRouter...). */
-export async function runOpenAI({ model, prompt, system, images, signal, onEvent }) {
+/**
+ * Any OpenAI-compatible /chat/completions endpoint (OpenAI, Ollama, llama.cpp, vLLM, OpenRouter...). `headers` and `body`
+ * add provider extras; a `usage.cost` in the answer (OpenRouter) is recorded as the run's cost.
+ */
+export async function runOpenAI({ model, prompt, system, images, signal, onEvent, headers = {}, body = {} }) {
   const started = Date.now();
   const base = (model.base_url || 'https://api.openai.com/v1').replace(/\/$/, '');
   const content = [{ type: 'text', text: prompt }, ...loadImages(images).map((i) => ({ type: 'image_url', image_url: { url: `data:${i.mime};base64,${i.data}` } }))];
   onEvent?.({ type: 'status', text: `Calling ${model.model} @ ${base}` });
-  const json = await post(`${base}/chat/completions`, model.api_key ? { authorization: `Bearer ${model.api_key}` } : {},
-    { model: model.model, messages: [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: images?.length ? content : prompt }] },
+  const json = await post(`${base}/chat/completions`, { ...headers, ...(model.api_key ? { authorization: `Bearer ${model.api_key}` } : {}) },
+    { ...body, model: model.model, messages: [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: images?.length ? content : prompt }] },
     signal);
-  const text = json.choices?.[0]?.message?.content || '';
+  const text = textOf(json.choices?.[0]?.message?.content);
   onEvent?.({ type: 'text', text });
   return {
     text,
     usage: { input: json.usage?.prompt_tokens || 0, output: json.usage?.completion_tokens || 0, cache: 0 },
     toolCalls: {},
-    costUsd: 0,
+    costUsd: Number(json.usage?.cost) || 0,
     durationMs: Date.now() - started,
   };
 }

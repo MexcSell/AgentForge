@@ -16,12 +16,21 @@ import { notify, audit } from '../services/notify.js';
 import { gitInfo } from '../services/git.js';
 import { disposePreview } from '../services/runner.js';
 import { listModels, publishModels, PROVIDERS, runModel, recordRunUsage, credentialStatus } from '../models/index.js';
+import { openrouterCatalog } from '../models/openrouter.js';
+import { groqCatalog } from '../models/groq.js';
+import { mistralCatalog } from '../models/mistral.js';
+import { cohereCatalog } from '../models/cohere.js';
+import { sambanovaCatalog } from '../models/sambanova.js';
+import { SESSION_ID } from '../models/claudeCode.js';
 import { submitCommand, cancelMission, standup, syncNow, approveProposal, rejectProposal, handOver, previewHandOver } from '../orchestrator/engine.js';
 import { evolutionOverview, analyzeMission } from '../orchestrator/evolution.js';
 import { can, canSeeProject, grantedProjects } from '../services/access.js';
 import { grantProject } from '../services/auth.js';
 
 const err = (reply, code, message) => reply.code(code).send({ error: message });
+
+// A Claude Code session id saved on a model must be a UUID (or empty to remove it): it ends up in the CLI's argv.
+const badSession = (cfg) => cfg && cfg.sessionId != null && String(cfg.sessionId).trim() !== '' && !SESSION_ID.test(String(cfg.sessionId).trim());
 
 // The projects a delete covers, with their GMs. The hand-over preview reads them the same way, so it goes in the same order.
 // retire_id: the GM to retire with the project; null when it is an executive, which is never retired, or a clone.
@@ -360,10 +369,40 @@ export default async function apiRoutes(app, opts = {}) {
   app.get('/api/providers', () => Object.fromEntries(Object.entries(PROVIDERS).map(([k, v]) => [k, { label: v.label, canEdit: v.canEdit }])));
   // 'set' / 'missing' for the server's ANTHROPIC_API_KEY, never the value. Not in POLICY (routes/auth.js): admin-only.
   app.get('/api/models/credentials', () => credentialStatus());
+  // Every model OpenRouter offers, with prices per 1M tokens, for the Model Manager picker.
+  app.get('/api/openrouter/models', async (req, reply) => {
+    try { return await openrouterCatalog({ refresh: req.query.refresh === '1' }); } catch (e) { return err(reply, 502, e.message); }
+  });
+  // The chat models a Groq key can use, with prices per 1M tokens. POST so a key typed in the dialog stays out of URLs and
+  // logs; without one, the key stored on `model_id` (editing), else the server's GROQ_API_KEY.
+  app.post('/api/groq/models', async (req, reply) => {
+    const b = req.body || {};
+    const stored = !b.api_key && b.model_id ? (await one(`SELECT api_key FROM models WHERE id = $1 AND provider = 'groq'`, [b.model_id]))?.api_key : null;
+    try { return await groqCatalog({ key: (b.api_key || '').trim() || stored || undefined, refresh: !!b.refresh }); } catch (e) { return err(reply, 502, e.message); }
+  });
+  // The chat models a Mistral key can see (no prices: Mistral's list has none). Same key order as Groq's list.
+  app.post('/api/mistral/models', async (req, reply) => {
+    const b = req.body || {};
+    const stored = !b.api_key && b.model_id ? (await one(`SELECT api_key FROM models WHERE id = $1 AND provider = 'mistral'`, [b.model_id]))?.api_key : null;
+    try { return await mistralCatalog({ key: (b.api_key || '').trim() || stored || undefined, refresh: !!b.refresh }); } catch (e) { return err(reply, 502, e.message); }
+  });
+  // The chat models a Cohere key can use (no prices: Cohere's list has none). Same key order as Groq's list.
+  app.post('/api/cohere/models', async (req, reply) => {
+    const b = req.body || {};
+    const stored = !b.api_key && b.model_id ? (await one(`SELECT api_key FROM models WHERE id = $1 AND provider = 'cohere'`, [b.model_id]))?.api_key : null;
+    try { return await cohereCatalog({ key: (b.api_key || '').trim() || stored || undefined, refresh: !!b.refresh }); } catch (e) { return err(reply, 502, e.message); }
+  });
+  // Every SambaNova Cloud chat model with prices per 1M tokens. The list is public; the key (same order as Groq's) is sent if there is one.
+  app.post('/api/sambanova/models', async (req, reply) => {
+    const b = req.body || {};
+    const stored = !b.api_key && b.model_id ? (await one(`SELECT api_key FROM models WHERE id = $1 AND provider = 'sambanova'`, [b.model_id]))?.api_key : null;
+    try { return await sambanovaCatalog({ key: (b.api_key || '').trim() || stored || undefined, refresh: !!b.refresh }); } catch (e) { return err(reply, 502, e.message); }
+  });
 
   app.post('/api/models', async (req, reply) => {
     const b = req.body || {};
     if (!b.name || !PROVIDERS[b.provider]) return err(reply, 400, 'Name and a valid provider are required');
+    if (badSession(b.config)) return err(reply, 400, 'Session ID must be a Claude Code session id (a UUID)');
     const id = `${b.provider}-${String(b.model || b.name).toLowerCase().replace(/[^a-z0-9]+/g, '-')}`.slice(0, 60) + '-' + crypto.randomBytes(2).toString('hex');
     await query(`INSERT INTO models(id, name, provider, model, base_url, api_key, limits, config) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [id, b.name, b.provider, b.model || null, b.base_url || null, b.api_key || null, b.limits || {}, b.config || {}]);
@@ -375,8 +414,10 @@ export default async function apiRoutes(app, opts = {}) {
     const m = await one(`SELECT * FROM models WHERE id = $1`, [req.params.id]);
     if (!m) return err(reply, 404, 'Not found');
     const b = req.body || {};
+    if (badSession(b.config)) return err(reply, 400, 'Session ID must be a Claude Code session id (a UUID)');
+    // api_key: a new key replaces the stored one, blank keeps it, clear_api_key removes it.
     await query(`UPDATE models SET name=$2, model=$3, base_url=$4, api_key=$5, limits=$6, config=$7, enabled=$8 WHERE id=$1`,
-      [m.id, b.name ?? m.name, b.model ?? m.model, b.base_url ?? m.base_url, b.api_key ? b.api_key : m.api_key, { ...m.limits, ...(b.limits || {}) }, { ...m.config, ...(b.config || {}) }, b.enabled ?? m.enabled]);
+      [m.id, b.name ?? m.name, b.model ?? m.model, b.base_url ?? m.base_url, b.api_key ? b.api_key : b.clear_api_key ? null : m.api_key, { ...m.limits, ...(b.limits || {}) }, { ...m.config, ...(b.config || {}) }, b.enabled ?? m.enabled]);
     await publishModels();
     return { ok: true };
   });

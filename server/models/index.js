@@ -3,6 +3,11 @@ import { emit } from '../events.js';
 import { runClaudeCode } from './claudeCode.js';
 import { runCodex } from './codex.js';
 import { anthropicEnvKey, runAnthropic, runGpt, runOpenAI } from './http.js';
+import { openrouterEnvKey, runOpenRouter } from './openrouter.js';
+import { groqEnvKey, runGroq } from './groq.js';
+import { mistralEnvKey, runMistral } from './mistral.js';
+import { cohereEnvKey, runCohere } from './cohere.js';
+import { sambanovaEnvKey, runSambanova } from './sambanova.js';
 import { runSimulator } from './simulator.js';
 
 export const PROVIDERS = {
@@ -11,6 +16,11 @@ export const PROVIDERS = {
   anthropic: { label: 'Anthropic API', canEdit: false, run: runAnthropic },
   gpt: { label: 'OpenAI GPT', canEdit: false, run: runGpt },
   openai: { label: 'OpenAI-compatible', canEdit: false, run: runOpenAI },
+  openrouter: { label: 'OpenRouter', canEdit: false, run: runOpenRouter },
+  groq: { label: 'Groq', canEdit: false, run: runGroq },
+  mistral: { label: 'Mistral', canEdit: false, run: runMistral },
+  cohere: { label: 'Cohere', canEdit: false, run: runCohere },
+  sambanova: { label: 'SambaNova', canEdit: false, run: runSambanova },
   simulator: { label: 'Simulator', canEdit: false, run: runSimulator },
 };
 
@@ -86,17 +96,26 @@ export async function resolveModel(modelId) {
   return m;
 }
 
-/** Whether the server process has ANTHROPIC_API_KEY: the only thing about it that leaves the server (admins only). */
-export const credentialStatus = () => ({ ANTHROPIC_API_KEY: anthropicEnvKey() ? 'set' : 'missing' });
+/** Whether the server process has each provider key: the only thing about them that leaves the server (admins only). */
+export const credentialStatus = () => ({
+  ANTHROPIC_API_KEY: anthropicEnvKey() ? 'set' : 'missing',
+  OPENROUTER_API_KEY: openrouterEnvKey() ? 'set' : 'missing',
+  GROQ_API_KEY: groqEnvKey() ? 'set' : 'missing',
+  MISTRAL_API_KEY: mistralEnvKey() ? 'set' : 'missing',
+  COHERE_API_KEY: cohereEnvKey() ? 'set' : 'missing',
+  SAMBANOVA_API_KEY: sambanovaEnvKey() ? 'set' : 'missing',
+});
 
 /**
- * Masks Anthropic keys in what a run produces: agents inherit ANTHROPIC_API_KEY, so a shell `env` could print it, and
- * run events and outputs are stored and broadcast. The key prefix also catches a key cut by a preview limit.
+ * Masks Anthropic, OpenRouter, Groq, Mistral, Cohere and SambaNova keys in what a run produces: agents inherit ANTHROPIC_API_KEY, so a shell `env` could
+ * print it, and run events and outputs are stored and broadcast. The key prefixes also catch a key cut by a preview limit.
  */
 export function redactKeys(v, key = anthropicEnvKey()) {
   if (typeof v === 'string') {
-    const s = key ? v.split(key).join('[redacted]') : v;
-    return s.replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted]').replace(/(ANTHROPIC_API_KEY["']?\s*[=:]\s*["']?)[^\s"'\[]+/g, '$1[redacted]');
+    let s = v;
+    for (const k of [key, openrouterEnvKey(), groqEnvKey(), mistralEnvKey(), cohereEnvKey(), sambanovaEnvKey()].flat()) if (k) s = s.split(k).join('[redacted]');
+    return s.replace(/sk-ant-[A-Za-z0-9_-]+|sk-or-v1-[A-Za-z0-9]+|gsk_[A-Za-z0-9]+|mstrl_[A-Za-z0-9_-]+/g, '[redacted]')
+      .replace(/((?:ANTHROPIC|OPENROUTER|GROQ|MISTRAL|COHERE|SAMBANOVA)_API_KEY["']?\s*[=:]\s*["']?)[^\s"'\[]+/g, '$1[redacted]');
   }
   if (Array.isArray(v)) return v.map((x) => redactKeys(x, key));
   if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactKeys(x, key)]));
@@ -107,18 +126,20 @@ export function redactKeys(v, key = anthropicEnvKey()) {
 export async function runModel(model, opts, runId) {
   const provider = PROVIDERS[model.provider];
   if (!provider) throw new Error(`Unknown provider ${model.provider}`);
-  const onEvent = opts.onEvent && ((e) => opts.onEvent(redactKeys(e)));
+  // A key stored on the model reaches Claude Code agents too (their env), so it is masked like the server's.
+  const keys = [anthropicEnvKey(), model.api_key];
+  const onEvent = opts.onEvent && ((e) => opts.onEvent(redactKeys(e, keys)));
   let out;
   try {
     out = await provider.run({ ...opts, onEvent, model, access: provider.canEdit ? opts.access : 'read' });
   } catch (err) {
     // Assign only on a change: an abort's DOMException has a read-only message.
-    const msg = redactKeys(err.message);
+    const msg = redactKeys(err.message, keys);
     if (msg !== err.message) err.message = msg;
-    if (err.partial) err.partial.text = redactKeys(err.partial.text);
+    if (err.partial) err.partial.text = redactKeys(err.partial.text, keys);
     throw err;
   }
-  out.text = redactKeys(out.text);
+  out.text = redactKeys(out.text, keys);
   if (out.rateLimit) {
     await query(`UPDATE models SET rate_limit = $2 WHERE id = $1`, [model.id, { ...out.rateLimit, observedAt: new Date().toISOString() }]);
   }

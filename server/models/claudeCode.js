@@ -19,18 +19,30 @@ const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
  * longer has falls back to a fresh run with freshPrompt (default: prompt). persist: keep the session on disk so a later run can resume it.
  */
 export function runClaudeCode(opts) {
-  return runOnce(opts).catch((err) => {
-    if (!opts.resume || !err.resumeMissing || opts.signal?.aborted) throw err;
-    opts.onEvent?.({ type: 'status', text: 'Previous session not found · starting fresh' });
+  // The session id saved on the model (Model Manager) starts every agent task run that has no session of its own (not the
+  // GM's planning, digest, triage or commit runs, nor the connectivity test: they would carry its whole transcript). It is
+  // forked, so each run continues from it under a new id and the saved session itself never changes.
+  const saved = !opts.resume && opts.meta?.kind === 'task' && savedSession(opts.model);
+  const first = saved ? { ...opts, resume: saved, fork: true } : opts;
+  return runOnce(first).catch((err) => {
+    if (!first.resume || !err.resumeMissing || opts.signal?.aborted) throw err;
+    opts.onEvent?.({ type: 'status', text: `${saved ? 'Saved' : 'Previous'} session not found · starting fresh` });
     return runOnce({ ...opts, resume: null, prompt: opts.freshPrompt ?? opts.prompt });
   });
 }
 
-function runOnce({ model, prompt, system, cwd, addDirs = [], signal, onEvent, timeoutMs, tools = null, resume = null, persist = false }) {
+/** Claude Code session ids are UUIDs; anything else on the model is ignored (it would reach the CLI's argv). */
+export const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const savedSession = (model) => {
+  const id = String(model.config?.sessionId || '').trim();
+  return SESSION_ID.test(id) ? id : null;
+};
+
+function runOnce({ model, prompt, system, cwd, addDirs = [], signal, onEvent, timeoutMs, tools = null, resume = null, fork = false, persist = false }) {
   const cfg = model.config || {};
   const args = ['-p', '--output-format', 'stream-json', '--verbose'];
-  if (resume) args.push('--resume', resume);
-  else if (!persist) args.push('--no-session-persistence');
+  if (resume) args.push('--resume', resume, ...(fork ? ['--fork-session'] : []));
+  if (!persist && (!resume || fork)) args.push('--no-session-persistence');
   if (model.model) args.push('--model', model.model);
   if (cfg.effort) args.push('--effort', cfg.effort);
   if (cfg.maxBudgetUsd) args.push('--max-budget-usd', String(cfg.maxBudgetUsd));
@@ -45,7 +57,8 @@ function runOnce({ model, prompt, system, cwd, addDirs = [], signal, onEvent, ti
     const started = Date.now();
     // The service runs as root; Claude Code refuses bypassPermissions as uid 0 unless IS_SANDBOX=1.
     // childEnv passes the service's ANTHROPIC_API_KEY on: the CLI then authenticates with it instead of its own login.
-    const child = spawn(config.claudeBin, args, { cwd, env: childEnv({ IS_SANDBOX: '1' }), detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    // A key stored on the model (Model Manager) wins over it.
+    const child = spawn(config.claudeBin, args, { cwd, env: childEnv({ IS_SANDBOX: '1', ...(model.api_key ? { ANTHROPIC_API_KEY: model.api_key } : {}) }), detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
     const toolCalls = {};
     const toolNames = {};
     let text = '';
@@ -144,7 +157,7 @@ function runOnce({ model, prompt, system, cwd, addDirs = [], signal, onEvent, ti
         // An API error (bad or missing key, ...) ends in an error result whose text says why.
         const why = final?.subtype && final.subtype !== 'success' ? final.subtype
           : (String(final?.result || '').trim().split('\n')[0].slice(0, 300) || stderr.trim().split('\n').pop() || `exit code ${code}`);
-        const hint = !anthropicEnvKey() && /api key|authenticat|unauthori[sz]ed|not logged in|\/login|\b401\b/i.test(why)
+        const hint = !anthropicEnvKey() && !model.api_key && /api key|authenticat|unauthori[sz]ed|not logged in|\/login|\b401\b/i.test(why)
           ? ' · ANTHROPIC_API_KEY is not set in the AgentForge service environment (README → Anthropic API key)' : '';
         return reject(Object.assign(new Error(`Claude Code failed: ${why}${hint}`), { partial: out }));
       }
