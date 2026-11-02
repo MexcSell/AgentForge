@@ -98,6 +98,8 @@ const reload = async () => {
 };
 const settle = () => act(async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setTimeout(r, 0)); });
 const text = () => document.getElementById('root').textContent;
+// Absence is asserted with assert.ok(!button(…)), never assert.equal(button(…), undefined): a failing equal diffs the
+// rendered node, whose React fiber keys pull in the whole app tree (tens of GB, OOM-killed the host).
 const button = (label) => [...document.querySelectorAll('#root button')].find((b) => b.textContent.trim() === label || b.getAttribute('aria-label') === label);
 const click = (node) => act(async () => { node.dispatchEvent(new w.MouseEvent('click', { bubbles: true, cancelable: true })); });
 const typeInto = (el, v) => act(async () => {
@@ -114,11 +116,11 @@ test('signed out: the sign-up screen has only a username field and a Register bu
   await settle();
   assert.ok(text().includes('Sign up'));
   assert.deepEqual(inputs().map((i) => i.type || 'text'), ['text'], 'one field');
-  assert.equal(document.querySelector('#root input[type="password"]'), null);
+  assert.ok(!document.querySelector('#root input[type="password"]'));
   assert.ok(button('Register'));
-  assert.equal(button('Team registration'), undefined);
-  assert.equal(button('Sign in on this computer'), undefined, 'this browser has no device yet');
-  assert.equal(button('Dashboard'), undefined, 'no navigation');
+  assert.ok(!button('Team registration'));
+  assert.ok(!button('Sign in on this computer'), 'this browser has no device yet');
+  assert.ok(!button('Dashboard'), 'no navigation');
   assert.ok(!calls.some((c) => c.url === '/api/projects' || c.url === '/api/auth/device'), 'no data requested, no device sign-in without a device');
 });
 
@@ -137,7 +139,7 @@ test('register → waiting for approval (no session) → approved → signed in 
   assert.ok(text().includes('Waiting for administrator approval'));
   assert.ok(text().includes('bob'));
   assert.equal(server.me, null, 'no session');
-  assert.equal(button('Dashboard'), undefined);
+  assert.ok(!button('Dashboard'));
 
   // Still pending: checking again keeps waiting.
   await click(button('Check again'));
@@ -152,7 +154,8 @@ test('register → waiting for approval (no session) → approved → signed in 
   await click(button('Check again'));
   await settle();
   assert.ok(signedInView());
-  for (const v of ['Users', 'Settings', 'Files', 'GitHub', 'Agents', 'Models']) assert.equal(button(v), undefined, v);
+  for (const v of ['Users', 'Files', 'GitHub', 'Agents', 'Models']) assert.ok(!button(v), v);
+  assert.ok(button('Settings'), 'Settings is for everyone (Appearance and Screen format only)');
   assert.ok(!calls.some((c) => c.url === '/api/auth/login'), 'never a password');
 
   // Session gone (expired, server restart…): a reload signs in again by the device alone.
@@ -165,7 +168,7 @@ test('register → waiting for approval (no session) → approved → signed in 
   // Log out sticks: the reload shows the homepage, and "Sign in on this computer" signs in again.
   await act(async () => useStore.getState().logout());
   await reload();
-  assert.equal(button('Dashboard'), undefined);
+  assert.ok(!button('Dashboard'));
   await click(button('Sign in on this computer'));
   await settle();
   assert.ok(signedInView());
@@ -178,11 +181,11 @@ test('another browser, or a forged device secret, is not signed in: the unknown 
   await act(async () => root.render(h(App)));
   await settle();
   assert.equal(calls.filter((c) => c.url === '/api/auth/device').length, 1, 'tried once, silently');
-  assert.equal(button('Dashboard'), undefined);
+  assert.ok(!button('Dashboard'));
   assert.equal(server.me, null);
   assert.ok(text().includes('Sign up') && button('Register'), 'the registration screen');
   assert.equal(localStorage.getItem('agentforge.device'), null, 'the stale secret is cleared');
-  assert.equal(button('Sign in on this computer'), undefined, 'nothing left to sign in with');
+  assert.ok(!button('Sign in on this computer'), 'nothing left to sign in with');
   await typeInto(inputs()[0], 'erin');
   await submit();
   await settle();
@@ -236,7 +239,7 @@ test('page load on a pending device shows the waiting screen, not the registrati
   await act(async () => root.render(h(App)));
   await settle();
   assert.ok(text().includes('Waiting for administrator approval') && text().includes('bob'));
-  assert.equal(button('Register'), undefined);
+  assert.ok(!button('Register'));
   assert.equal(inputs().length, 0);
   assert.equal(server.me, null);
   assert.equal(localStorage.getItem('agentforge.device'), secret, 'a known secret is kept');
@@ -252,7 +255,7 @@ test('page load on an approved device whose session cookie is not kept: a clear 
   assert.ok(calls.some((c) => c.url === '/api/auth/device'), 'device sign-in was tried');
   assert.ok(text().includes('Session not kept') && text().includes('did not keep the session cookie'), text().slice(0, 200));
   assert.ok(!text().includes('not registered'), 'not told it is unregistered');
-  assert.equal(button('Register'), undefined, 'no sign-up form');
+  assert.ok(!button('Register'), 'no sign-up form');
   assert.equal(inputs().length, 0);
   assert.equal(localStorage.getItem('agentforge.device'), secret, 'a valid secret is kept');
   // Cookies allowed again: "Check again" signs in.
@@ -271,7 +274,7 @@ for (const [what, set] of [['a 500', (s) => { s.fail = 500; }], ['a 502 from a p
     await act(async () => root.render(h(App)));
     await settle();
     assert.equal(localStorage.getItem('agentforge.device'), secret, 'a transient error never drops the secret');
-    assert.equal(button('Register'), undefined, 'no sign-up form');
+    assert.ok(!button('Register'), 'no sign-up form');
     assert.ok(text().includes('Connecting to AgentForge'));
     Object.assign(server, { fail: 0, down: false });
     await reload();
@@ -310,9 +313,9 @@ for (const [status, title] of [['rejected', 'Registration rejected'], ['disabled
     await settle();
     assert.ok(text().includes(title));
     assert.ok(text().includes(`status ${status}`) && text().includes('bob'), 'the server\'s reason');
-    assert.equal(button('Register'), undefined);
+    assert.ok(!button('Register'));
     assert.equal(inputs().length, 0);
-    assert.equal(button('Dashboard'), undefined);
+    assert.ok(!button('Dashboard'));
     assert.equal(server.me, null);
     assert.equal(localStorage.getItem('agentforge.device'), secret, 'a known secret is kept');
     // Re-enabled meanwhile: "Check again" signs in.
@@ -358,7 +361,7 @@ test('with no administrator yet, the homepage creates it from a username alone',
   await settle();
   assert.ok(text().includes('Create the administrator account'));
   assert.equal(inputs().length, 1);
-  assert.equal(button('Sign up'), undefined);
+  assert.ok(!button('Sign up'));
   await typeInto(inputs()[0], 'owner');
   await click(button('Create administrator'));
   await settle();
@@ -390,5 +393,5 @@ test('Users page: approve a registration, grant a project and a capability, rese
   await settle();
   assert.ok(calls.some((c) => c.url === '/api/users/u2/reset-device'));
   assert.ok(text().includes('No device bound'));
-  assert.equal(document.querySelector('#root [data-device-info]'), null);
+  assert.ok(!document.querySelector('#root [data-device-info]'));
 });

@@ -78,6 +78,7 @@ export const useStore = create((set, get) => ({
   // account: undefined while checking, null when signed out (the homepage shows), else { id, username, role, status, permissions }
   me: undefined,
   capabilities: {}, // permission flag → description, from /api/auth/me
+  eventSeq: null, // the server's event counter when /api/auth/me answered (lib/ws.js: skip the boot resync if unchanged)
   setup: false, // no administrator yet: the homepage creates it
   device: null, // signed out: why this browser's device sign-in was refused { code: pending|rejected|disabled, message, username, team }
 
@@ -126,9 +127,9 @@ export const useStore = create((set, get) => ({
   /** The signed-in account (or null), and whether the homepage should offer to create the administrator. */
   async loadMe() {
     try {
-      const { user, capabilities } = await api.get('/api/auth/me', { quiet: true });
+      const { user, capabilities, seq } = await api.get('/api/auth/me', { quiet: true });
       storage((s) => s.removeItem(SIGNED_OUT_KEY));
-      set({ me: user, capabilities, device: null });
+      set({ me: user, capabilities, eventSeq: seq ?? null, device: null });
     } catch (e) {
       if (e.status !== 401) throw e; // server unreachable (restarting): keep the account, the caller retries
       // No session: a registered browser signs in with its device secret, unless the user logged out here.
@@ -158,9 +159,9 @@ export const useStore = create((set, get) => ({
       return null;
     }
     try {
-      const { user, capabilities } = await api.get('/api/auth/me', { quiet: true });
+      const { user, capabilities, seq } = await api.get('/api/auth/me', { quiet: true });
       storage((s) => s.removeItem(SIGNED_OUT_KEY));
-      set({ me: user, capabilities, device: null });
+      set({ me: user, capabilities, eventSeq: seq ?? null, device: null });
       return user;
     } catch (e) {
       if (e.status !== 401) throw e; // server unreachable: the caller retries
@@ -428,6 +429,7 @@ export const useStore = create((set, get) => ({
         break;
       }
       case 'notification:new':
+        if (st.notifications.some((n) => n.id === p.id)) break; // already in the loadAll snapshot
         set({ notifications: [p, ...st.notifications].slice(0, 300) });
         toast[p.level === 'error' ? 'error' : p.level === 'success' ? 'success' : p.level === 'warning' ? 'warn' : 'info'](p.title, p.body, { source: p.source_name });
         break;

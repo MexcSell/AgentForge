@@ -8,6 +8,7 @@ import {
   listUsers, pendingCount, userAction, setPermissions, setGitIdentity, deleteUser,
 } from '../services/auth.js';
 import { previewTarget } from './preview.js';
+import { eventSeq } from '../events.js';
 
 const err = (reply, code, message, extra = {}) => reply.code(code).send({ error: message, ...extra });
 
@@ -181,7 +182,7 @@ export default async function authRoutes(app, opts = {}) {
   app.get('/api/auth/me', async (req, reply) => {
     const user = await sessionUser(tokenOf(req));
     if (!user) return err(reply, 401, 'Sign in required');
-    return { user: publicUser(user), capabilities: CAPABILITIES };
+    return { user: publicUser(user), capabilities: CAPABILITIES, seq: eventSeq() };
   });
   // Username + this browser's device (secret and computer info). Only the first account (the administrator) is
   // signed in at once; any other waits for approval without a session, then signs in through /api/auth/device.

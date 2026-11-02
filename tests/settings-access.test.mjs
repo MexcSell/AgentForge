@@ -88,7 +88,7 @@ test('a non-admin sees only Appearance and Screen format, can open Settings, and
   root = createRoot(document.getElementById('root'));
   await act(async () => root.render(h(ActivityBar, { layout: LAYOUTS[0] })));
   assert.ok(document.querySelector('#root button[aria-label^="Settings"]'), 'the Settings nav entry is shown');
-  assert.equal(document.querySelector('#root button[aria-label^="Users"]'), null);
+  assert.ok(!document.querySelector('#root button[aria-label^="Users"]'), 'no Users nav entry'); // never a rendered node in a failing assert: its diff inspects the whole React tree
 });
 
 test('an administrator sees every section as before', async () => {

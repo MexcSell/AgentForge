@@ -11,7 +11,7 @@ import multipart from '@fastify/multipart';
 import { config, ROOT, networkMode } from './config.js';
 import { pool, migrate, one } from './db/pool.js';
 import { seed, getSettings, sanitizeMonitor } from './db/seed.js';
-import { addClient, emit, clientCount } from './events.js';
+import { addClient, emit, clientCount, eventSeq } from './events.js';
 import { attachTerminal, killAllTerminals, terminalCount } from './services/terminal.js';
 import { killAllPreviews } from './services/runner.js';
 import { notify } from './services/notify.js';
@@ -132,6 +132,8 @@ app.post('/api/system/restart', async (req, reply) => {
 app.register(async (scope) => {
   scope.get('/api/events', { websocket: true }, (socket, req) => {
     addClient(socket, req.user);
+    // First frame, sent before anything else can be emitted to this socket (see eventSeq in events.js).
+    socket.send(JSON.stringify({ type: 'hello', payload: { seq: eventSeq() }, ts: Date.now() }));
     socket.on('close', () => syncMetrics());
     systemStatus().then((s) => socket.send(JSON.stringify({ type: 'system:status', payload: s, ts: Date.now() })));
     if (metrics) socket.send(JSON.stringify({ type: 'system:metrics', payload: metrics, ts: Date.now() }));

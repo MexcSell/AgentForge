@@ -120,9 +120,7 @@ export function TitleBar({ layout }) {
         {unread > 0 && <span className="absolute top-0.5 right-0.5 size-2 rounded-full bg-bad ring-2 ring-[var(--af-panel)]" />}
       </button>
       {st.me && (
-        <button onClick={() => st.logout()} className="flex items-center gap-1.5 h-7 px-1.5 rounded-md text-muted hover:text-fg hover:bg-hover text-[0.78rem]" title={`Signed in as ${st.me.username}${st.me.role === 'admin' ? ' (administrator)' : ''} · click to log out`}>
-          <span className="hidden md:inline max-w-28 truncate">{st.me.username}</span><LogOut size={15} />
-        </button>
+        <span className="hidden md:inline max-w-28 truncate px-1.5 text-muted text-[0.78rem]" title={`Signed in as ${st.me.username}${st.me.role === 'admin' ? ' (administrator)' : ''} · Sign out from the command palette (Ctrl K)`}>{st.me.username}</span>
       )}
     </header>
   );
@@ -315,6 +313,7 @@ export function CommandPalette() {
     const list = [
       ...[...VIEWS, ...SYSTEM_VIEWS].filter((v) => canView(st.me, v.id)).map((v) => ({ group: 'Go to', label: v.label, icon: v.icon, run: go(v.id), hint: `Alt+${v.key}` })),
       ...(can(st.me, 'createProjects') ? [{ group: 'Actions', label: 'New project…', icon: Plus, run: () => st.set({ palette: false, view: 'projects', createProject: true }) }] : []),
+      ...(st.me ? [{ group: 'Actions', label: 'Sign out', sub: st.me.username, icon: LogOut, run: () => { st.set({ palette: false }); st.logout(); } }] : []),
       { group: 'Actions', label: 'Toggle light / dark', icon: st.theme === 'dark' ? Sun : Moon, run: () => st.set({ palette: false, theme: st.theme === 'dark' ? 'light' : 'dark' }) },
       ...(can(st.me, 'manageAgents') ? [
         { group: 'Actions', label: 'Org chart', icon: Users, run: go('agents') },
