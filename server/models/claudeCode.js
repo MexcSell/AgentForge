@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { config } from '../config.js';
 import { childEnv } from '../services/env.js';
+import { anthropicEnvKey } from './http.js';
 
 function brief(input) {
   if (!input || typeof input !== 'object') return '';
@@ -43,6 +44,7 @@ function runOnce({ model, prompt, system, cwd, addDirs = [], signal, onEvent, ti
   return new Promise((resolve, reject) => {
     const started = Date.now();
     // The service runs as root; Claude Code refuses bypassPermissions as uid 0 unless IS_SANDBOX=1.
+    // childEnv passes the service's ANTHROPIC_API_KEY on: the CLI then authenticates with it instead of its own login.
     const child = spawn(config.claudeBin, args, { cwd, env: childEnv({ IS_SANDBOX: '1' }), detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
     const toolCalls = {};
     const toolNames = {};
@@ -139,8 +141,12 @@ function runOnce({ model, prompt, system, cwd, addDirs = [], signal, onEvent, ti
         return reject(Object.assign(new Error('Claude Code session not found'), { partial: out, resumeMissing: true }));
       }
       if (!final || final.is_error) {
-        const why = final?.subtype && final.subtype !== 'success' ? final.subtype : (stderr.trim().split('\n').pop() || `exit code ${code}`);
-        return reject(Object.assign(new Error(`Claude Code failed: ${why}`), { partial: out }));
+        // An API error (bad or missing key, ...) ends in an error result whose text says why.
+        const why = final?.subtype && final.subtype !== 'success' ? final.subtype
+          : (String(final?.result || '').trim().split('\n')[0].slice(0, 300) || stderr.trim().split('\n').pop() || `exit code ${code}`);
+        const hint = !anthropicEnvKey() && /api key|authenticat|unauthori[sz]ed|not logged in|\/login|\b401\b/i.test(why)
+          ? ' · ANTHROPIC_API_KEY is not set in the AgentForge service environment (README → Anthropic API key)' : '';
+        return reject(Object.assign(new Error(`Claude Code failed: ${why}${hint}`), { partial: out }));
       }
       resolve(out);
     });

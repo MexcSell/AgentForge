@@ -18,6 +18,8 @@ WorkingDirectory=/home/luca/AgentForge
 Environment=HOME=/root
 Environment=SHELL=/bin/bash
 Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Secrets such as ANTHROPIC_API_KEY=… (README "Anthropic API key"): root-only 0600 file outside the checkout; optional (-).
+EnvironmentFile=-/etc/agentforge/agentforge.env
 ExecStart=/usr/local/bin/node scripts/supervisor.js
 # Keep it up even after `npm run stop` (exit 0); use `systemctl stop agentforge` to really stop it.
 Restart=always

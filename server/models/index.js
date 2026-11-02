@@ -2,7 +2,7 @@ import { one, many, query } from '../db/pool.js';
 import { emit } from '../events.js';
 import { runClaudeCode } from './claudeCode.js';
 import { runCodex } from './codex.js';
-import { runAnthropic, runGpt, runOpenAI } from './http.js';
+import { anthropicEnvKey, runAnthropic, runGpt, runOpenAI } from './http.js';
 import { runSimulator } from './simulator.js';
 
 export const PROVIDERS = {
@@ -86,11 +86,39 @@ export async function resolveModel(modelId) {
   return m;
 }
 
+/** Whether the server process has ANTHROPIC_API_KEY: the only thing about it that leaves the server (admins only). */
+export const credentialStatus = () => ({ ANTHROPIC_API_KEY: anthropicEnvKey() ? 'set' : 'missing' });
+
+/**
+ * Masks Anthropic keys in what a run produces: agents inherit ANTHROPIC_API_KEY, so a shell `env` could print it, and
+ * run events and outputs are stored and broadcast. The key prefix also catches a key cut by a preview limit.
+ */
+export function redactKeys(v, key = anthropicEnvKey()) {
+  if (typeof v === 'string') {
+    const s = key ? v.split(key).join('[redacted]') : v;
+    return s.replace(/sk-ant-[A-Za-z0-9_-]+/g, '[redacted]').replace(/(ANTHROPIC_API_KEY["']?\s*[=:]\s*["']?)[^\s"'\[]+/g, '$1[redacted]');
+  }
+  if (Array.isArray(v)) return v.map((x) => redactKeys(x, key));
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, redactKeys(x, key)]));
+  return v;
+}
+
 /** Runs a model and records usage. Every call becomes a row in `runs`. */
 export async function runModel(model, opts, runId) {
   const provider = PROVIDERS[model.provider];
   if (!provider) throw new Error(`Unknown provider ${model.provider}`);
-  const out = await provider.run({ ...opts, model, access: provider.canEdit ? opts.access : 'read' });
+  const onEvent = opts.onEvent && ((e) => opts.onEvent(redactKeys(e)));
+  let out;
+  try {
+    out = await provider.run({ ...opts, onEvent, model, access: provider.canEdit ? opts.access : 'read' });
+  } catch (err) {
+    // Assign only on a change: an abort's DOMException has a read-only message.
+    const msg = redactKeys(err.message);
+    if (msg !== err.message) err.message = msg;
+    if (err.partial) err.partial.text = redactKeys(err.partial.text);
+    throw err;
+  }
+  out.text = redactKeys(out.text);
   if (out.rateLimit) {
     await query(`UPDATE models SET rate_limit = $2 WHERE id = $1`, [model.id, { ...out.rateLimit, observedAt: new Date().toISOString() }]);
   }

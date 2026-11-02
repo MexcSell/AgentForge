@@ -27,6 +27,24 @@ sudo systemctl enable --now agentforge
 
 Then manage it with `systemctl restart|stop|status agentforge`. `npm run stop` only restarts it, since systemd brings it back; `npm start` beside the service just reports "already running". The service has no login shell, so variables exported in `.bashrc` do not reach it: put them in `.env`.
 
+### Anthropic API key
+
+Anthropic API models (Model Manager → **Anthropic API · Fable 5.1 / Opus 5.5 / Sonnet 5.5 / Haiku 5.5**) authenticate with `ANTHROPIC_API_KEY` from the server's environment, unless a key is stored on the model. Agents get the same variable, so Claude Code runs (**Claude Code · …** models) authenticate with it instead of the `claude` CLI login, and the usage is billed to that key. Without it, Claude Code keeps using the CLI login, and Anthropic API runs fail with "ANTHROPIC_API_KEY is not set". The key is never stored in the database or sent to the browser: Model Manager shows administrators only whether it is `set` or `missing`, and run output is masked.
+
+For the systemd service, keep the key in a root-only file outside the checkout (agents work inside the checkout, so a `.env` there is within their reach):
+
+```bash
+sudo install -d -m 0700 /etc/agentforge
+sudo install -m 0600 /dev/null /etc/agentforge/agentforge.env
+sudoedit /etc/agentforge/agentforge.env        # one line: ANTHROPIC_API_KEY=sk-ant-...
+sudo systemctl edit agentforge                 # add the two lines below, or use the updated deploy/agentforge.service
+#   [Service]
+#   EnvironmentFile=-/etc/agentforge/agentforge.env
+sudo systemctl daemon-reload && sudo systemctl restart agentforge
+```
+
+Check it with `systemctl show agentforge -p EnvironmentFiles` and Model Manager's `ANTHROPIC_API_KEY: set` line. Without systemd, `ANTHROPIC_API_KEY=` in `.env` (`chmod 600 .env`) also works.
+
 ### Remote access
 
 With **HTTPS mode** off (the default, Settings → Network · HTTPS mode, administrators only) the server listens on all interfaces over plain HTTP with no proxy hop, so other computers can open `http://<server IP or hostname>:4800` (the startup log lists the URLs). Every page and API still needs a signed-in account, and WebSockets only accept the app's own origin. To keep it local, set `HOST=127.0.0.1` in `.env` (another address binds just that interface); the change applies on the next restart. The administrator can sign in from any computer; other accounts are bound to the computer they registered from, so a teammate signs up from their own computer and the administrator approves it (or uses **Reset device** to move an account). If it does not load from outside, open TCP port 4800 in the host firewall and any cloud security group / router port forward. Traffic on port 4800 is plain HTTP, and the app includes a shell terminal (admin only). Over the internet, serve it over HTTPS (below) and keep 4800 private.

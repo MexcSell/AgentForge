@@ -15,7 +15,7 @@ import { listTopics, getTopic, createTopic, updateTopic, deleteTopic, isUuid } f
 import { notify, audit } from '../services/notify.js';
 import { gitInfo } from '../services/git.js';
 import { disposePreview } from '../services/runner.js';
-import { listModels, publishModels, PROVIDERS, runModel, recordRunUsage } from '../models/index.js';
+import { listModels, publishModels, PROVIDERS, runModel, recordRunUsage, credentialStatus } from '../models/index.js';
 import { submitCommand, cancelMission, standup, syncNow, approveProposal, rejectProposal, handOver, previewHandOver } from '../orchestrator/engine.js';
 import { evolutionOverview, analyzeMission } from '../orchestrator/evolution.js';
 import { can, canSeeProject, grantedProjects } from '../services/access.js';
@@ -358,6 +358,8 @@ export default async function apiRoutes(app, opts = {}) {
   // ---- models ------------------------------------------------------------
   app.get('/api/models', () => listModels());
   app.get('/api/providers', () => Object.fromEntries(Object.entries(PROVIDERS).map(([k, v]) => [k, { label: v.label, canEdit: v.canEdit }])));
+  // 'set' / 'missing' for the server's ANTHROPIC_API_KEY, never the value. Not in POLICY (routes/auth.js): admin-only.
+  app.get('/api/models/credentials', () => credentialStatus());
 
   app.post('/api/models', async (req, reply) => {
     const b = req.body || {};

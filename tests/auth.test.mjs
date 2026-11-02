@@ -567,6 +567,36 @@ test('settings are admin-only: even with manageSettings a non-admin can neither 
   a.ws.close();
 });
 
+test('ANTHROPIC_API_KEY: only administrators learn whether it is set, and nothing returns the value', async () => {
+  const old = process.env.ANTHROPIC_API_KEY;
+  const key = `sk-ant-test-${crypto.randomBytes(12).toString('hex')}`;
+  process.env.ANTHROPIC_API_KEY = key;
+  try {
+    const sid = `af_session=${await auth.createSession(await userId('sid'))}`; // has manageSettings
+    const asAdmin = await call('GET', '/api/models/credentials', { cookie: root });
+    assert.deepEqual([asAdmin.status, asAdmin.data], [200, { ANTHROPIC_API_KEY: 'set' }]);
+    assert.equal((await call('GET', '/api/models/credentials', { cookie: nia })).status, 403, 'non-admin');
+    assert.equal((await call('GET', '/api/models/credentials', { cookie: sid })).status, 403, 'manageSettings is not enough');
+    const s = await socket(root);
+    await tick();
+    s.events.length = 0;
+    const { publishModels } = await import('../server/models/index.js');
+    await publishModels();
+    await tick();
+    for (const p of ['/api/models', '/api/providers', '/api/settings', '/api/models/credentials']) {
+      const r = await call('GET', p, { cookie: root });
+      assert.equal(JSON.stringify(r.data).includes(key), false, p);
+    }
+    assert.ok(s.events.some((e) => e.type === 'models:update'));
+    assert.equal(JSON.stringify(s.events).includes(key), false, 'models:update');
+    s.ws.close();
+    delete process.env.ANTHROPIC_API_KEY;
+    assert.deepEqual((await call('GET', '/api/models/credentials', { cookie: root })).data, { ANTHROPIC_API_KEY: 'missing' });
+  } finally {
+    if (old === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = old;
+  }
+});
+
 test('per-user Git identity: the administrator sets name, email and branch (validated); other non-admins never see them', async () => {
   const id = await userId('sid');
   const put = (body, cookie = root) => call('PUT', `/api/users/${id}/git`, { cookie, body });

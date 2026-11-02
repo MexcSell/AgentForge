@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Cpu, Plus, Star, Trash2, FlaskConical, Pencil, Timer, CalendarClock, Coins, Hash, CircleCheck, CircleX, Gauge, KeyRound, Info, SquareTerminal, Sparkles } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { useStore } from '../lib/store.js';
+import { isAdmin } from '../lib/access.js';
 import { toast } from '../lib/toast.js';
 import { compact, usd, duration, dateTime } from '../lib/format.js';
 import { PROVIDER_STYLE } from '../lib/icons.jsx';
@@ -20,6 +21,8 @@ const PRESETS = {
   openai: { model: 'gpt-4o', base_url: 'http://localhost:11434/v1' },
   simulator: { model: 'sim-1', base_url: '' },
 };
+/** Current Claude model ids, suggested in the Model id field for Claude Code and the Anthropic API. */
+const CLAUDE_MODELS = [['claude-fable-5-1', 'Fable 5.1'], ['claude-opus-5-5', 'Opus 5.5'], ['claude-sonnet-5-5', 'Sonnet 5.5'], ['claude-haiku-5-5', 'Haiku 5.5']];
 
 function ProviderMark({ provider, size = 40 }) {
   const s = PROVIDER_STYLE[provider] || PROVIDER_STYLE.simulator;
@@ -78,7 +81,7 @@ function RateLimit({ info }) {
   );
 }
 
-function ModelDialog({ open, model, onClose }) {
+function ModelDialog({ open, model, onClose, envKey }) {
   const providers = PROVIDER_STYLE;
   const blank = { name: '', provider: 'claude-code', ...PRESETS['claude-code'], api_key: '', limits: { dailyTokens: 2000000, weeklyTokens: 10000000, dailyPrompts: 400, weeklyPrompts: 2000, resetHour: 0, weeklyResetDay: 1 }, config: { effort: '' } };
   const [f, setF] = useState(blank);
@@ -116,9 +119,13 @@ function ModelDialog({ open, model, onClose }) {
         )}
         <div className="grid md:grid-cols-2 gap-4">
           <Field label="Display name"><Input value={f.name} placeholder="Claude Code · Sonnet" onChange={(e) => setF({ ...f, name: e.target.value })} /></Field>
-          <Field label="Model id"><Input className="mono" value={f.model || ''} onChange={(e) => setF({ ...f, model: e.target.value })} /></Field>
+          <Field label="Model id">
+            <Input className="mono" list={f.provider === 'claude-code' || f.provider === 'anthropic' ? 'af-claude-models' : undefined} value={f.model || ''} onChange={(e) => setF({ ...f, model: e.target.value })} />
+            <datalist id="af-claude-models">{CLAUDE_MODELS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</datalist>
+          </Field>
           {viaHttp && <Field label="Base URL"><Input className="mono" value={f.base_url || ''} placeholder={f.provider === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1'} onChange={(e) => setF({ ...f, base_url: e.target.value })} /></Field>}
-          {viaHttp && <Field label="API key" hint={model?.has_api_key ? 'A key is stored. Leave blank to keep it.' : f.provider === 'gpt' ? 'Stored server-side; never sent to the browser. Without a stored key, OPENAI_API_KEY is used.' : 'Stored server-side; never sent to the browser.'}><Input icon={KeyRound} type="password" value={f.api_key} onChange={(e) => setF({ ...f, api_key: e.target.value })} /></Field>}
+          {viaHttp && <Field label="API key" hint={model?.has_api_key ? 'A key is stored. Leave blank to keep it.' : f.provider === 'gpt' ? 'Stored server-side; never sent to the browser. Without a stored key, OPENAI_API_KEY is used.'
+            : f.provider === 'anthropic' ? `Optional. Without a stored key, the server's ANTHROPIC_API_KEY is used${envKey ? ` (${envKey})` : ''}.` : 'Stored server-side; never sent to the browser.'}><Input icon={KeyRound} type="password" value={f.api_key} onChange={(e) => setF({ ...f, api_key: e.target.value })} /></Field>}
           {agentCli && (
             <>
               <div className="flex flex-col gap-1.5">
@@ -145,7 +152,7 @@ function ModelDialog({ open, model, onClose }) {
   );
 }
 
-function ModelCard({ m, onEdit, onDelete }) {
+function ModelCard({ m, onEdit, onDelete, envKey }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState(null);
   const L = m.limits || {};
@@ -159,7 +166,7 @@ function ModelCard({ m, onEdit, onDelete }) {
       <div className="flex items-center gap-3 p-4 border-b border-line">
         <ProviderMark provider={m.provider} />
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2"><span className="font-semibold truncate">{m.name}</span>{m.is_default && <Badge tone="accent" icon={Star}>Default</Badge>}{m.can_edit && !m.is_default && <Badge>Recommended</Badge>}{m.provider === 'gpt' && !m.has_api_key && <Badge tone="warn" icon={KeyRound}>API key required</Badge>}</div>
+          <div className="flex items-center gap-2"><span className="font-semibold truncate">{m.name}</span>{m.is_default && <Badge tone="accent" icon={Star}>Default</Badge>}{m.can_edit && !m.is_default && <Badge>Recommended</Badge>}{m.provider === 'gpt' && !m.has_api_key && <Badge tone="warn" icon={KeyRound}>API key required</Badge>}{m.provider === 'anthropic' && !m.has_api_key && envKey === 'missing' && <Badge tone="warn" icon={KeyRound}>ANTHROPIC_API_KEY missing</Badge>}</div>
           <div className="text-xs text-subtle mono truncate">{m.provider_label} · {m.model}{m.can_edit ? ' · can edit files' : ' · text only'}</div>
         </div>
         <Toggle checked={m.enabled} onChange={(v) => api.patch(`/api/models/${m.id}`, { enabled: v })} />
@@ -204,8 +211,17 @@ function ModelCard({ m, onEdit, onDelete }) {
 
 export default function Models({ layout }) {
   const models = useStore((s) => s.models);
+  const admin = isAdmin(useStore((s) => s.me));
   const [dialog, setDialog] = useState(null);
   const [del, setDel] = useState(null);
+  // 'set' | 'missing' for the server's ANTHROPIC_API_KEY; the endpoint is admin-only, so others never ask.
+  const [envKey, setEnvKey] = useState(null);
+  useEffect(() => {
+    if (!admin) return setEnvKey(null);
+    let live = true;
+    api.get('/api/models/credentials', { quiet: true }).then((c) => live && setEnvKey(c?.ANTHROPIC_API_KEY || null), () => {});
+    return () => { live = false; };
+  }, [admin]);
   return (
     <div className={cx('h-full overflow-auto', layout.floating && 'p-1.5')}>
       <div className="p-4 flex flex-col gap-4 max-w-[1500px]">
@@ -221,11 +237,20 @@ export default function Models({ layout }) {
           <Info size={13} className="mt-0.5 shrink-0 text-info" />
           <span>Budgets are enforced by AgentForge before each run (tokens = input + output; cache reads shown separately). Provider plan limits reported by Claude Code or Codex appear on each card after its first run.</span>
         </div>
+        {envKey && (
+          <div className="flex items-start gap-2 text-xs text-muted p-3 rounded-lg border border-line bg-panel">
+            <KeyRound size={13} className={cx('mt-0.5 shrink-0', envKey === 'set' ? 'text-ok' : 'text-warn')} />
+            <span>
+              <span className="mono">ANTHROPIC_API_KEY</span> in the server environment: <b className={envKey === 'set' ? 'text-ok' : 'text-warn'}>{envKey}</b>.
+              {envKey === 'set' ? ' Anthropic API models and Claude Code runs authenticate with it.' : ' Anthropic API models need it (or a key stored on the model); Claude Code falls back to the claude CLI login. See README → Anthropic API key.'}
+            </span>
+          </div>
+        )}
         <div className="grid gap-4 xl:grid-cols-2">
-          {models.map((m) => <ModelCard key={m.id} m={m} onEdit={() => setDialog({ model: m })} onDelete={() => setDel(m)} />)}
+          {models.map((m) => <ModelCard key={m.id} m={m} envKey={envKey} onEdit={() => setDialog({ model: m })} onDelete={() => setDel(m)} />)}
         </div>
       </div>
-      <ModelDialog open={!!dialog} model={dialog?.model} onClose={() => setDialog(null)} />
+      <ModelDialog open={!!dialog} model={dialog?.model} envKey={envKey} onClose={() => setDialog(null)} />
       <Confirm open={!!del} title={`Delete ${del?.name}?`} danger confirmLabel="Delete" body="Agents assigned to this model fall back to the default model. Usage history is kept." onConfirm={() => api.del(`/api/models/${del.id}`)} onClose={() => setDel(null)} />
     </div>
   );

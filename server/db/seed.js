@@ -21,10 +21,18 @@ export function sanitizeMonitor(value, base = DEFAULT_SETTINGS.monitor) {
 
 const DEFAULT_LIMITS = { dailyTokens: 2_000_000, weeklyTokens: 10_000_000, dailyPrompts: 400, weeklyPrompts: 2000, resetHour: 0, weeklyResetDay: 1 };
 
-const MODELS = [
+export const MODELS = [
   { id: 'claude-code-opus', name: 'Claude Code · Opus 5.5', provider: 'claude-code', model: 'claude-opus-5-5', is_default: true },
   { id: 'claude-code-sonnet', name: 'Claude Code · Sonnet 5.5', provider: 'claude-code', model: 'claude-sonnet-5-5' },
   { id: 'claude-code-haiku', name: 'Claude Code · Haiku 5.5', provider: 'claude-code', model: 'claude-haiku-5-5' },
+  { id: 'claude-code-fable', name: 'Claude Code · Fable 5.1', provider: 'claude-code', model: 'claude-fable-5-1' },
+  // Anthropic Messages API with ANTHROPIC_API_KEY from the server environment (or a key stored on the model).
+  // Enabled even without the key: a run then fails with a clear "ANTHROPIC_API_KEY is not set" instead of an agent
+  // assigned to one silently running on the default model.
+  { id: 'anthropic-fable', name: 'Anthropic API · Fable 5.1', provider: 'anthropic', model: 'claude-fable-5-1' },
+  { id: 'anthropic-opus', name: 'Anthropic API · Opus 5.5', provider: 'anthropic', model: 'claude-opus-5-5' },
+  { id: 'anthropic-sonnet', name: 'Anthropic API · Sonnet 5.5', provider: 'anthropic', model: 'claude-sonnet-5-5' },
+  { id: 'anthropic-haiku', name: 'Anthropic API · Haiku 5.5', provider: 'anthropic', model: 'claude-haiku-5-5' },
   { id: 'codex-gpt-6-luna', name: 'Codex · GPT-6 Luna', provider: 'codex', model: 'gpt-6-luna' },
   // Enabled only if OPENAI_API_KEY is set on first seed; otherwise add a key and enable it in Model Manager.
   { id: 'gpt-6-luna', name: 'GPT · GPT-6 Luna', provider: 'gpt', model: 'gpt-6-luna', enabled: !!process.env.OPENAI_API_KEY },
@@ -50,11 +58,8 @@ const AGENTS = [
   ['Muse', 'optimizer', 'Darwin', { prompting: 80, playbooks: 76 }, 'Turns lessons into versioned playbooks.'],
 ];
 
-export async function seed() {
-  for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-    await query(`INSERT INTO settings(key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`, [key, value]);
-  }
-
+/** Adds the built-in models that are missing. Existing rows (edited, disabled, the default) are left as they are. */
+export async function seedModels() {
   for (const m of MODELS) {
     await query(
       `INSERT INTO models(id, name, provider, model, is_default, enabled, limits, config)
@@ -63,6 +68,14 @@ export async function seed() {
         m.provider === 'claude-code' || m.provider === 'codex' ? { effort: '' } : {}],
     );
   }
+}
+
+export async function seed() {
+  for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+    await query(`INSERT INTO settings(key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING`, [key, value]);
+  }
+
+  await seedModels();
 
   const existing = await one(`SELECT count(*)::int AS n FROM agents`);
   if (existing.n === 0) {

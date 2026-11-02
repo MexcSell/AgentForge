@@ -16,10 +16,13 @@ async function post(url, headers, body, signal) {
   return json;
 }
 
+/** ANTHROPIC_API_KEY of the server process (systemd EnvironmentFile or .env, see README), or '' when unset. */
+export const anthropicEnvKey = () => (process.env.ANTHROPIC_API_KEY || '').trim();
+
 /** Anthropic Messages API (text-only agents: they report, they do not edit files). */
 export async function runAnthropic({ model, prompt, system, images, signal, onEvent }) {
-  const key = model.api_key || process.env.ANTHROPIC_API_KEY;
-  if (!key) throw new Error('No API key configured for this model (set it in Model Manager or ANTHROPIC_API_KEY).');
+  const key = model.api_key || anthropicEnvKey();
+  if (!key) throw new Error('ANTHROPIC_API_KEY is not set in the AgentForge service environment (README → Anthropic API key), and no key is stored for this model in Model Manager.');
   const started = Date.now();
   const content = [
     ...loadImages(images).map((i) => ({ type: 'image', source: { type: 'base64', media_type: i.mime, data: i.data } })),
