@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { api, onSignedOut } from './api.js';
 import { toast } from './toast.js';
-import { can, canView } from './access.js';
+import { can, canView, isAdmin } from './access.js';
 import { deviceCredential, forgetDeviceSecret, storedDeviceSecret } from './device.js';
 
 const PREF_KEY = 'af.prefs';
@@ -106,6 +106,7 @@ export const useStore = create((set, get) => ({
   live: {},
   previews: {}, // { [projectId]: { status, mode, command, port, url, startedAt, exitCode, error, log: string[] } }
   bittensor: null, // { status, competitions } — GET /api/bittensor, kept live by bittensor:status / bittensor:competition
+  pendingUsers: 0, // accounts waiting for approval (admins only) — GET /api/users/pending, kept live by users:pending
   syncTick: 0,
   evolutionTick: 0,
   clientUpdate: null,
@@ -177,16 +178,17 @@ export const useStore = create((set, get) => ({
 
   // Back to the homepage, dropping everything the account could see.
   signedOut() {
-    set({ me: null, device: null, loaded: false, projects: [], agents: [], notifications: [], settings: null, topics: {}, messages: {}, tasks: {}, members: {}, previews: {}, live: {}, bittensor: null });
+    set({ me: null, device: null, loaded: false, projects: [], agents: [], notifications: [], settings: null, topics: {}, messages: {}, tasks: {}, members: {}, previews: {}, live: {}, bittensor: null, pendingUsers: 0 });
   },
 
   async loadAll() {
     const me = get().me;
-    const [projects, agents, models, notifications, settings, roles, system] = await Promise.all([
+    const [projects, agents, models, notifications, settings, roles, system, pending] = await Promise.all([
       api.get('/api/projects'), api.get('/api/agents'), api.get('/api/models'), api.get('/api/notifications'),
       can(me, 'manageSettings') ? api.get('/api/settings') : null, api.get('/api/roles'), api.get('/api/system/status'),
+      isAdmin(me) ? api.get('/api/users/pending', { quiet: true }).catch(() => null) : null,
     ]);
-    const s = { projects, agents, models, notifications, settings, roles, system, loaded: true };
+    const s = { projects, agents, models, notifications, settings, roles, system, pendingUsers: Number(pending?.count) || 0, loaded: true };
     if (!projects.some((p) => p.id === get().activeProjectId)) s.activeProjectId = projects[0]?.id || null;
     if (!canView(me, get().view)) s.view = 'dashboard';
     set(s);
@@ -443,6 +445,7 @@ export const useStore = create((set, get) => ({
         break;
       }
       case 'models:update': set({ models: p }); break;
+      case 'users:pending': set({ pendingUsers: Number(p.count) || 0 }); break;
       case 'auth:update': // the administrator changed this account: reload what it may see
         set({ me: p });
         get().loadAll().catch(() => {});

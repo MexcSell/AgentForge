@@ -9,7 +9,7 @@ import { LAYOUTS, getLayout } from '../lib/layouts.js';
 import { GithubMark } from '../lib/icons.jsx';
 import { compact, duration } from '../lib/format.js';
 import { cx, Kbd, StatusDot, AgentAvatar } from './ui.jsx';
-import { can, canView } from '../lib/access.js';
+import { can, canView, isAdmin } from '../lib/access.js';
 
 const GithubIcon = (p) => <GithubMark size={p.size || 18} />;
 
@@ -33,17 +33,21 @@ export function ActivityBar({ layout }) {
   const unread = useStore(selectUnread);
   const working = useStore((s) => selectWorkingAgents(s).length);
   const running = useStore((s) => selectRunningProjects(s).length);
+  const pendingUsers = useStore((s) => s.pendingUsers);
   const me = useStore((s) => s.me);
   const views = VIEWS.filter((v) => canView(me, v.id));
   const system = SYSTEM_VIEWS.filter((v) => canView(me, v.id));
-  const badges = { dashboard: unread, projects: running, agents: working };
+  // Users: accounts waiting for approval; only administrators get the count (and see the Users view at all).
+  const badges = { dashboard: unread, projects: running, agents: working, users: isAdmin(me) ? pendingUsers : 0 };
+  const badgeLabel = { users: (n) => `${n} ${n === 1 ? 'user' : 'users'} awaiting approval` };
   const bottom = layout.activity === 'bottom';
   const labels = layout.activityLabels && !bottom;
   const item = (v) => {
     const active = view === v.id;
     const b = badges[v.id];
+    const note = b > 0 && badgeLabel[v.id] ? badgeLabel[v.id](b) : null;
     return (
-      <button key={v.id} onClick={() => set({ view: v.id })} title={`${v.label}  (Alt+${v.key})`} aria-label={v.label} aria-current={active ? 'page' : undefined}
+      <button key={v.id} onClick={() => set({ view: v.id })} title={`${v.label}  (Alt+${v.key})${note ? ` · ${note}` : ''}`} aria-label={note ? `${v.label}, ${note}` : v.label} aria-current={active ? 'page' : undefined}
         className={cx('group relative flex items-center rounded-lg transition-colors shrink-0',
           bottom ? 'flex-col justify-center gap-0.5 h-12 flex-1 max-w-24' : labels ? 'gap-2.5 h-9 px-2.5 w-full' : 'justify-center size-10',
           active ? 'text-fg bg-accent-soft' : 'text-subtle hover:text-fg hover:bg-hover')}>
@@ -51,7 +55,7 @@ export function ActivityBar({ layout }) {
         <span className="relative">
           <v.icon size={bottom ? 19 : 18} strokeWidth={1.8} />
           {b > 0 && (
-            <span className={cx('absolute -top-1.5 -right-2 min-w-[15px] h-[15px] px-[3px] rounded-full text-[9.5px] font-bold leading-[15px] text-center tabular ring-2 ring-[var(--af-panel)]',
+            <span data-badge={v.id} className={cx('absolute -top-1.5 -right-2 min-w-[15px] h-[15px] px-[3px] rounded-full text-[9.5px] font-bold leading-[15px] text-center tabular ring-2 ring-[var(--af-panel)]',
               v.id === 'dashboard' ? 'bg-bad text-white' : 'grad-accent text-accent-fg')}>{b > 99 ? '99+' : b}</span>
           )}
         </span>

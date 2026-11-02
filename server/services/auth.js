@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import { one, many, query } from '../db/pool.js';
 import { notify, audit } from './notify.js';
-import { refreshUserClients } from '../events.js';
+import { refreshUserClients, emit } from '../events.js';
 import { sanitizePermissions, setProtectedProjects, isAdmin } from './access.js';
 
 const scrypt = promisify(crypto.scrypt);
@@ -152,6 +152,7 @@ export function signup({ username, device, team } = {}) {
       await query(`DELETE FROM sessions WHERE user_id = $1`, [existing.id]);
       const user = await one(`UPDATE users SET device_secret_hash = $2, device_info = $3, device_bound_at = now(), status = 'pending', updated_at = now() WHERE id = $1 RETURNING *`, [existing.id, hash, info]);
       refreshUserClients(user.id, user, publicUser(user));
+      await announcePending();
       await audit(username, 'user.rebind-device', username, { device: info.label || null });
       await notify({ source_type: 'system', source_name: 'Users', level: 'warn', title: `New computer waiting for approval · ${username}`, body: info.label || null }).catch(() => {});
       return user;
@@ -164,6 +165,7 @@ export function signup({ username, device, team } = {}) {
         sanitizePermissions({}), hash, info, first ? new Date() : null],
     );
     await audit(username, first ? 'user.bootstrap-admin' : 'user.signup', username, { team: user.team, device: info.label || null });
+    if (!first) await announcePending();
     if (!first) await notify({ source_type: 'system', source_name: 'Users', level: 'warn', title: `Registration waiting for approval · ${username}`, body: [info.label, user.team && `Team: ${user.team}`].filter(Boolean).join(' · ') || null }).catch(() => {});
     return user;
   });
@@ -289,11 +291,22 @@ export async function loadProtected() {
   setProtectedProjects((await many(`SELECT id FROM projects WHERE protected`)).map((r) => r.id));
 }
 
+/** How many accounts wait for administrator approval (the badge on the Users nav icon). */
+export const pendingCount = async () => (await one(`SELECT count(*)::int AS n FROM users WHERE status = 'pending'`)).n;
+
+// Tells the administrators' browsers the new count ('users:pending' is not a listed event, so admin-only).
+async function announcePending() {
+  // Best effort: the account change itself already succeeded.
+  const count = await pendingCount().catch(() => null);
+  if (count !== null) emit('users:pending', { count });
+}
+
 // Pushes a changed account to its open browsers (new permissions), or closes them when it can no longer sign in.
 async function changed(id, { endSessions = false } = {}) {
   if (endSessions) await query(`DELETE FROM sessions WHERE user_id = $1`, [id]);
   const u = await getUser(id);
   refreshUserClients(id, u, publicUser(u));
+  await announcePending();
   return publicUser(u);
 }
 
@@ -351,5 +364,6 @@ export async function deleteUser(actor, id) {
   await query(`DELETE FROM users WHERE id = $1`, [u.id]);
   await audit(actor.username, 'user.delete', u.username);
   refreshUserClients(u.id, null, null);
+  await announcePending();
   return { ok: true };
 }

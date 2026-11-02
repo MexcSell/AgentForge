@@ -5,7 +5,7 @@ import { isUuid } from '../services/topics.js';
 import { can, canSeeProject, isAdmin, CAPABILITIES } from '../services/access.js';
 import {
   signup, login, deviceLogin, needsSetup, createSession, sessionUser, destroySession, tokenOf, sessionCookie, clearedCookie, publicUser,
-  listUsers, userAction, setPermissions, deleteUser,
+  listUsers, pendingCount, userAction, setPermissions, deleteUser,
 } from '../services/auth.js';
 import { previewTarget } from './preview.js';
 
@@ -201,6 +201,7 @@ export default async function authRoutes(app, opts = {}) {
 
   // ---- users (admin only: not in POLICY) -------------------------------------
   app.get('/api/users', async () => ({ users: await listUsers(), capabilities: CAPABILITIES }));
+  app.get('/api/users/pending', async () => ({ count: await pendingCount() }));
   app.post('/api/users/:id/:action', guard(async (req) => {
     if (!isUuid(req.params.id)) throw Object.assign(new Error('User not found'), { status: 404 });
     return userAction(req.user, req.params.id, req.params.action);

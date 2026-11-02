@@ -103,7 +103,9 @@ export default function Users() {
   const projects = useMemo(() => all.filter((p) => !p.protected), [all]); // the platform project is never granted
   const [data, setData] = useState(null);
   const load = () => api.get('/api/users').then(setData).catch(() => {});
-  useEffect(() => { load(); }, []);
+  // Reloads when the waiting count changes (users:pending): a new sign-up, or an approval from another browser.
+  const pendingUsers = useStore((s) => s.pendingUsers);
+  useEffect(() => { load(); }, [pendingUsers]);
   const replace = (u) => setData((d) => ({ ...d, users: d.users.map((x) => (x.id === u.id ? u : x)) }));
   const remove = (id) => setData((d) => ({ ...d, users: d.users.filter((x) => x.id !== id) }));
   const pending = data?.users.filter((u) => u.status === 'pending').length || 0;

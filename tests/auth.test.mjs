@@ -441,6 +441,39 @@ test('reset device: the user registers again from the new computer and waits for
   assert.equal((await deviceLogin(LAPTOP_DEV)).status, 200);
 });
 
+test('the waiting count (Users nav badge): GET /api/users/pending and live users:pending events, for administrators only', async () => {
+  const count = async (cookie) => (await call('GET', '/api/users/pending', { cookie })).data.count;
+  bob = cookieOf(await deviceLogin(LAPTOP_DEV)); // re-enabled above, with a fresh session
+  const before = await count(admin);
+  assert.equal(before, (await one(`SELECT count(*)::int AS n FROM users WHERE status = 'pending'`)).n);
+  assert.equal((await call('GET', '/api/users/pending', { cookie: bob })).status, 403, 'a non-admin never gets the count');
+  assert.equal((await call('GET', '/api/users/pending')).status, 401);
+  const a = await socket(admin);
+  const b = await socket(bob);
+  assert.ok(a.events && b.events, 'both sockets opened');
+  await tick();
+  a.events.length = 0;
+  b.events.length = 0;
+  const seen = () => a.events.filter((e) => e.type === 'users:pending').map((e) => e.payload.count);
+
+  // New sign-ups raise it; approve, reject and delete lower it.
+  assert.equal((await signup('hank', browser('Chrome on Linux'))).data.user.status, 'pending');
+  await signup('ivy', browser('Firefox on Linux'));
+  await signup('jude', browser('Safari on macOS'));
+  await tick();
+  assert.deepEqual(seen(), [before + 1, before + 2, before + 3]);
+  assert.equal(await count(admin), before + 3);
+  await call('POST', `/api/users/${await userId('hank')}/approve`, { cookie: admin });
+  await call('POST', `/api/users/${await userId('ivy')}/reject`, { cookie: admin });
+  await call('DELETE', `/api/users/${await userId('jude')}`, { cookie: admin });
+  await tick();
+  assert.deepEqual(seen(), [before + 1, before + 2, before + 3, before + 2, before + 1, before]);
+  assert.equal(await count(admin), before);
+  assert.ok(!b.events.some((e) => e.type === 'users:pending'), 'a non-admin socket never receives the count');
+  a.ws.close();
+  b.ws.close();
+});
+
 test('the admin can not lock itself out; delete removes an account and its sessions', async () => {
   const ownerId = await userId('owner');
   assert.equal((await call('POST', `/api/users/${ownerId}/disable`, { cookie: admin })).status, 400);
