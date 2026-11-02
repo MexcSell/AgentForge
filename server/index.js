@@ -31,7 +31,7 @@ try { commit = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: ROOT
 // State reported by scripts/supervisor.js over IPC.
 let supervisor = { attached: config.supervised, pendingRestart: false, building: false, lastRestartAt: null, lastBuildAt: null, lastError: null, clientVersion: null };
 
-const app = Fastify({ logger: { level: process.env.LOG_LEVEL || 'warn' }, bodyLimit: 25 * 1024 * 1024 });
+const app = Fastify({ logger: { level: process.env.LOG_LEVEL || 'warn' }, bodyLimit: 25 * 1024 * 1024, trustProxy: config.trustProxy });
 await app.register(websocket);
 await app.register(multipart, { limits: { fileSize: 200 * 1024 * 1024, files: 50 } });
 // Every /api, /uploads and preview request needs a signed-in, active account (routes/auth.js); runs before the preview hook.

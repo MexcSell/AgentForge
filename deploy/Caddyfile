@@ -1,0 +1,28 @@
+# AgentForge behind Caddy: TLS on 443, HTTP→HTTPS redirect on 80, everything proxied to the app on loopback.
+# Setup (README "Serving over HTTPS"): run AgentForge with TRUST_PROXY=1 and HOST=127.0.0.1, point DNS at this host,
+# open ports 80 and 443, then:  AF_DOMAIN=agentforge.example.com caddy run --config deploy/Caddyfile
+#
+# What Caddy does without extra lines here:
+# - automatic HTTPS: gets and renews a Let's Encrypt/ZeroSSL certificate for the domain and redirects http:// to https://
+# - reverse_proxy passes WebSocket upgrades through (live updates /api/events, admin terminal /api/terminal, previews)
+# - reverse_proxy keeps the browser's Host and sets X-Forwarded-For/Proto/Host itself, dropping any the client sent
+
+(agentforge) {
+	encode zstd gzip
+	# HSTS: browsers refuse plain http for this name for a year. Add "; includeSubDomains" only if every subdomain has https.
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy 127.0.0.1:{$AF_PORT:4800}
+}
+
+{$AF_DOMAIN} {
+	import agentforge
+}
+
+# No domain? Use Caddy's own certificate authority on the IP or LAN name instead of the block above
+# (browsers warn until they trust Caddy's root: `caddy trust` on this host; on other computers import
+# /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt, path varies by install):
+#
+# https://192.168.1.20, https://agentforge.lan {
+# 	tls internal
+# 	import agentforge
+# }

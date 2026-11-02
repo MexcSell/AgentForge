@@ -26,7 +26,7 @@ The administrator is never bound to a device: it can sign in from any computer. 
 ## Passwords and sessions
 
 - Passwords are hashed with **scrypt** (N=16384, r=8, p=1) using a random 16-byte salt per hash. The stored form is `scrypt$N$r$p$salt$hash`. The hash is compared in constant time. A login with an unknown username still runs a hash, so it takes the same time as a wrong password.
-- A session is a random 256-bit token held in the `af_session` cookie, set with `HttpOnly; SameSite=Lax; Path=/`, plus `Secure` when the request came over https (for example `x-forwarded-proto: https` from a TLS proxy). The database stores only the token's SHA-256. Sessions last 30 days. **Log out** (the user name in the title bar) deletes the session.
+- A session is a random 256-bit token held in the `af_session` cookie, set with `HttpOnly; SameSite=Lax; Path=/`, plus `Secure` when the request came over https (`X-Forwarded-Proto: https` from a TLS proxy counts only with `TRUST_PROXY` set, see the README's HTTPS section). The database stores only the token's SHA-256. Sessions last 30 days. **Log out** (the user name in the title bar) deletes the session.
 
 ## Permissions
 

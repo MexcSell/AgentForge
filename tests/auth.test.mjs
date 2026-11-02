@@ -29,11 +29,12 @@ const BOB_PC = pc({ cores: 4, memory: 4, gpu: 'Mesa Intel(R) UHD Graphics 620', 
 const CAROL_PC = pc({ platform: 'Win32', cores: 12, memory: 32, gpu: 'ANGLE (AMD Radeon RX 6700)', canvas: '0ddba11', timezone: 'Asia/Seoul', language: 'ko-KR' });
 
 let app, base, core, alpha, beta;
+let proxied, proxiedBase; // the same routes with TRUST_PROXY=1 (config.trustProxy 'loopback'), as behind deploy/Caddyfile
 
-async function call(method, path, { body, cookie } = {}) {
-  const res = await fetch(base + path, {
+async function call(method, path, { body, cookie, headers = {}, at = base } = {}) {
+  const res = await fetch(at + path, {
     method,
-    headers: { ...(body ? { 'content-type': 'application/json' } : {}), ...(cookie ? { cookie } : {}) },
+    headers: { ...(body ? { 'content-type': 'application/json' } : {}), ...(cookie ? { cookie } : {}), ...headers },
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -47,9 +48,9 @@ const login = (username, device, password = 'correct horse') => call('POST', '/a
 const userId = async (name) => (await one(`SELECT id FROM users WHERE username = $1`, [name])).id;
 
 /** Opens /api/events (or path) with the cookie and an optional browser Origin; resolves { ws, events } once open, or { status } when the upgrade is refused. */
-function socket(cookie, { origin, path = '/api/events' } = {}) {
+function socket(cookie, { origin, path = '/api/events', headers = {}, at = base } = {}) {
   return new Promise((resolve) => {
-    const ws = new WebSocket(base.replace('http', 'ws') + path, { headers: cookie ? { cookie } : {}, ...(origin ? { origin } : {}) });
+    const ws = new WebSocket(at.replace('http', 'ws') + path, { headers: { ...(cookie ? { cookie } : {}), ...headers }, ...(origin ? { origin } : {}) });
     const events = [];
     ws.on('message', (m) => events.push(JSON.parse(String(m))));
     ws.on('open', () => resolve({ ws, events }));
@@ -85,9 +86,22 @@ before(async () => {
   await app.register(filesRoutes);
   await app.listen({ port: 0, host: '127.0.0.1' });
   base = `http://127.0.0.1:${app.server.address().port}`;
+
+  proxied = Fastify({ trustProxy: 'loopback' });
+  await proxied.register(websocket);
+  authHooks(proxied);
+  proxied.get('/api/whoami', async (req) => ({ ip: req.ip, protocol: req.protocol, host: req.host }));
+  proxied.register(async (scope) => {
+    scope.get('/api/events', { websocket: true }, (ws, req) => addClient(ws, req.user));
+    scope.get('/api/terminal', { websocket: true }, (ws) => ws.close());
+  });
+  await proxied.register(authRoutes);
+  await proxied.listen({ port: 0, host: '127.0.0.1' });
+  proxiedBase = `http://127.0.0.1:${proxied.server.address().port}`;
 });
 
 after(async () => {
+  await proxied.close();
   await app.close();
   client.release();
   await pool.end();
@@ -131,14 +145,9 @@ test('WebSockets accept the app\'s own origin (any host name or IP it is opened 
   const own = await socket(admin, { origin: base });
   assert.equal(own.status, undefined, 'same-origin socket opens');
   own.ws.close();
-  // Opened by a LAN/public address through a proxy that keeps the browser's host in X-Forwarded-Host.
-  const proxied = await new Promise((resolve) => {
-    const ws = new WebSocket(base.replace('http', 'ws') + '/api/events', { origin: 'http://192.0.2.10:4800', headers: { cookie: admin, 'x-forwarded-host': '192.0.2.10:4800' } });
-    ws.on('open', () => { ws.close(); resolve('open'); });
-    ws.on('unexpected-response', (req, res) => resolve(res.statusCode));
-    ws.on('error', () => {});
-  });
-  assert.equal(proxied, 'open');
+  // X-Forwarded-Host is ignored without TRUST_PROXY: a direct client can not name the origin it wants accepted.
+  const spoofed = await socket(admin, { origin: 'http://192.0.2.10:4800', headers: { 'x-forwarded-host': '192.0.2.10:4800' } });
+  assert.equal(spoofed.status, 403, 'untrusted X-Forwarded-Host');
   for (const origin of [`http://127.0.0.1:${Number(port) + 1}`, 'http://evil.example', 'null']) {
     assert.equal((await socket(admin, { origin })).status, 403, origin);
     assert.equal((await socket(admin, { origin, path: '/api/terminal' })).status, 403, `terminal ${origin}`);
@@ -163,6 +172,40 @@ test('a new sign-up is pending: it can see its own state but nothing else until 
   assert.equal(list.data.users[0].team, 'Platform');
   assert.ok(!('password_hash' in list.data.users[0]) && !('device' in list.data.users[0]));
   assert.ok((await one(`SELECT 1 FROM notifications WHERE title LIKE '%bob%'`)));
+});
+
+test('TRUST_PROXY: forwarded https gives Secure cookies, the forwarded origin and the real client IP; never without it', async () => {
+  const XF = { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'af.example', 'x-forwarded-for': '203.0.113.9' };
+  // Behind the trusted proxy (loopback here).
+  const r = await call('POST', '/api/auth/login', { at: proxiedBase, headers: XF, body: { username: 'owner', password: 'correct horse', device: PC } });
+  assert.equal(r.status, 200);
+  assert.match(r.setCookie, /; Secure$/);
+  const out = await call('POST', '/api/auth/logout', { at: proxiedBase, headers: XF, cookie: cookieOf(r) });
+  assert.match(out.setCookie, /Max-Age=0; Secure$/);
+  assert.doesNotMatch((await call('POST', '/api/auth/login', { at: proxiedBase, body: { username: 'owner', password: 'correct horse', device: PC } })).setCookie, /Secure/, 'plain http via the proxy');
+  const who = await call('GET', '/api/whoami', { at: proxiedBase, cookie: admin, headers: { ...XF, 'x-forwarded-for': '198.51.100.1, 203.0.113.9' } });
+  assert.deepEqual(who.data, { ip: '203.0.113.9', protocol: 'https', host: 'af.example' }, 'the address the proxy saw, not what the client claims');
+  // Direct clients (the default, TRUST_PROXY unset) can not claim https: identical cookies to plain http.
+  const direct = await call('POST', '/api/auth/login', { headers: XF, body: { username: 'owner', password: 'correct horse', device: PC } });
+  assert.equal(direct.status, 200);
+  assert.doesNotMatch(direct.setCookie, /Secure/);
+  assert.doesNotMatch((await call('POST', '/api/auth/logout', { headers: XF, cookie: cookieOf(direct) })).setCookie, /Secure/);
+
+  // WebSockets: the public https origin the proxy forwards is accepted, foreign origins are not.
+  const pub = await socket(admin, { at: proxiedBase, origin: 'https://af.example', headers: XF });
+  assert.equal(pub.status, undefined, 'forwarded public origin opens');
+  pub.ws.close();
+  const term = await socket(admin, { at: proxiedBase, origin: 'https://af.example', headers: XF, path: '/api/terminal' });
+  assert.equal(term.status, undefined, 'terminal through the proxy');
+  term.ws.close();
+  for (const origin of ['https://evil.example', 'http://af.example.evil.example', 'null']) {
+    assert.equal((await socket(admin, { at: proxiedBase, origin, headers: XF })).status, 403, origin);
+    assert.equal((await socket(admin, { at: proxiedBase, origin, headers: XF, path: '/api/terminal' })).status, 403, `terminal ${origin}`);
+  }
+  // A foreign page whose Host the proxy forwards for its own domain is still refused.
+  assert.equal((await socket(admin, { at: proxiedBase, origin: 'https://evil.example', headers: { ...XF, host: 'evil.example' } })).status, 403, 'XFH wins over Host');
+  // The same forwarded origin straight to the untrusted server is refused.
+  assert.equal((await socket(admin, { origin: 'https://af.example', headers: XF })).status, 403, 'untrusted forwarded origin');
 });
 
 test('sign-up is refused for a computer bound to another username, or a name that is taken', async () => {

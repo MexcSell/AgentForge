@@ -21,6 +21,9 @@ export const config = {
   // Bind address: all interfaces by default so other computers can reach the UI; HOST=127.0.0.1 keeps it local.
   // The supervisor's health-check candidate (side port) stays on loopback unless HOST is set.
   host: env.HOST || (env.AF_CANDIDATE === '1' ? '127.0.0.1' : '0.0.0.0'),
+  // Behind a TLS reverse proxy (deploy/Caddyfile): honour X-Forwarded-Proto/Host/For only from these peers. Unset/0/false =
+  // ignored (direct clients can not spoof them); 1/true = a proxy on this host (loopback); otherwise IPs/CIDRs, comma-separated.
+  trustProxy: /^(|0|false|no|off)$/i.test(env.TRUST_PROXY || '') ? false : /^(1|true|yes|on)$/i.test(env.TRUST_PROXY) ? 'loopback' : env.TRUST_PROXY,
   candidate: env.AF_CANDIDATE === '1', // health-check instance spawned by the supervisor
   supervised: typeof process.send === 'function',
   dataDir: path.join(ROOT, 'data'),

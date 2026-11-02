@@ -56,6 +56,8 @@ export default async function previewRoutes(app) {
 export function previewHook(req, reply, done) {
   const target = req.raw.afPreview !== undefined ? req.raw.afPreview : previewTarget(req.raw); // the auth hook resolved it already
   if (!target) return done();
+  // What the upstream gets as X-Forwarded-*: the client's own values only from a trusted proxy (config.trustProxy).
+  req.raw.afForwarded = { for: (req.ips ? [...req.ips].reverse() : [req.ip]).join(', '), host: req.host, proto: req.protocol };
   reply.hijack();
   done();
   servePreview(req.raw, reply.raw, target).catch((e) => {
@@ -168,10 +170,11 @@ function forwardHeaders(raw, s, upgrade = false) {
   const h = {};
   for (const [k, v] of Object.entries(raw.headers)) if (!HOP.has(k)) h[k] = v;
   h.host = `localhost:${s.port}`; // dev servers check Host (e.g. Vite allowedHosts)
-  const via = [raw.headers['x-forwarded-for'], raw.socket.remoteAddress].filter(Boolean).join(', ');
-  if (via) h['x-forwarded-for'] = via;
-  if (raw.headers.host) h['x-forwarded-host'] = raw.headers['x-forwarded-host'] || raw.headers.host;
-  h['x-forwarded-proto'] = raw.headers['x-forwarded-proto'] || 'http';
+  for (const k of ['x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto']) delete h[k];
+  const fwd = raw.afForwarded;
+  if (fwd.for) h['x-forwarded-for'] = fwd.for;
+  if (fwd.host) h['x-forwarded-host'] = fwd.host;
+  h['x-forwarded-proto'] = fwd.proto;
   h['x-forwarded-prefix'] = `/preview/${s.project_id}`;
   if (upgrade) Object.assign(h, { connection: 'Upgrade', upgrade: raw.headers.upgrade });
   return h;
@@ -204,7 +207,7 @@ function rewriteLocation(loc, s, raw) {
   let u;
   try { u = new URL(loc, 'http://upstream.invalid/'); } catch { return loc; }
   if (/^([a-z][a-z\d+.-]*:)?\/\//i.test(loc)) {
-    const own = [`localhost:${s.port}`, `127.0.0.1:${s.port}`, `[::1]:${s.port}`, raw.headers['x-forwarded-host'], raw.headers.host];
+    const own = [`localhost:${s.port}`, `127.0.0.1:${s.port}`, `[::1]:${s.port}`, raw.afForwarded.host, raw.headers.host];
     if (!own.includes(u.host)) return loc; // a real external redirect
   } else if (!loc.startsWith('/')) {
     return loc; // relative: already resolves under the prefix
