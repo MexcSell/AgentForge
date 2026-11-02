@@ -102,6 +102,19 @@ export async function refusal(user, method, url, params = {}) {
 }
 
 /**
+ * A browser WebSocket upgrade whose Origin is not this server (Host, or X-Forwarded-Host behind a proxy). SameSite=Lax
+ * still sends the cookie from another port of the same host, so a page there could otherwise open the events socket
+ * or the terminal. Clients without an Origin (not browsers) are left to the session check.
+ */
+function crossOriginSocket(raw) {
+  if (String(raw.headers.upgrade || '').toLowerCase() !== 'websocket' || !raw.headers.origin) return false;
+  let origin;
+  try { origin = new URL(raw.headers.origin).host.toLowerCase(); } catch { return true; }
+  const own = [raw.headers.host, String(raw.headers['x-forwarded-host'] || '').split(',')[0].trim()];
+  return !own.some((h) => h && h.toLowerCase() === origin);
+}
+
+/**
  * Root hooks. onRequest (registered before the preview hook): /api, /uploads and project previews need an active
  * account → 401 without a session, 403 while pending. preHandler: the route's POLICY.
  */
@@ -111,6 +124,7 @@ export function authHooks(app) {
     const pathname = req.raw.url.split('?')[0];
     const preview = previewTarget(req.raw);
     req.raw.afPreview = preview; // computed once: the preview hook reuses it
+    if (!preview && pathname.startsWith('/api/') && crossOriginSocket(req.raw)) return err(reply, 403, 'Cross-origin WebSocket refused');
     if (!preview && (!GATED.test(pathname) || PUBLIC.has(pathname))) return;
     const user = await sessionUser(tokenOf(req));
     if (!user) return err(reply, 401, 'Sign in required');

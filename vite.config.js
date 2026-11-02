@@ -10,6 +10,8 @@ export default defineConfig({
   build: { outDir: 'dist', emptyOutDir: true, chunkSizeWarningLimit: 2500 },
   server: {
     port: 5173,
+    host: process.env.HOST || '0.0.0.0', // reachable from other computers like the API (HOST=127.0.0.1 keeps it local)
+    allowedHosts: true, // any IP or hostname; /api still needs a session
     proxy: {
       '/api': { target: api, ws: true },
       '/uploads': api,

@@ -18,7 +18,9 @@ const env = process.env;
 export const config = {
   root: ROOT,
   port: Number(env.PORT || 4800),
-  host: env.HOST || '127.0.0.1',
+  // Bind address: all interfaces by default so other computers can reach the UI; HOST=127.0.0.1 keeps it local.
+  // The supervisor's health-check candidate (side port) stays on loopback unless HOST is set.
+  host: env.HOST || (env.AF_CANDIDATE === '1' ? '127.0.0.1' : '0.0.0.0'),
   candidate: env.AF_CANDIDATE === '1', // health-check instance spawned by the supervisor
   supervised: typeof process.send === 'function',
   dataDir: path.join(ROOT, 'data'),

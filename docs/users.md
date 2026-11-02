@@ -14,7 +14,7 @@ There is a single administrator role. It is set up in one of these ways:
 
 The administrator is never bound to a device: it can sign in from any computer. It cannot disable, reject or delete its own account or another administrator account, so it cannot lock itself out from the Users page. Sessions are stored in the database (`sessions`), so a restart or redeploy does not sign anyone out. The schema change only adds the `users` and `sessions` tables (`CREATE TABLE IF NOT EXISTS`), so migrating the live database touches no existing data.
 
-**Exposure warning:** until the administrator account exists, whoever opens the homepage first can create it. The server binds to `127.0.0.1` by default. If it is reachable from a network, create the account right after deploying, or set `AF_ADMIN_USERNAME`/`AF_ADMIN_PASSWORD` before the restart.
+**Exposure warning:** until the administrator account exists, whoever opens the homepage first can create it. The server listens on all interfaces by default (`HOST=127.0.0.1` keeps it local), so it is reachable from the network: create the account right after deploying, or set `AF_ADMIN_USERNAME`/`AF_ADMIN_PASSWORD` before the restart.
 
 ## Sign-up and approval
 

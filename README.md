@@ -6,7 +6,7 @@ A self-evolving, multi-agent software engineering control room. You give a proje
 
 ```bash
 npm install
-npm start            # supervisor: builds the UI, serves http://127.0.0.1:4800, restarts safely on changes
+npm start            # supervisor: builds the UI, serves http://<host>:4800, restarts safely on changes
 npm run stop         # stop the supervisor
 npm run logs         # follow data/logs/agentforge.log
 npm run dev          # development: API with --watch + Vite HMR on :5173
@@ -15,7 +15,9 @@ npm run db:check     # PostgreSQL connectivity check
 
 Requirements: Node.js ≥ 20, PostgreSQL (defaults: `localhost:5432`, db `agentapp`, user/password `agentuser`), and the `claude` CLI logged in. `gh` is used for push credentials when it is authenticated. Override settings in `.env` (see `.env.example`).
 
-The service binds to `127.0.0.1` only. It includes a shell terminal (admin only), so put it behind TLS before exposing it to a network.
+### Remote access
+
+The server listens on all interfaces (`HOST=0.0.0.0`), so other computers can open `http://<server IP or hostname>:4800` (the startup log lists the URLs). Every page and API still needs a signed-in account, and WebSockets only accept the app's own origin. To keep it local, set `HOST=127.0.0.1` in `.env` (another address binds just that interface); the change applies on the next restart. The administrator can sign in from any computer; other accounts are bound to the computer they registered from, so a teammate signs up from their own computer and the administrator approves it (or uses **Reset device** to move an account). If it does not load from outside, open TCP port 4800 in the host firewall and any cloud security group / router port forward. Traffic is plain HTTP and the app includes a shell terminal (admin only): on untrusted networks, put it behind a TLS reverse proxy (the session cookie turns `Secure` automatically when the proxy sends `X-Forwarded-Proto: https`).
 
 ## Users
 

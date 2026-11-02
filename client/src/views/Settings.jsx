@@ -154,7 +154,7 @@ export default function Settings() {
               [Database, 'Database · PostgreSQL', 'Relational integrity for projects, tasks, runs and audit history; JSONB for flexible agent skills, plans and reports.'],
               [Cpu, 'Agent runtime · Claude Code CLI', 'Gives agents real tools (read, edit, run) inside each project directory, with streamed usage and rate-limit data.'],
               [Zap, 'Not used yet · Redis, Qdrant', 'A single node needs no external queue or cache; agent memory starts in PostgreSQL. Both can be added when scaling out.'],
-              [ShieldCheck, 'Not used yet · Better Auth, Cloudflare', 'The service binds to 127.0.0.1 only. Add authentication before exposing it to a network.'],
+              [ShieldCheck, 'Not used yet · Better Auth, Cloudflare', 'Built-in accounts guard every page and API. The service listens on all interfaces over plain HTTP; put it behind TLS on untrusted networks.'],
             ].map(([I, t, d]) => (
               <div key={t} className="flex gap-3 p-3 rounded-lg bg-sunken border border-line">
                 <I size={16} className="text-accent shrink-0 mt-0.5" />

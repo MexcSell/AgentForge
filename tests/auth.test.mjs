@@ -46,10 +46,10 @@ const signup = (username, device, extra = {}) => call('POST', '/api/auth/signup'
 const login = (username, device, password = 'correct horse') => call('POST', '/api/auth/login', { body: { username, password, device } });
 const userId = async (name) => (await one(`SELECT id FROM users WHERE username = $1`, [name])).id;
 
-/** Opens /api/events with the cookie; resolves { ws, events } once open, or { status } when the upgrade is refused. */
-function socket(cookie) {
+/** Opens /api/events (or path) with the cookie and an optional browser Origin; resolves { ws, events } once open, or { status } when the upgrade is refused. */
+function socket(cookie, { origin, path = '/api/events' } = {}) {
   return new Promise((resolve) => {
-    const ws = new WebSocket(base.replace('http', 'ws') + '/api/events', { headers: cookie ? { cookie } : {} });
+    const ws = new WebSocket(base.replace('http', 'ws') + path, { headers: cookie ? { cookie } : {}, ...(origin ? { origin } : {}) });
     const events = [];
     ws.on('message', (m) => events.push(JSON.parse(String(m))));
     ws.on('open', () => resolve({ ws, events }));
@@ -124,6 +124,26 @@ test('the first account becomes the active administrator, with a salted scrypt h
   assert.equal((await one(`SELECT count(*)::int AS n FROM sessions WHERE token_hash = $1`, [admin.split('=')[1]])).n, 0);
   assert.deepEqual((await call('GET', '/api/auth/state')).data, { setup: false });
   assert.equal((await call('GET', '/api/projects', { cookie: admin })).data.length, 3);
+});
+
+test('WebSockets accept the app\'s own origin (any host name or IP it is opened by) and refuse other origins', async () => {
+  const port = new URL(base).port;
+  const own = await socket(admin, { origin: base });
+  assert.equal(own.status, undefined, 'same-origin socket opens');
+  own.ws.close();
+  // Opened by a LAN/public address through a proxy that keeps the browser's host in X-Forwarded-Host.
+  const proxied = await new Promise((resolve) => {
+    const ws = new WebSocket(base.replace('http', 'ws') + '/api/events', { origin: 'http://192.0.2.10:4800', headers: { cookie: admin, 'x-forwarded-host': '192.0.2.10:4800' } });
+    ws.on('open', () => { ws.close(); resolve('open'); });
+    ws.on('unexpected-response', (req, res) => resolve(res.statusCode));
+    ws.on('error', () => {});
+  });
+  assert.equal(proxied, 'open');
+  for (const origin of [`http://127.0.0.1:${Number(port) + 1}`, 'http://evil.example', 'null']) {
+    assert.equal((await socket(admin, { origin })).status, 403, origin);
+    assert.equal((await socket(admin, { origin, path: '/api/terminal' })).status, 403, `terminal ${origin}`);
+  }
+  assert.equal((await socket(undefined, { origin: 'http://evil.example' })).status, 403, 'refused before the session check');
 });
 
 test('a new sign-up is pending: it can see its own state but nothing else until approved', async () => {

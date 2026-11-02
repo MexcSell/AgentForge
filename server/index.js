@@ -156,6 +156,13 @@ if (!config.candidate) await recoverInterrupted();
 
 await app.listen({ port: config.port, host: config.host });
 console.log(`[agentforge] ${config.candidate ? 'candidate' : 'server'} listening on http://${config.host}:${config.port}`);
+if (!config.candidate && ['0.0.0.0', '::'].includes(config.host)) {
+  // Wildcard bind: list the addresses other computers can use (container/bridge interfaces skipped).
+  const ips = Object.entries(os.networkInterfaces())
+    .filter(([name]) => !/^(docker|br-|cni|veth|flannel|virbr)/.test(name))
+    .flatMap(([, list]) => list.filter((a) => a.family === 'IPv4' && !a.internal).map((a) => a.address));
+  for (const ip of ['127.0.0.1', ...ips]) console.log(`[agentforge]   open http://${ip}:${config.port}`);
+}
 
 const pushStatus = async () => emit('system:status', await systemStatus());
 if (!config.candidate) {
