@@ -177,7 +177,7 @@ Write the digest now: 3-8 short markdown lines. Nothing else.`;
  * `shared`: null when no other mission of the project is active, else the files those missions touched or lease
  * (repo-relative). It adds the rule that keeps a worker off the other missions' edits.
  */
-export function taskPrompt({ project, agent, task, gm, supervisor, deps, mission, attachments, playbook, shared = null }) {
+export function taskPrompt({ project, agent, task, gm, supervisor, deps, mission, attachments, playbook, shared = null, earlier = [], resumed = false }) {
   const info = roleInfo(agent.role);
   const lessons = [...new Set((playbook || []).map((l) => String(l).trim()).filter(Boolean))].slice(0, 12);
   const system = `You are ${agent.name}, ${agent.title} (tier ${agent.tier}, ${info.department}) in the AgentForge engineering organization.
@@ -197,7 +197,7 @@ Operating rules:
     : '';
   // In the prompt rather than the system prompt: a resumed session keeps the system prompt it started with.
   const sharedNote = shared ? `WORKING TREE NOTE: other missions are editing this working tree right now (their files: ${shared.length ? clip(shared.join(', '), 400) : 'none yet'}). Never run git stash/checkout/reset/restore/clean or project-wide formatters; never revert, reformat or delete files you did not change; never build into the live dist.\n\n` : '';
-  const prompt = `${sharedNote}TASK CONTRACT
+  const prompt = `${sharedNote}${earlierWork(earlier, resumed)}TASK CONTRACT
 ${JSON.stringify({ task_id: task.key, mission: mission.command.slice(0, 600), project: project.name, role: task.role, goal: task.title, description: task.description, acceptance: task.acceptance, depends_on: task.depends_on, ...(task.files?.length ? { files: task.files } : {}) }, null, 2)}
 
 ${depText}${imageNote(attachments)}
@@ -212,6 +212,23 @@ Do the work now. When finished, end your reply with a JSON report in a \`\`\`jso
 }
 "proposals" stays empty unless the order clearly needs follow-up work you could not do within this task's scope; then add at most one { "title", "description", "role" }.`;
   return { system, prompt };
+}
+
+/**
+ * Earlier tasks of the topic (newest first) as a hand-off note, so a worker builds on them instead of re-reading the
+ * code from scratch. `resumed`: the session already holds its own earlier work, so these are only other agents' tasks
+ * since. Hard cap 2400 chars.
+ */
+export function earlierWork(tasks = [], resumed = false) {
+  if (!tasks.length) return '';
+  let out = `${resumed ? 'DONE IN THIS TOPIC SINCE YOUR LAST TASK' : 'EARLIER WORK IN THIS TOPIC'} (newest first; build on it instead of re-exploring the code: read only the files the task needs, and re-read a file before editing it):\n`;
+  for (const t of tasks) {
+    const files = (Array.isArray(t.report?.artifacts) ? t.report.artifacts : []).map(String);
+    const l = `- ${clip(t.key, 12)} [${t.status}] ${clip(t.title, 120)} (${clip(t.agent_name || 'agent', 40)}): ${clip(t.report?.summary || t.result, 360) || '—'}${files.length ? ` · files: ${clip(files.join(', '), 240)}` : ''}\n`;
+    if (out.length + l.length > 2400) break;
+    out += l;
+  }
+  return `${out}\n`;
 }
 
 /** The next message to a resumed session whose previous attempt at the task failed: it already holds the contract. */

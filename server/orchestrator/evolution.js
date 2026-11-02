@@ -94,6 +94,54 @@ async function learnLocked({ agent, task, report, ok, out, settings, project }) 
   await publishAgent(a.id);
 }
 
+// What a GM practices on every mission it leads (the manager role's own skill names, see roles.js).
+export const ORCHESTRATION_SKILLS = ['planning', 'decomposition', 'coordination'];
+
+/**
+ * The GM's learning from a mission it led: called once per finished mission with staffed tasks. The gain follows the
+ * outcome, not the output: a done mission earns XP (more for larger plans) and grows the orchestration skills, a failed
+ * one earns a little XP and no skill, a cancelled one nothing. Kept apart from learn(): no task counters or lessons, and
+ * a skill that a task of this mission already credited to the GM (staffed itself, or through a clone of it) is not
+ * credited again.
+ */
+export function learnMission(args) {
+  if (args.status === 'cancelled' || !args.tasks?.length) return Promise.resolve();
+  return withAgentLock('learn', args.gm.id, () => learnMissionLocked(args));
+}
+
+async function learnMissionLocked({ gm, mission, project, status, tasks }) {
+  const a = await one(`SELECT * FROM agents WHERE id = $1`, [gm.id]);
+  if (!a) return;
+  if (a.merged_into) return learnMission({ gm: { ...gm, id: a.merged_into }, mission, project, status, tasks });
+  const ok = status === 'done';
+  const xp = a.xp + (ok ? 20 + 2 * Math.min(5, tasks.length) : 6);
+  const level = levelFor(xp);
+  // Skills its own tasks here credited: on the GM itself or on a clone of it (whose gains merge back into it).
+  const own = await many(
+    `SELECT t.skills FROM tasks t JOIN agents x ON x.id = t.agent_id
+     WHERE t.mission_id = $1 AND t.origin <> 'proposal' AND (x.id = $2 OR x.cloned_from = $2 OR x.merged_into = $2)`, [mission.id, a.id]);
+  const practiced = new Set(own.flatMap((t) => (t.skills || []).map((s) => String(s).toLowerCase())));
+  const skills = [...a.skills];
+  if (ok) {
+    for (const name of ORCHESTRATION_SKILLS.filter((n) => !practiced.has(n))) {
+      const s = skills.find((k) => k.name === name);
+      if (s) s.level = Math.min(100, s.level + 2);
+      else skills.push({ name, level: 22, learnedAt: new Date().toISOString() });
+    }
+  }
+  const st = {
+    missionsDone: (a.stats.missionsDone || 0) + (ok ? 1 : 0),
+    missionsFailed: (a.stats.missionsFailed || 0) + (ok ? 0 : 1),
+    projects: [...new Set([...(a.stats.projects || []), project.name])].slice(-50),
+  };
+  await query(`UPDATE agents SET xp=$2, level=$3, skills=$4, stats=stats || $5, updated_at=now() WHERE id=$1`, [a.id, xp, level, JSON.stringify(skills), st]);
+  await event('observe', a.id, `${a.name} led a ${status} mission: +${xp - a.xp} XP`, { missionId: mission.id, status, tasks: tasks.length, xp: xp - a.xp });
+  if (level > a.level) {
+    await notify({ source_type: 'agent', source_name: a.name, agent_id: a.id, level: 'success', title: `${a.name} reached level ${level}`, body: `${a.title} · ${xp} XP` });
+  }
+  await publishAgent(a.id);
+}
+
 async function promote(agent, playbook, reason) {
   const { version } = await one(`UPDATE agents SET playbook=$2, prompt_version=prompt_version + 1 WHERE id=$1 RETURNING prompt_version AS version`, [agent.id, JSON.stringify(playbook)]);
   await query(`INSERT INTO agent_versions(agent_id, version, playbook, reason) VALUES ($1,$2,$3,$4)`, [agent.id, version, JSON.stringify(playbook), reason]);
@@ -130,6 +178,8 @@ export function combineLearning(target, clone) {
     tasksFailed: (ts.tasksFailed || 0) + (cs.tasksFailed || 0),
     projects: [...new Set([...(ts.projects || []), ...(cs.projects || [])])].slice(-50),
   };
+  // A GM clone's missions (learnMission); absent on workers, so their merged stats are unchanged.
+  for (const k of ['missionsDone', 'missionsFailed']) if (cs[k] != null || ts[k] != null) stats[k] = (ts[k] || 0) + (cs[k] || 0);
   for (const k of USAGE) if (cs[k] != null) stats[k] = Number(ts[k] || 0) + Number(cs[k] || 0);
   return { xp, level: levelFor(xp), skills, stats, gained: { skills: changed, xp: xpGained } };
 }

@@ -13,7 +13,7 @@ import { syncProject, touchedFiles, repoPaths } from '../services/git.js';
 import { PROVIDERS, resolveModel, runModel, recordRunUsage, publishModels } from '../models/index.js';
 import { heuristicPlan, topicTitle, topicSummary } from './heuristics.js';
 import { planPrompt, taskPrompt, retryPrompt, commitPrompt, digestPrompt, triagePrompt, parseJson, topicContext, inflightContext } from './prompts.js';
-import { learn, analyzeMission } from './evolution.js';
+import { learn, learnMission, analyzeMission } from './evolution.js';
 
 // Missions run in per-topic lanes: one at a time per topic (FIFO), different topics in parallel with no project-wide
 // cap. The lane is the mission's topic at submit time.
@@ -647,6 +647,8 @@ async function runMission(mission, signal) {
       title: `${project.name}: mission ${status} (${done}/${final.length})`, body: mission.command.slice(0, 160),
     });
     await audit(gm.name, `mission.${status}`, project.name, { missionId: mission.id });
+    // The GM learns from the mission it planned and staffed (its own runs are never tasks, so learn() never sees them).
+    await learnMission({ gm, mission, project, status, tasks: final, settings }).catch((e) => console.error('[learn]', e.message));
     analyzeMission(mission.id).catch((e) => console.error('[evolution]', e.message));
   } catch (err) {
     const status = signal.aborted ? 'cancelled' : 'failed';
@@ -657,6 +659,8 @@ async function runMission(mission, signal) {
     refreshProject(project.id);
     await publishMission(mission.id);
     await postMessage({ project_id: project.id, mission_id: mission.id, author_type: 'agent', agent_id: gm.id, kind: status === 'cancelled' ? 'status' : 'error', content: status === 'cancelled' ? 'Mission cancelled.' : `Mission failed: ${err.message}` });
+    const staffed = await many(`SELECT id FROM tasks WHERE mission_id = $1 AND origin <> 'proposal'`, [mission.id]).catch(() => []);
+    await learnMission({ gm, mission, project, status, tasks: staffed, settings }).catch((e) => console.error('[learn]', e.message));
   } finally {
     // Stays 'working' while another mission of a project it manages is still planning or running.
     await refreshAgentStatus(gm.id);
@@ -892,13 +896,26 @@ async function resumableSession({ agent, model, mission, task, attempt }) {
   if (model.provider !== 'claude-code') return null;
   // A retry continues the failed attempt itself: it already knows the code and what went wrong.
   const row = attempt > 1
-    ? await one(`SELECT session_id, context_tokens FROM runs WHERE task_id = $1 AND agent_id = $2 AND model_id = $3 AND kind = 'task' AND session_id IS NOT NULL AND status <> 'cancelled' ORDER BY created_at DESC LIMIT 1`, [task.id, agent.id, model.id])
+    ? await one(`SELECT session_id, context_tokens, created_at FROM runs WHERE task_id = $1 AND agent_id = $2 AND model_id = $3 AND kind = 'task' AND session_id IS NOT NULL AND status <> 'cancelled' ORDER BY created_at DESC LIMIT 1`, [task.id, agent.id, model.id])
     : await one(
-      `SELECT r.session_id, r.context_tokens FROM runs r JOIN missions m ON m.id = r.mission_id
+      `SELECT r.session_id, r.context_tokens, r.created_at FROM runs r JOIN missions m ON m.id = r.mission_id
        WHERE r.agent_id = $1 AND r.model_id = $2 AND r.kind = 'task' AND r.status = 'done' AND r.session_id IS NOT NULL
          AND m.topic_id = $3 AND m.project_id = $4 AND r.finished_at > now() - make_interval(mins => $5)
        ORDER BY r.finished_at DESC LIMIT 1`, [agent.id, model.id, mission.topic_id, mission.project_id, RESUME_WINDOW_MIN]);
-  return row && row.context_tokens <= RESUME_MAX_CONTEXT ? row.session_id : null;
+  return row && row.context_tokens <= RESUME_MAX_CONTEXT ? { id: row.session_id, at: row.created_at, retry: attempt > 1 } : null;
+}
+
+// The hand-off from earlier missions in the topic: their task reports (what was done, which files) instead of a cold
+// re-exploration. A resumed session already holds its own tasks, so it only gets the others finished since its last run
+// started; a resumed retry gets nothing new.
+async function topicWork({ mission, session }) {
+  if (!mission.topic_id || session?.retry) return [];
+  return many(
+    `SELECT t.key, t.title, t.status, t.report, t.result, a.name AS agent_name FROM tasks t
+     JOIN missions m ON m.id = t.mission_id LEFT JOIN agents a ON a.id = t.agent_id
+     WHERE m.topic_id = $1 AND m.project_id = $2 AND t.mission_id <> $3 AND t.status IN ('done', 'failed')
+       AND ($4::timestamptz IS NULL OR (t.finished_at > $4 AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.task_id = t.id AND r.session_id = $5)))
+     ORDER BY t.finished_at DESC LIMIT 6`, [mission.topic_id, mission.project_id, mission.id, session?.at ?? null, session?.id ?? null]);
 }
 
 async function runTask({ task, state, project, gm, mission, settings, signal, attempt = 1 }) {
@@ -960,7 +977,12 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
   const playbook = agent.stats?.experiment?.playbook || agent.playbook;
   const others = activeIn(project.id).filter((a) => a.mission.id !== mission.id);
   const shared = others.length ? await filesOf(project, others) : null;
-  const { system, prompt } = taskPrompt({ project, agent, task: { ...task, acceptance: task.acceptance }, gm, supervisor: agent.supervisor_name, deps, mission, attachments: mission.attachments, playbook, shared });
+  let model = await resolveModel(agent.model_id).catch(() => null); // a failure is raised again inside the try below
+  const session = model ? await resumableSession({ agent, model, mission, task, attempt }) : null;
+  const brief = { project, agent, task: { ...task, acceptance: task.acceptance }, gm, supervisor: agent.supervisor_name, deps, mission, attachments: mission.attachments, playbook, shared };
+  const { system, prompt } = taskPrompt({ ...brief, earlier: await topicWork({ mission, session }), resumed: !!session });
+  // What a resume that falls back to a new session sends instead: the whole hand-off, as for any fresh run.
+  const freshPrompt = session ? taskPrompt({ ...brief, earlier: await topicWork({ mission, session: null }) }).prompt : prompt;
   const access = roleInfo(agent.role).access;
 
   let ok = false;
@@ -969,14 +991,14 @@ async function runTask({ task, state, project, gm, mission, settings, signal, at
   let errorText = null;
   let progressTimer = null;
   try {
-    const model = await resolveModel(agent.model_id);
+    model ??= await resolveModel(agent.model_id);
     let progress = 5;
     progressTimer = setInterval(() => {
       progress = Math.min(92, progress + Math.max(1, Math.round((95 - progress) / 12)));
       query(`UPDATE tasks SET progress=$2 WHERE id=$1 AND status='running'`, [task.id, progress]).then(() => publishTask(task.id)).catch(() => {});
     }, 4000);
-    const resume = await resumableSession({ agent, model, mission, task, attempt });
-    out = await executeRun({ kind: 'task', agent, project, mission, task, model, prompt: resume && task.failure ? retryPrompt(task.failure) : prompt, freshPrompt: prompt, system, access, attachments: mission.attachments, signal, meta: { kind: 'task', role: agent.role, title: task.title, resumed: !!resume }, resume, persist: true });
+    const resume = session?.id ?? null;
+    out = await executeRun({ kind: 'task', agent, project, mission, task, model, prompt: resume && task.failure ? retryPrompt(task.failure) : prompt, freshPrompt, system, access, attachments: mission.attachments, signal, meta: { kind: 'task', role: agent.role, title: task.title, resumed: !!resume }, resume, persist: true });
     report = parseJson(out.text) || { status: 'done', summary: String(out.text || '').slice(-1500) };
     ok = !['failed', 'blocked'].includes(String(report.status || 'done').toLowerCase());
   } catch (err) {
